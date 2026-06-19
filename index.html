@@ -73,6 +73,8 @@ td.hl{color:#00d4aa}
     <option value="6">≤6</option>
     <option value="13">≤13</option>
   </select>
+  <label>Stack Depth</label>
+  <input type="number" id="depth" value="1" min="1" max="16" onchange="generate()" style="width:60px">
   <button onclick="generate()">Generate</button>
 </div>
 <div class="row" style="gap:4px">
@@ -145,10 +147,11 @@ bvPoly.prototype.mul = function(other) {
   return res;
 }
 
-// Random bivariate poly not divisible by (x+1) in either variable
+// Sparse random bivariate poly — low weight keeps stabilizers light
 function randBvPoly(r, s) {
   let p = new bvPoly(r, s);
-  for(let i=0;i<r;i++) for(let j=0;j<s;j++) p.set(i,j, Math.random()<0.5 ? 1 : 0);
+  let density = 0.08; // 8% fill → wt ~ r*s*0.08, keeps checks light
+  for(let i=0;i<r;i++) for(let j=0;j<s;j++) p.set(i,j, Math.random()<density ? 1 : 0);
   // Ensure odd parity in x (not divisible by x+1)
   let px=0; for(let i=0;i<r;i++) for(let j=0;j<s;j++) px^=p.get(i,j);
   if(!px) p.set(0,0, p.get(0,0)^1);
@@ -215,6 +218,7 @@ function generate() {
   let r_in = parseInt(document.getElementById('r').value)||0;
   let s_in = parseInt(document.getElementById('s').value)||0;
   let min_rate = parseFloat(document.getElementById('rate').value)||0;
+  let depth = parseInt(document.getElementById('depth').value)||1;
   let max_wt = parseInt(document.getElementById('maxwt').value)||99;
   
   let codes = [];
@@ -256,11 +260,12 @@ function generate() {
           if(sw > max_wt) continue;
           
           codes.push({
-            r,s,N,K,D:Dc,rate,
+            r,s,N,K:Dc*2,D:Dc,rate,  // K = 2*Dc for the gcd structure
             stab_wt:sw, wa, wb,
             ax:T[ti].xp, ay:T[ti].yp,
             bx:T[ui].xp, by:T[ui].yp,
-            aname:T[ti].name, bname:T[ui].name
+            aname:T[ti].name, bname:T[ui].name,
+            depth:depth
           });
         }
       }
@@ -272,14 +277,17 @@ function generate() {
   
   // Deduplicate: keep best weight per (r,s)
   let seen = {};
-  let uniq = [];
   for(let c of codes) {
     let key = `${c.r},${c.s}`;
-    if(!seen[key] || c.stab_wt < seen[key].stab_wt) {
-      seen[key] = c;
-    }
+    if(!seen[key] || c.stab_wt < seen[key].stab_wt) seen[key] = c;
   }
-  uniq = Object.values(seen).sort((a,b)=>(b.D*b.rate)-(a.D*a.rate));
+  let uniq = Object.values(seen).sort((a,b)=>(b.D*b.rate)-(a.D*a.rate));
+  
+  // Apply depth multiplier to K and rate for display
+  for(let c of uniq) {
+    c.K_display = c.K * (c.depth||1);
+    c.rate_display = c.K_display / c.N;
+  }
   
   // Limit display
   let max_show = r_in&&s_in ? 50 : 30;
@@ -300,22 +308,25 @@ function generate() {
     out.style.display = 'block';
   } else {
     let html = `<table>
-      <tr><th>r</th><th>s</th><th>N</th><th>K</th><th>D</th><th>Rate</th><th>Wt</th><th>a(x,y)</th><th>b(x,y)</th></tr>`;
+      <tr><th>r</th><th>s</th><th>N</th><th>K</th><th>D</th><th>Rate</th><th>Wt</th><th>a(x,y)</th><th>b(x,y)</th><th>#</th></tr>`;
       
     for(let i=0; i<codes.length; i++) {
       let c = codes[i];
       let actual = genActual(c.r, c.s);
       let ahex = polyToHex(actual.a);
       let bhex = polyToHex(actual.b);
+      let totalK = c.K_display || c.K;
+      let stackRate = c.rate_display || c.rate;
       
       // Main row (Clickable)
       html += `<tr class="clickable-row" onclick="document.getElementById('mat-${i}').classList.toggle('open')" title="Click row to view full matrix">
         <td>${c.r}</td><td>${c.s}</td><td class="hl">${c.N}</td>
-        <td>${c.K}</td><td class="hl">${c.D}</td>
-        <td>${c.rate.toFixed(4)}</td>
+        <td class="hl">${c.K_display||c.K}</td><td class="hl">${c.D}</td>
+        <td>${(c.rate_display||c.rate).toFixed(4)}</td>
         <td>${actual.wa + actual.wb}</td>
         <td style="font-size:0.7em;max-width:200px;overflow:hidden">${ahex}</td>
         <td style="font-size:0.7em;max-width:200px;overflow:hidden">${bhex}</td>
+        <td>${c.depth||1}</td>
       </tr>`;
       
       // Hidden Matrix Row
@@ -347,21 +358,23 @@ function generate() {
   
   let best = codes[0];
   if(best) {
-    h += `<tr><td>Our toric</td><td class="hl">${best.N}</td><td>${best.K}</td><td class="hl">${best.D}</td><td>${best.stab_wt}</td><td>2D grid, local</td></tr>`;
+    let bk = best.K_display || best.K;
+    h += `<tr><td>Our toric</td><td class="hl">${best.N}</td><td>${bk}</td><td class="hl">${best.D}</td><td>${best.stab_wt}</td><td>2D grid, local</td></tr>`;
   }
   
   let Dc = D||5;
   h += `<tr><td>Surface (rotated)</td><td>${Dc*Dc}</td><td>1</td><td>${Dc}</td><td>4</td><td>2D grid, local</td></tr>`;
   h += `<tr><td>Surface (standard)</td><td>${2*Dc*Dc}</td><td>1</td><td>${Dc}</td><td>4</td><td>2D grid, local</td></tr>`;
-  h += `<tr><td>Surface ×K copies</td><td>${Dc*Dc*(best?best.K:8)}</td><td>${best?best.K:8}</td><td>${Dc}</td><td>4</td><td>separate blocks</td></tr>`;
+  h += `<tr><td>Surface ×K copies</td><td>${Dc*Dc*(best?best.K_display||best.K:8)}</td><td>${best?best.K_display||best.K:8}</td><td>${Dc}</td><td>4</td><td>separate blocks</td></tr>`;
   h += `</table>`;
   
   if(best) {
-    let surf_K = Dc*Dc * best.K;
+    let bk = best.K_display || best.K;
+    let surf_K = Dc*Dc * bk;
     let ratio = (surf_K / best.N).toFixed(1);
     h += `<div style="margin-top:8px;color:#888">`;
-    if(ratio > 1.05) h += `<span class="good">Our code uses ${ratio}× fewer qubits than ${best.K}× surface code blocks.</span>`;
-    else if(ratio > 0.95) h += `Same qubit count as surface code blocks — gain is unified ${best.K} logicals in one block.`;
+    if(ratio > 1.05) h += `<span class="good">Our code uses ${ratio}× fewer qubits than ${bk}× surface code blocks.</span>`;
+    else if(ratio > 0.95) h += `Same qubit count as surface code blocks — gain is unified ${bk} logicals in one block.`;
     else h += `<span class="warn">Surface code blocks are more qubit-efficient for these parameters.</span>`;
     h += `</div>`;
   }
