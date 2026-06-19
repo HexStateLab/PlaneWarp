@@ -1,0 +1,238 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>2D Toric Code Generator — Repeated-Root Theorem</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+body{background:#0a0a0f;color:#c0c0d0;font-family:monospace;padding:20px;max-width:900px;margin:auto}
+h1{color:#00d4aa;font-size:1.4em;margin-bottom:4px}
+.sub{color:#666;font-size:0.8em;margin-bottom:20px}
+.panel{background:#111118;border:1px solid #222;border-radius:6px;padding:16px;margin-bottom:16px}
+.panel h2{color:#00b4d8;font-size:1em;margin-bottom:10px}
+.row{display:flex;gap:12px;flex-wrap:wrap;align-items:center;margin-bottom:10px}
+.row label{color:#888;font-size:0.85em;min-width:60px}
+input,select{background:#1a1a25;border:1px solid #333;color:#e0e0e0;padding:6px 10px;border-radius:4px;font-family:monospace;font-size:0.9em;width:100px}
+input:focus,select:focus{outline:none;border-color:#00d4aa}
+button{background:#00b4d8;color:#000;border:none;padding:8px 20px;border-radius:4px;cursor:pointer;font-family:monospace;font-weight:bold;font-size:0.9em}
+button:hover{background:#00d4aa}
+.result{margin-top:10px;padding:12px;background:#0d0d14;border-radius:4px;font-size:0.85em;line-height:1.6}
+.result .hl{color:#00d4aa;font-weight:bold}
+.result .dim{color:#888}
+.result .warn{color:#f0a040}
+.result .good{color:#00d4aa}
+table{width:100%;border-collapse:collapse;font-size:0.8em;margin-top:8px}
+th{color:#888;text-align:left;padding:4px 8px;border-bottom:1px solid #222}
+td{padding:4px 8px;border-bottom:1px solid #1a1a22}
+td.hl{color:#00d4aa}
+.slider{width:100%}
+.preset{border:1px solid #333;background:#1a1a25;color:#888;padding:4px 10px;border-radius:4px;cursor:pointer;font-size:0.8em;margin:2px}
+.preset:hover{background:#222;color:#ccc}
+.preset.active{background:#00b4d8;color:#000;border-color:#00b4d8}
+</style>
+</head>
+<body>
+
+<h1>⬡ 2D Toric Code Generator</h1>
+<div class="sub">Repeated-Root Theorem · gcd=(x+1)²·(y+1)² · Torus Z<sub>r</sub>×Z<sub>s</sub></div>
+
+<div class="panel">
+<h2>Parameters</h2>
+<div class="row">
+  <label>Distance D</label>
+  <input type="number" id="D" value="5" min="3" step="2" onchange="generate()">
+  <label>Logical K</label>
+  <select id="K" onchange="generate()">
+    <option value="8">8 (gcd deg=4)</option>
+    <option value="4">4 (gcd deg=2)</option>
+    <option value="16">16 (gcd deg=8)</option>
+  </select>
+  <label>Torus r</label>
+  <input type="number" id="r" value="" placeholder="auto" onchange="generate()">
+  <label>Torus s</label>
+  <input type="number" id="s" value="" placeholder="auto" onchange="generate()">
+</div>
+<div class="row">
+  <label>Min Rate</label>
+  <input type="number" id="rate" value="0" min="0" max="1" step="0.001" onchange="generate()" style="width:80px">
+  <label>Max Weight</label>
+  <select id="maxwt" onchange="generate()">
+    <option value="99">any</option>
+    <option value="8" selected>≤8 (sparse)</option>
+    <option value="6">≤6</option>
+    <option value="13">≤13</option>
+  </select>
+  <button onclick="generate()">Generate</button>
+</div>
+<div class="row" style="gap:4px">
+  <span style="color:#666;font-size:0.75em">Presets:</span>
+  <button class="preset" onclick="preset(5)">D=5</button>
+  <button class="preset" onclick="preset(7)">D=7</button>
+  <button class="preset" onclick="preset(10)">D=10</button>
+  <button class="preset" onclick="preset(20)">D=20</button>
+  <button class="preset" onclick="preset(50)">D=50</button>
+  <button class="preset" onclick="preset(100)">D=100</button>
+</div>
+</div>
+
+<div class="panel" id="output" style="display:none">
+<h2>Generated Codes</h2>
+<div id="codes"></div>
+</div>
+
+<div class="panel">
+<h2>Comparison to Surface Codes</h2>
+<div id="compare"></div>
+</div>
+
+<script>
+const T = [
+  {name:"min4",  xp:0x3, yp:0x3, wx:2, wy:2},
+  {name:"min4b", xp:0x3, yp:0x3, wx:2, wy:2},
+  {name:"diag-x",xp:0x7, yp:0x3, wx:3, wy:2},
+  {name:"diag-y",xp:0x3, yp:0x7, wx:2, wy:3},
+  {name:"sym",   xp:0x7, yp:0x7, wx:3, wy:3},
+  {name:"spread",xp:0xb, yp:0x5, wx:3, wy:2},
+];
+
+function polyStr(p) {
+  if(p==0x3)return"x+1";
+  if(p==0x5)return"x²+1";
+  if(p==0x7)return"x²+x+1";
+  if(p==0xb)return"x³+x+1";
+  return"0x"+p.toString(16);
+}
+
+function preset(d) {
+  document.getElementById('D').value = d;
+  document.getElementById('r').value = '';
+  document.getElementById('s').value = '';
+  generate();
+}
+
+function generate() {
+  let D = parseInt(document.getElementById('D').value)||5;
+  let K = parseInt(document.getElementById('K').value)||8;
+  let r_in = parseInt(document.getElementById('r').value)||0;
+  let s_in = parseInt(document.getElementById('s').value)||0;
+  let min_rate = parseFloat(document.getElementById('rate').value)||0;
+  let max_wt = parseInt(document.getElementById('maxwt').value)||99;
+  
+  let codes = [];
+  
+  // Determine r,s ranges
+  let r_start, r_end, s_start, s_end;
+  if(r_in && s_in) {
+    r_start = r_end = r_in;
+    s_start = s_end = s_in;
+  } else if(r_in) {
+    r_start = r_end = r_in;
+    s_start = (D||3); s_end = D*3+2;
+  } else if(s_in) {
+    s_start = s_end = s_in;
+    r_start = (D||3); r_end = D*3+2;
+  } else {
+    r_start = (D||3); r_end = D*3+2;
+    s_start = (D||3); s_end = D*3+2;
+  }
+  
+  for(let mx=r_start;mx<=r_end;mx+=2) {
+    if(mx<3)continue;
+    let r = 2*mx;
+    for(let my=s_start;my<=s_end;my+=2) {
+      if(my<3)continue;
+      let s = 2*my;
+      let Dc = Math.min(mx, my);
+      if(D && Dc < D) continue;
+      
+      let N = 2*r*s;
+      let rate = K/N;
+      if(rate < min_rate) continue;
+      
+      for(let ti=0;ti<T.length;ti++) {
+        for(let ui=0;ui<T.length;ui++) {
+          let wa = T[ti].wx * T[ti].wy;
+          let wb = T[ui].wx * T[ui].wy;
+          let sw = wa + wb;
+          if(sw > max_wt) continue;
+          
+          codes.push({
+            r,s,N,K,D:Dc,rate,
+            stab_wt:sw, wa, wb,
+            ax:T[ti].xp, ay:T[ti].yp,
+            bx:T[ui].xp, by:T[ui].yp,
+            aname:T[ti].name, bname:T[ui].name
+          });
+        }
+      }
+    }
+  }
+  
+  // Sort by score: D*rate
+  codes.sort((a,b) => (b.D*b.rate) - (a.D*a.rate));
+  
+  // Limit display
+  let max_show = r_in&&s_in ? 50 : 30;
+  codes = codes.slice(0, max_show);
+  
+  // Output
+  let out = document.getElementById('output');
+  let div = document.getElementById('codes');
+  
+  if(codes.length === 0) {
+    div.innerHTML = '<div class="warn">No codes found matching constraints. Try relaxing max weight or rate.</div>';
+    out.style.display = 'block';
+  } else {
+    let html = `<table>
+      <tr><th>r</th><th>s</th><th>N</th><th>K</th><th>D</th><th>Rate</th><th>Wt</th><th>a(x,y)</th><th>b(x,y)</th></tr>`;
+    for(let c of codes) {
+      let axs = polyStr(c.ax), ays = polyStr(c.ay);
+      let bxs = polyStr(c.bx), bys = polyStr(c.by);
+      html += `<tr>
+        <td>${c.r}</td><td>${c.s}</td><td class="hl">${c.N}</td>
+        <td>${c.K}</td><td class="hl">${c.D}</td>
+        <td>${c.rate.toFixed(4)}</td>
+        <td>${c.stab_wt}</td>
+        <td><span class="dim">a<sub>x</sub>=</span>${axs} <span class="dim">a<sub>y</sub>=</span>${ays}</td>
+        <td><span class="dim">b<sub>x</sub>=</span>${bxs} <span class="dim">b<sub>y</sub>=</span>${bys}</td>
+      </tr>`;
+    }
+    html += `</table><div style="margin-top:8px;color:#666">${codes.length} codes · a(x,y)=a<sub>x</sub>(x)·a<sub>y</sub>(y) over Z<sub>r</sub>×Z<sub>s</sub></div>`;
+    div.innerHTML = html;
+    out.style.display = 'block';
+  }
+  
+  // Comparison
+  let comp = document.getElementById('compare');
+  let h = `<table>
+    <tr><th>Code</th><th>N</th><th>K</th><th>D</th><th>Wt</th><th>Connectivity</th></tr>`;
+  
+  let best = codes[0];
+  if(best) {
+    h += `<tr><td>Our toric</td><td class="hl">${best.N}</td><td>${best.K}</td><td class="hl">${best.D}</td><td>${best.stab_wt}</td><td>2D grid, local</td></tr>`;
+  }
+  
+  let Dc = D||5;
+  h += `<tr><td>Surface (rotated)</td><td>${Dc*Dc}</td><td>1</td><td>${Dc}</td><td>4</td><td>2D grid, local</td></tr>`;
+  h += `<tr><td>Surface (standard)</td><td>${2*Dc*Dc}</td><td>1</td><td>${Dc}</td><td>4</td><td>2D grid, local</td></tr>`;
+  h += `<tr><td>Surface ×K copies</td><td>${Dc*Dc*(best?best.K:8)}</td><td>${best?best.K:8}</td><td>${Dc}</td><td>4</td><td>separate blocks</td></tr>`;
+  h += `</table>`;
+  
+  if(best) {
+    let surf_K = Dc*Dc * best.K;
+    let ratio = (surf_K / best.N).toFixed(1);
+    h += `<div style="margin-top:8px;color:#888">`;
+    if(ratio > 1.05) h += `<span class="good">Our code uses ${ratio}× fewer qubits than ${best.K}× surface code blocks.</span>`;
+    else if(ratio > 0.95) h += `Same qubit count as surface code blocks — gain is unified ${best.K} logicals in one block.`;
+    else h += `<span class="warn">Surface code blocks are more qubit-efficient for these parameters.</span>`;
+    h += `</div>`;
+  }
+  
+  comp.innerHTML = h;
+}
+
+generate();
+</script>
+</body>
+</html>
