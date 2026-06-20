@@ -83,6 +83,8 @@ td.hl{color:#00d4aa}
   <label>Density %</label>
   <input type="range" id="density" value="8" min="1" max="50" onchange="generate()" style="width:60px" title="Sparse fill % for random pa,pb">
   <span id="dval">8%</span>
+  <label>Rotated</label>
+  <input type="checkbox" id="rotated" onchange="generate()" title="Face-qubit convention: N=r·s, planar boundaries. K is approximate.">
   <button onclick="generate()">Generate</button>
 </div>
 </div>
@@ -191,6 +193,53 @@ function renderMatrix(p) {
   return h;
 }
 
+// Compute K for Kite geometry: circulant-x, open-y (Toeplitz) via GF(2) rank
+function kiteRank(aCoeff, bCoeff) {
+  let r=aCoeff.r, s=aCoeff.s, Nf=r*s, BB=2*Nf;
+  let NC=(Nf+31)>>>5, BC=(BB+31)>>>5;
+  function halfRow(mat,u,v,rev){
+    let row=new Uint32Array(NC);
+    for(let i=0;i<r;i++)for(let j=0;j<s;j++){
+      let xi=rev?(i-u+r)%r:(u-i+r)%r; // x: always circulant
+      let yj=rev?(j-v):(v-j);          // y: Toeplitz, no wrap
+      if(yj<0||yj>=s) continue;
+      if(mat.get(xi,yj)){let ci=i*s+j; row[ci>>>5]|=1<<(ci&31);}
+    }
+    return row;
+  }
+  function merge(lo,hi){
+    let row=new Uint32Array(BC);
+    for(let i=0;i<NC;i++)row[i]=lo[i];
+    let sf=Nf&31, w0=Nf>>>5;
+    if(sf===0){for(let i=0;i<NC;i++)row[w0+i]=hi[i];}
+    else{for(let i=0;i<NC;i++){row[w0+i]|=hi[i]<<sf;if(w0+i+1<BC)row[w0+i+1]|=hi[i]>>>(32-sf);}}
+    return row;
+  }
+  let HX=[],HZ=[];
+  for(let u=0;u<r;u++)for(let v=0;v<s;v++){
+    HX.push(merge(halfRow(aCoeff,u,v,0),halfRow(bCoeff,u,v,0)));
+    HZ.push(merge(halfRow(bCoeff,u,v,1),halfRow(aCoeff,u,v,1)));
+  }
+  function rank(rows){
+    let m=rows.length, w=Array(m);
+    for(let i=0;i<m;i++)w[i]=new Uint32Array(rows[i]);
+    let rk=0;
+    for(let cw=0;cw<BC;cw++)for(let cb=0;cb<32;cb++){
+      let bit=cb+cw*32;if(bit>=BB)break;
+      let mask=1<<cb, pivot=-1;
+      for(let i=rk;i<m;i++)if(w[i][cw]&mask){pivot=i;break}
+      if(pivot<0)continue;
+      let t=w[rk];w[rk]=w[pivot];w[pivot]=t;
+      for(let i=0;i<m;i++)if(i!==rk&&(w[i][cw]&mask))
+        for(let k=0;k<BC;k++)w[i][k]^=w[rk][k];
+      rk++;
+    }
+    return rk;
+  }
+  let rx=rank(HX), rz=rank(HZ), rcomb=rank(HX.concat(HZ));
+  return {K:BB-rcomb, rx, rz, rcomb};
+}
+
 // Generate actual code. Minimal mode: algebraic weight-8 codes.
 function genActual(r, s, density, minimal) {
   let g = gcdPoly(r, s);
@@ -218,16 +267,18 @@ function generate() {
   let density = parseInt(document.getElementById('density').value)/100 || 0.08;
   document.getElementById('dval').textContent = Math.round(density*100)+'%';
   let minimal = document.getElementById('minimal').checked;
+  let rotated = document.getElementById('rotated').checked;
   let Nfilter = parseInt(document.getElementById('Nfilter').value)||0;
   
   // Build (r,s) candidate list: either from ranges or directly from N filter
   let pairs = [];
   if(Nfilter && !r_in && !s_in) {
-    // Derive r,s from N = 2rs → rs = N/2, r=2mx, s=2my → mx*my = N/8
-    let n8 = Nfilter/8;
-    for(let mx=3; mx*mx<=n8; mx++) {
-      if(n8 % mx === 0) {
-        let my = n8/mx;
+    // Derive r,s from N: non-rotated N=2rs→mx*my=N/8, rotated N=rs→mx*my=N/4
+    let div = rotated ? 4 : 8;
+    let target = Nfilter/div;
+    for(let mx=3; mx*mx<=target; mx++) {
+      if(target % mx === 0) {
+        let my = target/mx;
         if(my >= 3) {
           let Dc = Math.min(mx, my);
           if(!D || Dc >= D) pairs.push({r:2*mx, s:2*my, Dc});
@@ -273,15 +324,27 @@ function generate() {
       let Dc = Math.min(mx, my);
       if(D && Dc < D) continue;
       
-      let N = 2*r*s, Rs = r*s;
+      let N = (rotated ? 1 : 2) * r*s, Rs = r*s;
       if(Nfilter && N !== Nfilter) continue;
       
       if(minimal) {
         // === ALGEBRAIC WEIGHT-8 ===
-        // Family 1: monomial → dependent HX/HZ → max K
-        let K1 = Rs + 2*r + 2*s - 4;
+        // Torus: K = rs+2r+2s−4 (monomial), K = 4r+4s−8 (chain)
+        // Kite:  K = rs + 2·max(r,s), N=rs, chain disabled (K=0)
+        let K1 = rotated ? Rs + 2*Math.max(r,s) : Rs + 2*r + 2*s - 4;
+        let K2 = rotated ? 0 : 4*r + 4*s - 8;
         if(K1/N >= min_rate) {
           let g = gcdPoly(r, s);
+          if(rotated) {
+            // Kite: assemble actual stabilizers, compute K via rank
+            for(let [ai,aj,bi,bj] of [[0,0,2,2],[r/2|0,s/2|0,1,1]]) {
+              ai%=r;aj%=s;bi%=r;bj%=s;
+              let pa=new bvPoly(r,s);pa.set(ai,aj,1); let pb=new bvPoly(r,s);pb.set(bi,bj,1);
+              let a=g.mul(pa),b=g.mul(pb);
+              let kr=kiteRank(a,b);
+              codes.push({r,s,N,K:kr.K*depth,D:Dc,rate:kr.K*depth/N,stab_wt:a.wt()+b.wt(),wa:a.wt(),wb:b.wt(),ax:0,ay:0,bx:0,by:0,aname:'kite',bname:`K=${kr.K}`,_a:a,_b:b,depth});
+            }
+          } else {
           let shifts = [[0,0,2,2],[r/2|0,s/2|0,1,1]];
           for(let [ai,aj,bi,bj] of shifts) {
             ai%=r; aj%=s; bi%=r; bj%=s;
@@ -291,9 +354,9 @@ function generate() {
             codes.push({r,s,N,K:K1*depth,D:Dc,rate:K1*depth/N,stab_wt:a.wt()+b.wt(),wa:a.wt(),wb:b.wt(),ax:0,ay:0,bx:0,by:0,aname:'mono',bname:`${ai},${aj}`,_a:a,_b:b,depth});
           }
         }
-        // Family 2: chain f=(1+x²)·chain(y) → independent HX/HZ → K=4r+4s-8
-        let K2 = 4*r + 4*s - 8;
-        if(K2/N >= min_rate && K2 !== K1) {
+        }
+        // Family 2: chain (toroidal only)
+        if(K2/N >= min_rate && K2 !== K1 && !rotated) {
           let g = gcdPoly(r, s), added=0;
           for(let a=0; a<s && added<3; a++)
             for(let m=0; a+2*m+2<s && added<3; m++) {
@@ -334,9 +397,9 @@ function generate() {
             aname:T[ti].name, bname:T[ui].name,
             depth
           });
-        }
-      }
     }
+  }
+  }
   }
   }
   
@@ -359,13 +422,26 @@ function generate() {
   let noteDiv = document.getElementById('construction');
   if(noteDiv) noteDiv.innerHTML = codes.length>0 
     ? (minimal
-      ? `<span class="dim">Algebraic weight-8: monomial K=rs+2r+2s−4, chain K=4r+4s−8, D=min(r/2,s/2). No brute-force.</span>`
-      : `<span class="dim">Actual code: a = template · p<sub>a</sub>(x,y) where p<sub>a</sub> random, not divisible by (x+1) or (y+1). Template = minimal-weight representative.</span>`)
+      ? `<span class="dim">Algebraic weight-8: ${rotated?'Kite K=rs+2·max(r,s), N=rs':'Torus K=rs+2r+2s−4, chain K=4r+4s−8'}, D=min(r/2,s/2).</span>`
+      : `<span class="dim">Actual code: a = template · p<sub>a</sub>(x,y). Random sparse at ${Math.round(density*100)}% density.${rotated?' Rotated: N=rs.':''}</span>`)
     : '';
   
   // Output
   let out = document.getElementById('output');
   let div = document.getElementById('codes');
+  
+  function polyString(p) {
+    let terms = [];
+    for(let i=0;i<p.r;i++) for(let j=0;j<p.s;j++) {
+      if(p.get(i,j)) {
+        let t = '';
+        if(i===0 && j===0) t = '1';
+        else { if(i>0) t += `x^${i}`; if(j>0) t += `y^${j}`; }
+        terms.push(t);
+      }
+    }
+    return terms.length ? terms.join(' + ') : '0';
+  }
   
   if(codes.length === 0) {
     div.innerHTML = '<div class="warn">No codes found matching constraints. Try relaxing max weight or rate.</div>';
@@ -390,11 +466,12 @@ function generate() {
         <td>${c.depth||1}</td>
       </tr>`;
       
-      html += `<tr id="mat-${i}" class="matrix-view">
+            let astr = polyString(actual.a), bstr = polyString(actual.b);
+            html += `<tr id="mat-${i}" class="matrix-view">
         <td colspan="10">
           <div class="matrix-container">
-            <div><div style="color:#888;">a(x,y) Matrix (${c.r}x${c.s})</div>${renderMatrix(actual.a)}</div>
-            <div><div style="color:#888;">b(x,y) Matrix (${c.r}x${c.s})</div>${renderMatrix(actual.b)}</div>
+            <div><div style="color:#888;">a(x,y)${rotated?' [Kite: open-y]':''}</div><div style="color:#aaa;margin-bottom:4px;font-family:monospace;font-size:0.8em">${astr}</div>${renderMatrix(actual.a)}</div>
+            <div><div style="color:#888;">b(x,y)${rotated?' [Kite: open-y]':''}</div><div style="color:#aaa;margin-bottom:4px;font-family:monospace;font-size:0.8em">${bstr}</div>${renderMatrix(actual.b)}</div>
           </div>
         </td>
       </tr>`;
