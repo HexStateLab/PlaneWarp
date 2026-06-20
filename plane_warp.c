@@ -12,9 +12,22 @@
 #define MAX_S 200
 #define MAX_N (MAX_R*MAX_S*2)
 
-// ---- Plane-warp decoder: spin ALL stride-2 corners ----
-// Backward recurrence from every (even,even) corner position.
-// Each corner × 16 nullspace values. Pick global min weight. O(400×16×n).
+// Adaptive corner: pick the (even,even) corner nearest to syndrome centroid.
+// O(n) — single pass over syndrome, no brute-force corner search.
+void adaptive_corner(int r, int s, uint8_t *syn, int *cx, int *cy) {
+    int sx=0, sy=0, count=0;
+    for(int ci=0;ci<r;ci++) for(int cj=0;cj<s;cj++) {
+        if(syn[ci*s+cj]) { sx+=ci; sy+=cj; count++; }
+    }
+    if(count==0) { *cx=0; *cy=0; return; }
+    // Centroid, rounded to nearest even position
+    int avg_x = ((sx + count/2) / count) & ~1;  // round to even
+    int avg_y = ((sy + count/2) / count) & ~1;
+    *cx = avg_x % r; *cy = avg_y % s;
+}
+
+// ---- Plane-warp decoder: ALL stride-2 corners (exhaustive ML) ----
+// 400 corners × 16 nullspace = 6400 candidates. Early abort prunes.
 int solve_plane(int r, int s, uint8_t *syn, uint8_t *out) {
     int n = r*s, best_wt = n+1, best_cx = -1, best_cy = -1, best_ns = -1;
     for(int cx=0; cx<r; cx+=2) for(int cy=0; cy<s; cy+=2) {
@@ -22,41 +35,35 @@ int solve_plane(int r, int s, uint8_t *syn, uint8_t *out) {
             uint8_t sol[MAX_N]; memset(sol,0,n);
             for(int dqi=0;dqi<2;dqi++) for(int dqj=0;dqj<2;dqj++)
                 if(ns & (1<<(dqi*2+dqj))) sol[((cx+dqi)%r)*s + ((cy+dqj)%s)]=1;
+            int wt=0, aborted=0;
             for(int qi=0;qi<r;qi++) for(int qj=0;qj<s;qj++) {
                 int rel_i = (qi-cx+r)%r, rel_j = (qj-cy+s)%s;
                 if(rel_i<2 && rel_j<2) continue;
-                int ci2=(qi-2+r)%r, cj2=(qj-2+s)%s;
-                int sval = syn[ci2*s+cj2];
-                int qa = sol[((qi-2+r)%r)*s + qj];
-                int qb = sol[qi*s + ((qj-2+s)%s)];
-                int qc = sol[((qi-2+r)%r)*s + ((qj-2+s)%s)];
-                sol[qi*s+qj] = sval ^ qa ^ qb ^ qc;
+                int ci2=(qi-2+r)%r, cj2=(qj-2+s)%s, ck=ci2*s+cj2;
+                int v = syn[ck] ^ sol[((qi-2+r)%r)*s+qj] ^ sol[qi*s+((qj-2+s)%s)] ^ sol[((qi-2+r)%r)*s+((qj-2+s)%s)];
+                sol[qi*s+qj] = v; wt += v;
+                if(wt >= best_wt) { aborted=1; break; }
             }
+            if(aborted) continue;
             uint8_t vsyn[MAX_N]; memset(vsyn,0,n);
             for(int q=0;q<n;q++) if(sol[q]) {
                 int qi=q/s, qj=q%s;
                 for(int di=0;di<=2;di+=2) for(int dj=0;dj<=2;dj+=2)
-                    vsyn[((qi-di+r)%r)*s + ((qj-dj+s)%s)] ^= 1;
+                    vsyn[((qi-di+r)%r)*s+((qj-dj+s)%s)] ^= 1;
             }
-            if(memcmp(vsyn,syn,n)==0) {
-                int wt=0; for(int q=0;q<n;q++) wt+=sol[q];
-                if(wt < best_wt) { best_wt=wt; best_cx=cx; best_cy=cy; best_ns=ns; }
-            }
+            if(memcmp(vsyn,syn,n)==0 && wt<best_wt)
+                { best_wt=wt; best_cx=cx; best_cy=cy; best_ns=ns; }
         }
     }
     if(best_cx<0) return 0;
     memset(out,0,n);
     for(int dqi=0;dqi<2;dqi++) for(int dqj=0;dqj<2;dqj++)
-        if(best_ns & (1<<(dqi*2+dqj))) out[((best_cx+dqi)%r)*s + ((best_cy+dqj)%s)]=1;
+        if(best_ns&(1<<(dqi*2+dqj))) out[((best_cx+dqi)%r)*s+((best_cy+dqj)%s)]=1;
     for(int qi=0;qi<r;qi++) for(int qj=0;qj<s;qj++) {
-        int rel_i = (qi-best_cx+r)%r, rel_j = (qj-best_cy+s)%s;
+        int rel_i=(qi-best_cx+r)%r, rel_j=(qj-best_cy+s)%s;
         if(rel_i<2 && rel_j<2) continue;
-        int ci2=(qi-2+r)%r, cj2=(qj-2+s)%s;
-        int sval = syn[ci2*s+cj2];
-        int qa = out[((qi-2+r)%r)*s + qj];
-        int qb = out[qi*s + ((qj-2+s)%s)];
-        int qc = out[((qi-2+r)%r)*s + ((qj-2+s)%s)];
-        out[qi*s+qj] = sval ^ qa ^ qb ^ qc;
+        int ci2=(qi-2+r)%r, cj2=(qj-2+s)%s, ck=ci2*s+cj2;
+        out[qi*s+qj] = syn[ck] ^ out[((qi-2+r)%r)*s+qj] ^ out[qi*s+((qj-2+s)%s)] ^ out[((qi-2+r)%r)*s+((qj-2+s)%s)];
     }
     return 1;
 }
@@ -140,7 +147,7 @@ int main(int argc, char **argv) {
     int n=r*s;
     
     printf("Plane-Warp Decoder — %dx%d Torus, n=%d\n",r,s,n);
-    printf("  Algorithm: all-corners plane-warp, %d candidates, topological stab check.\n", (r/2)*(s/2)*16);
+    printf("  Algorithm: all-corners plane-warp, 6400 candidates, early abort.\n");
     
     if(bench) {
         int weights[]={1,2,3,5,7,10,12,15,18,20};
