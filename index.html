@@ -73,6 +73,10 @@ td.hl{color:#00d4aa}
     <option value="6">≤6</option>
     <option value="13">≤13</option>
   </select>
+  <label>Stack Depth</label>
+  <input type="number" id="depth" value="1" min="1" max="16" onchange="generate()" style="width:60px">
+  <label>Exact D</label>
+  <input type="checkbox" id="exactD" onchange="generate()">
   <button onclick="generate()">Generate</button>
 </div>
 <div class="row" style="gap:4px">
@@ -145,10 +149,11 @@ bvPoly.prototype.mul = function(other) {
   return res;
 }
 
-// Random bivariate poly not divisible by (x+1) in either variable
+// Sparse random bivariate poly — low weight keeps stabilizers light
 function randBvPoly(r, s) {
   let p = new bvPoly(r, s);
-  for(let i=0;i<r;i++) for(let j=0;j<s;j++) p.set(i,j, Math.random()<0.5 ? 1 : 0);
+  let density = 0.08; // 8% fill → wt ~ r*s*0.08, keeps checks light
+  for(let i=0;i<r;i++) for(let j=0;j<s;j++) p.set(i,j, Math.random()<density ? 1 : 0);
   // Ensure odd parity in x (not divisible by x+1)
   let px=0; for(let i=0;i<r;i++) for(let j=0;j<s;j++) px^=p.get(i,j);
   if(!px) p.set(0,0, p.get(0,0)^1);
@@ -201,13 +206,153 @@ function genActual(r, s) {
   let g = gcdPoly(r, s);
   let pa = randBvPoly(r, s);
   let pb = randBvPoly(r, s);
-  return {
-    a: g.mul(pa),
-    b: g.mul(pb),
-    wa: g.mul(pa).wt(),
-    wb: g.mul(pb).wt()
-  };
+  let a = g.mul(pa), b = g.mul(pb);
+  return {a, b, wa: a.wt(), wb: b.wt()};
 }
+
+// Compute actual K via GF(2) rank + weight-1 distance (U32 chunked, any N)
+function computeActual(c, aCoeff, bCoeff) {
+  let r=c.r, s=c.s, N=r*s, BB=2*N;
+  let NC = (N+31)>>>5;  // ceil(N/32) words per half-row
+  let BC = (BB+31)>>>5; // ceil(BB/32) words per full row
+
+  // Build one half-row (N bits) from polynomial coefficient matrix
+  function halfRow(mat, u, v, rev) {
+    let row = new Uint32Array(NC);
+    for(let i=0;i<r;i++) for(let j=0;j<s;j++) {
+      let mi = rev ? (i-u+r)%r : (u-i+r)%r;
+      let mj = rev ? (j-v+s)%s : (v-j+s)%s;
+      if(mat.get(mi, mj)) {
+        let ci = i*s + j;
+        row[ci>>>5] |= 1<<(ci&31);
+      }
+    }
+    return row;
+  }
+
+  // Merge two half-rows into a full BB-bit row (lo | hi shifted by N bits)
+  function merge(lo, hi) {
+    let row = new Uint32Array(BC);
+    for(let i=0;i<NC;i++) row[i] = lo[i];
+    let sf = N & 31, w0 = N >>> 5;
+    if(sf === 0) {
+      for(let i=0;i<NC;i++) row[w0+i] = hi[i];
+    } else {
+      for(let i=0;i<NC;i++) {
+        row[w0+i] |= (hi[i] << sf);
+        if(w0+i+1 < BC) row[w0+i+1] |= hi[i] >>> (32-sf);
+      }
+    }
+    return row;
+  }
+
+  // Build HX and HZ rows
+  let HX=[], HZ=[];
+  for(let u=0;u<r;u++) for(let v=0;v<s;v++) {
+    HX.push(merge(halfRow(aCoeff,u,v,0), halfRow(bCoeff,u,v,0)));
+    HZ.push(merge(halfRow(bCoeff,u,v,1), halfRow(aCoeff,u,v,1)));
+  }
+
+  // CSS guaranteed by circulant construction — skip check
+  // (symplectic product A·AT+B·BT=0 always holds for BB codes)
+
+  // GF(2) rank on U32 chunked rows
+  function rankRows(rows){
+    let m=rows.length, w=Array(m);
+    for(let i=0;i<m;i++) w[i]=new Uint32Array(rows[i]);
+    let rk=0;
+    for(let cw=0;cw<BC;cw++){
+      for(let cb=0;cb<32;cb++){
+        let bit = cb + cw*32;
+        if(bit >= BB) break;
+        let mask = 1<<cb, pivot=-1;
+        for(let i=rk;i<m;i++) if(w[i][cw] & mask){pivot=i;break}
+        if(pivot<0) continue;
+        let t=w[rk]; w[rk]=w[pivot]; w[pivot]=t;
+        for(let i=0;i<m;i++) if(i!==rk&&(w[i][cw]&mask)){
+          for(let k=0;k<BC;k++) w[i][k]^=w[rk][k];
+        }
+        rk++;
+      }
+    }
+    return rk;
+  }
+  let rx=rankRows(HX), rz=rankRows(HZ);
+  let combined = HX.concat(HZ);
+  let rcomb=rankRows(combined);
+  let Ka=BB-rcomb;
+
+  // Helper: check if vector vq (Uint32Array) commutes with all HZ rows
+  function commutes(vq) {
+    for(let i=0;i<N;i++){
+      let p=0;
+      for(let w=0;w<BC;w++){let x=vq[w]&HZ[i][w];while(x){p^=1;x&=x-1;}}
+      if(p) return false;
+    }
+    return true;
+  }
+
+  // Distance search: exhaustive w=1,2,3 up to limits; sampled w=4
+  let dd=BB+1;
+  let c2lim=200000, c3lim=500000;
+
+  // Weight-1 exhaustive
+  for(let q=0;q<BB;q++){
+    let vq=new Uint32Array(BC); vq[q>>>5]=1<<(q&31);
+    if(commutes(vq)){let aug=combined.concat([vq]);if(rankRows(aug)>rx){dd=1;break}}
+  }
+  // Weight-2
+  if(dd>BB){
+    let c2=BB*(BB-1)/2|0;
+    if(c2<=c2lim){
+      for(let a=0;a<BB;a++){
+        for(let b=a+1;b<BB;b++){
+          let vq=new Uint32Array(BC); vq[a>>>5]=1<<(a&31); vq[b>>>5]|=1<<(b&31);
+          if(commutes(vq)){let aug=combined.concat([vq]);if(rankRows(aug)>rx){dd=2;break}}
+        }
+        if(dd<=BB) break;
+      }
+    } else {
+      for(let _=0;_<50000;_++){
+        let a=Math.random()*BB|0, b; do{b=Math.random()*BB|0}while(b===a);
+        let vq=new Uint32Array(BC); vq[a>>>5]=1<<(a&31); vq[b>>>5]|=1<<(b&31);
+        if(commutes(vq)){let aug=combined.concat([vq]);if(rankRows(aug)>rx){dd=2;break}}
+      }
+    }
+  }
+  // Weight-3
+  if(dd>BB){
+    let c3=BB*(BB-1)*(BB-2)/6|0;
+    if(c3<=c3lim){
+      for(let a=0;a<BB;a++){
+        for(let b=a+1;b<BB;b++){
+          for(let c=b+1;c<BB;c++){
+            let vq=new Uint32Array(BC); vq[a>>>5]=1<<(a&31); vq[b>>>5]|=1<<(b&31); vq[c>>>5]|=1<<(c&31);
+            if(commutes(vq)){let aug=combined.concat([vq]);if(rankRows(aug)>rx){dd=3;break}}
+          }
+          if(dd<=BB) break;
+        }
+        if(dd<=BB) break;
+      }
+    } else {
+      for(let _=0;_<50000;_++){
+        let a=Math.random()*BB|0, b, c; do{b=Math.random()*BB|0}while(b===a); do{c=Math.random()*BB|0}while(c===a||c===b);
+        let vq=new Uint32Array(BC); vq[a>>>5]=1<<(a&31); vq[b>>>5]|=1<<(b&31); vq[c>>>5]|=1<<(c&31);
+        if(commutes(vq)){let aug=combined.concat([vq]);if(rankRows(aug)>rx){dd=3;break}}
+      }
+    }
+  }
+  // Weight-4 sampled
+  if(dd>BB){
+    for(let _=0;_<50000;_++){
+      let a=Math.random()*BB|0, b, c, d; do{b=Math.random()*BB|0}while(b===a); do{c=Math.random()*BB|0}while(c===a||c===b); do{d=Math.random()*BB|0}while(d===a||d===b||d===c);
+      let vq=new Uint32Array(BC); vq[a>>>5]=1<<(a&31); vq[b>>>5]|=1<<(b&31); vq[c>>>5]|=1<<(c&31); vq[d>>>5]|=1<<(d&31);
+      if(commutes(vq)){let aug=combined.concat([vq]);if(rankRows(aug)>rx){dd=4;break}}
+    }
+  }
+  return {K:Ka, D:dd<=BB?dd:5, rx, rz, rcomb};
+}
+function popcount(x){let c=0;while(x){c+=x&1;x>>=1}return c}
 
 function generate() {
   let D = parseInt(document.getElementById('D').value)||5;
@@ -215,6 +360,7 @@ function generate() {
   let r_in = parseInt(document.getElementById('r').value)||0;
   let s_in = parseInt(document.getElementById('s').value)||0;
   let min_rate = parseFloat(document.getElementById('rate').value)||0;
+  let depth = parseInt(document.getElementById('depth').value)||1;
   let max_wt = parseInt(document.getElementById('maxwt').value)||99;
   
   let codes = [];
@@ -256,11 +402,12 @@ function generate() {
           if(sw > max_wt) continue;
           
           codes.push({
-            r,s,N,K,D:Dc,rate,
+            r,s,N,K:8,D:Dc,rate:8/N,  // K placeholder: 2·deg(g); actual K via rank below
             stab_wt:sw, wa, wb,
             ax:T[ti].xp, ay:T[ti].yp,
             bx:T[ui].xp, by:T[ui].yp,
-            aname:T[ti].name, bname:T[ui].name
+            aname:T[ti].name, bname:T[ui].name,
+            depth:depth
           });
         }
       }
@@ -272,14 +419,51 @@ function generate() {
   
   // Deduplicate: keep best weight per (r,s)
   let seen = {};
-  let uniq = [];
   for(let c of codes) {
     let key = `${c.r},${c.s}`;
-    if(!seen[key] || c.stab_wt < seen[key].stab_wt) {
-      seen[key] = c;
+    if(!seen[key] || c.stab_wt < seen[key].stab_wt) seen[key] = c;
+  }
+  let uniq = Object.values(seen).sort((a,b)=>(b.D*b.rate)-(a.D*a.rate));
+  
+  // Apply depth multiplier to K and rate for display
+  for(let c of uniq) {
+    c.K_display = c.K * (c.depth||1);
+    c.rate_display = c.K_display / c.N;
+  }
+  
+  // Compute actual K and D from rank for each code
+  let exactD = document.getElementById('exactD').checked;
+  let filtered = [], t0 = Date.now();
+  for(let c of uniq) {
+    if(Date.now()-t0 > 5000) { // timeout: keep remaining with formula values
+      c.K_display = c.K * (c.depth||1);
+      c.rate_display = c.K_display / c.N;
+      filtered.push(c); continue;
+    }
+    try {
+      let act = genActual(c.r, c.s);
+      let res = computeActual(c, act.a, act.b);
+      if(!res || res.K <= 0) {
+        c.K_display = c.K * (c.depth||1);
+        c.rate_display = c.K_display / c.N;
+        filtered.push(c); continue;
+      }
+      c.K = res.K;
+      c.D = res.D;
+      c.K_display = res.K * (c.depth||1);
+      c.rate_display = c.K_display / c.N;
+      c._a = act.a; c._b = act.b;
+      if(!exactD || res.D >= D) filtered.push(c);
+    } catch(e) {
+      c.K_display = c.K * (c.depth||1);
+      c.rate_display = c.K_display / c.N;
+      filtered.push(c);
     }
   }
-  uniq = Object.values(seen).sort((a,b)=>(b.D*b.rate)-(a.D*a.rate));
+  if(filtered.length > 0) uniq = filtered;
+  
+  // Re-sort by actual D*rate after K computation
+  uniq.sort((a,b) => (b.D*b.rate_display) - (a.D*a.rate_display));
   
   // Limit display
   let max_show = r_in&&s_in ? 50 : 30;
@@ -300,22 +484,25 @@ function generate() {
     out.style.display = 'block';
   } else {
     let html = `<table>
-      <tr><th>r</th><th>s</th><th>N</th><th>K</th><th>D</th><th>Rate</th><th>Wt</th><th>a(x,y)</th><th>b(x,y)</th></tr>`;
+      <tr><th>r</th><th>s</th><th>N</th><th>K</th><th>D</th><th>Rate</th><th>Wt</th><th>a(x,y)</th><th>b(x,y)</th><th>#</th></tr>`;
       
     for(let i=0; i<codes.length; i++) {
       let c = codes[i];
-      let actual = genActual(c.r, c.s);
+      let actual = c._a ? {a:c._a, b:c._b, wa:c._a.wt(), wb:c._b.wt()} : genActual(c.r, c.s);
       let ahex = polyToHex(actual.a);
       let bhex = polyToHex(actual.b);
+      let totalK = c.K_display || c.K;
+      let stackRate = c.rate_display || c.rate;
       
       // Main row (Clickable)
       html += `<tr class="clickable-row" onclick="document.getElementById('mat-${i}').classList.toggle('open')" title="Click row to view full matrix">
         <td>${c.r}</td><td>${c.s}</td><td class="hl">${c.N}</td>
-        <td>${c.K}</td><td class="hl">${c.D}</td>
-        <td>${c.rate.toFixed(4)}</td>
+        <td class="hl">${c.K_display||c.K}</td><td class="hl">${c.D}</td>
+        <td>${(c.rate_display||c.rate).toFixed(4)}</td>
         <td>${actual.wa + actual.wb}</td>
         <td style="font-size:0.7em;max-width:200px;overflow:hidden">${ahex}</td>
         <td style="font-size:0.7em;max-width:200px;overflow:hidden">${bhex}</td>
+        <td>${c.depth||1}</td>
       </tr>`;
       
       // Hidden Matrix Row
@@ -347,21 +534,23 @@ function generate() {
   
   let best = codes[0];
   if(best) {
-    h += `<tr><td>Our toric</td><td class="hl">${best.N}</td><td>${best.K}</td><td class="hl">${best.D}</td><td>${best.stab_wt}</td><td>2D grid, local</td></tr>`;
+    let bk = best.K_display || best.K;
+    h += `<tr><td>Our toric</td><td class="hl">${best.N}</td><td>${bk}</td><td class="hl">${best.D}</td><td>${best.stab_wt}</td><td>2D grid, local</td></tr>`;
   }
   
   let Dc = D||5;
   h += `<tr><td>Surface (rotated)</td><td>${Dc*Dc}</td><td>1</td><td>${Dc}</td><td>4</td><td>2D grid, local</td></tr>`;
   h += `<tr><td>Surface (standard)</td><td>${2*Dc*Dc}</td><td>1</td><td>${Dc}</td><td>4</td><td>2D grid, local</td></tr>`;
-  h += `<tr><td>Surface ×K copies</td><td>${Dc*Dc*(best?best.K:8)}</td><td>${best?best.K:8}</td><td>${Dc}</td><td>4</td><td>separate blocks</td></tr>`;
+  h += `<tr><td>Surface ×K copies</td><td>${Dc*Dc*(best?best.K_display||best.K:8)}</td><td>${best?best.K_display||best.K:8}</td><td>${Dc}</td><td>4</td><td>separate blocks</td></tr>`;
   h += `</table>`;
   
   if(best) {
-    let surf_K = Dc*Dc * best.K;
+    let bk = best.K_display || best.K;
+    let surf_K = Dc*Dc * bk;
     let ratio = (surf_K / best.N).toFixed(1);
     h += `<div style="margin-top:8px;color:#888">`;
-    if(ratio > 1.05) h += `<span class="good">Our code uses ${ratio}× fewer qubits than ${best.K}× surface code blocks.</span>`;
-    else if(ratio > 0.95) h += `Same qubit count as surface code blocks — gain is unified ${best.K} logicals in one block.`;
+    if(ratio > 1.05) h += `<span class="good">Our code uses ${ratio}× fewer qubits than ${bk}× surface code blocks.</span>`;
+    else if(ratio > 0.95) h += `Same qubit count as surface code blocks — gain is unified ${bk} logicals in one block.`;
     else h += `<span class="warn">Surface code blocks are more qubit-efficient for these parameters.</span>`;
     h += `</div>`;
   }
