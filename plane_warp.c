@@ -98,6 +98,32 @@ void gen_line(int r, int s, uint8_t *err, int n_lines, int llen) {
     }
 }
 
+// ---- Topological stabilizer check ----
+// diff is a stabilizer iff ALL row/col parity sums are even
+// within each of the 4 parity sub-lattices. Odd parity = logical wrap.
+int is_stabilizer(int r, int s, uint8_t *diff) {
+    for(int px=0;px<2;px++) for(int py=0;py<2;py++) {
+        int hr=r/2, hs=s/2;
+        for(int si=0;si<hr;si++) {
+            int rp=0;
+            for(int sj=0;sj<hs;sj++) {
+                int qi=px+2*si, qj=py+2*sj;
+                if(diff[qi*s+qj]) rp^=1;
+            }
+            if(rp) return 0;
+        }
+        for(int sj=0;sj<hs;sj++) {
+            int cp=0;
+            for(int si=0;si<hr;si++) {
+                int qi=px+2*si, qj=py+2*sj;
+                if(diff[qi*s+qj]) cp^=1;
+            }
+            if(cp) return 0;
+        }
+    }
+    return 1;
+}
+
 // ---- Test ----
 int main(int argc, char **argv) {
     int r=40, s=40, weight=0, trials=200, seed=42, bench=0, mode=0;
@@ -134,10 +160,7 @@ int main(int argc, char **argv) {
                     solve_plane(r,s,syn,dec);
                     uint8_t diff[MAX_N];
                     for(int q=0;q<n;q++) diff[q]=err[q]^dec[q];
-                    syndrome_of(r,s,diff,syn); // check if diff is stabilizer
-                    int is_stab=1;
-                    for(int q=0;q<n;q++) if(syn[q]){is_stab=0;break;}
-                    if(is_stab) ok++;
+                    if(is_stabilizer(r,s,diff)) ok++;
                 }
                 printf("%8d %8s %7.1f%%\n",w,
                     ok==trials?"ALL":({static char b[16];snprintf(b,16,"%d/%d",ok,trials);b;}),
@@ -155,10 +178,7 @@ int main(int argc, char **argv) {
             solve_plane(r,s,syn,dec);
             uint8_t diff[MAX_N];
             for(int q=0;q<n;q++) diff[q]=err[q]^dec[q];
-            syndrome_of(r,s,diff,syn);
-            int is_stab=1;
-            for(int q=0;q<n;q++) if(syn[q]){is_stab=0;break;}
-            if(is_stab) ok++;
+            if(is_stabilizer(r,s,diff)) ok++;
         }
         printf("Weight-%d: %d/%d (%.1f%%)\n",weight,ok,trials,100.0*ok/trials);
     }
