@@ -131,6 +131,18 @@ int is_stabilizer(int r, int s, uint8_t *diff) {
     return 1;
 }
 
+// Full CSS decode: X-errors via HZ (a), Z-errors via HX (b = g shifted by (2,2))
+// Z-syndrome is the same plus-shape pattern as X but shifted — reuse solve_plane.
+int decode_Z(int r, int s, uint8_t *err_z, uint8_t *dec_z) {
+    int n=r*s; uint8_t syn[MAX_N]; memset(syn,0,n);
+    for(int q=0;q<n;q++) if(err_z[q]) {
+        int qi=q/s, qj=q%s;
+        for(int di=0;di<=2;di+=2) for(int dj=0;dj<=2;dj+=2)
+            syn[((qi+2-di+r)%r)*s + ((qj+2-dj+s)%s)] ^= 1;
+    }
+    return solve_plane(r,s,syn,dec_z);
+}
+
 // ---- Test ----
 int main(int argc, char **argv) {
     int r=40, s=40, weight=0, trials=200, seed=42, bench=0, mode=0;
