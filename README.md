@@ -96,10 +96,58 @@ plane_warp.c (~200 lines)
 
 ## Theoretical Basis
 
-The code family has `g = (x²+1)(y²+1) = (x+1)²(y+1)²` over GF(2). The circulant operator from `g` has rank `(r-2)(s-2)` via Kronecker decomposition. 
+### Polynomial-to-Recurrence Mapping
 
-The 4D nullspace corresponds to the 2×2 corner degrees of freedom. The distance bound `D = min(r/2, s/2)` follows from the theorem guarantee.
+The code is defined by a bivariate polynomial `a(x,y)` over GF(2) on the quotient ring `R = GF(2)[x,y]/(x^r+1, y^s+1)`. Each term `x^i y^j` in `a(x,y)` contributes a shift operator `T_{i,j}` to the 2D circulant matrix `A`. The Z-check at position `(u,v)` is the convolution:
 
-The plane-warp decoder is the closed-form solution to the ML decoding problem for this code family. 
+```
+c(u,v) = Σ_{(i,j) ∈ supp(a)} q(u-i, v-j) mod 2
+```
 
-It is provably exact for all error patterns with weight below the code distance, and empirically near-optimal for correlated noise.
+For `g = (x²+1)(y²+1) = 1 + x² + y² + x²y²`, the support is `{(0,0),(2,0),(0,2),(2,2)}`, giving the plus-shaped recurrence:
+
+```
+c(u,v) = q(u,v) ⊕ q(u-2,v) ⊕ q(u,v-2) ⊕ q(u-2,v-2)
+```
+
+This is a 2D linear recurrence with stride 2 in both directions. The equation can be solved by fixing a "cut set" of qubits that breaks all cyclic dependencies, then propagating the recurrence from the cut outward. The nullspace dimension `d` equals the number of qubits in the minimal cut:
+
+```
+d = deg( gcd( a(x,y), x^r+1, y^s+1 ) )
+```
+
+For `g = (x²+1)(y²+1)`: `gcd(g, x^r+1, y^s+1) = (x+1)²(y+1)²`, which has degree 4. The 2×2 corner at any stride-2 position is a valid cut set.
+
+### Generalization to Other Polynomials
+
+The plane-warp principle generalizes to any bivariate bicycle code. Given `a(x,y)` with `k` terms:
+
+1. **Compute the nullspace dimension** `d = deg(gcd(a, x^r+1, y^s+1))`
+2. **Find a cut set** of `d` qubits whose removal breaks all cycles in the dependency graph. For separable polynomials `a(x,y) = a_x(x)·a_y(y)`, the cut is a `d_x × d_y` block (Kronecker structure). For non-separable polynomials, the cut is found by Gaussian elimination on the `n×n` circulant matrix.
+3. **Propagate the recurrence** from the cut outward — the cut values uniquely determine all other qubits
+4. **Enumerate all `2^d` nullspace choices**, select the minimum-weight solution
+
+The recurrence formula depends on the polynomial support:
+
+```
+q(u,v) = c(u,v) ⊕ Σ_{(i,j)∈supp(a)\{(0,0)\}} q(u+i, v+j)
+```
+
+using forward propagation, or the inverse with backward propagation.
+
+**Examples of cut dimensions for different polynomials on an `r×s` torus:**
+
+| Polynomial `a(x,y)` | Terms | Nullspace `d` | Cut structure |
+|---|---|---|---|
+| `(x+1)(y+1)` | 4 | 4 | 2×2 corner, stride 1 |
+| `(x²+1)(y²+1)` | 4 | 4 | 2×2 corner, stride 2 |
+| `(x+1)(y²+1)` | 4 | 4 | 2×2 corner, mixed stride |
+| `1+x+y+xy` (surface) | 4 | `r+s-1` | Full boundary |
+| `(x+1)^k (y+1)^l` | `(k+1)(l+1)` | `k·l` | `k×l` block |
+| `x+1` (1D only) | 2 | 2 | 2 contiguous qubits |
+
+The decoder is agnostic to the polynomial — only the cut positions and nullspace dimension change. For small `d` (≤ 10), exhaustive nullspace enumeration (`2^d` candidates) remains tractable. For larger `d`, the plane-warp can be combined with iterative methods or restricted to a subspace of the nullspace.
+
+## License
+
+MIT
