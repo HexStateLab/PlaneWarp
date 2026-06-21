@@ -89,6 +89,34 @@ static void build_nullspace(int r, int s) {
     ns_ready=1;
 }
 
+// ---- Corner relocation: same two recurrences as above, but the
+// protected 2x2 "nullzone" block is anchored at an arbitrary (cx,cy)
+// instead of being pinned to the origin. Walking the fill in order
+// of increasing distance from (cx,cy) (rather than raw row-major
+// order) keeps every dependency already resolved when it's needed,
+// exactly mirroring the origin-anchored versions above.
+static void compute_base_at(int r, int s, uint8_t *syn, int cx, int cy, uint8_t *base) {
+    int n=r*s; memset(base,0,n);
+    for(int ri=0; ri<r; ri++) for(int rj=0; rj<s; rj++) {
+        if(ri<2 && rj<2) continue;
+        int qi=(cx+ri)%r, qj=(cy+rj)%s;
+        int qi2=(cx+ri-2+r)%r, qj2=(cy+rj-2+s)%s;
+        int ck=((qi-2+r)%r)*s+((qj-2+s)%s);   // syndrome offset is fixed by the code, not the corner
+        base[qi*s+qj] = syn[ck] ^ base[qi2*s+qj] ^ base[qi*s+qj2] ^ base[qi2*s+qj2];
+    }
+}
+static void build_nullspace_single_at(int r, int s, int cx, int cy, int h, uint8_t *ns) {
+    int n=r*s; memset(ns,0,n);
+    for(int dqi=0;dqi<2;dqi++) for(int dqj=0;dqj<2;dqj++)
+        if(h&(1<<(dqi*2+dqj))) ns[((cx+dqi)%r)*s+((cy+dqj)%s)]=1;
+    for(int ri=0; ri<r; ri++) for(int rj=0; rj<s; rj++) {
+        if(ri<2 && rj<2) continue;
+        int qi=(cx+ri)%r, qj=(cy+rj)%s;
+        int qi2=(cx+ri-2+r)%r, qj2=(cy+rj-2+s)%s;
+        ns[qi*s+qj] = ns[qi2*s+qj] ^ ns[qi*s+qj2] ^ ns[qi2*s+qj2];
+    }
+}
+
 // ---- Helpers: optimal 4-pattern per column/row (boundary-relative) ----
 // Boundary is the 2x2 block at (cx,cy). Protect those qubits.
 static int best_col_pat(int r, int s, uint8_t *p, int j, int px, int cx, int cy, int n) {
@@ -178,6 +206,82 @@ static void apply_row_free(int r, int s, uint8_t *p, int i, int py, int pat) {
     for(int j=py^1;j<s;j+=2) p[i*s+j]^=e1;
 }
 
+// ============================================================
+// LOCAL-MINIMA ESCAPE — plant the nullzone block inside the zone.
+//
+// Phases 1-2 inside solve_plane only ever anchor the 2x2 nullspace
+// corner at the fixed origin (0,0). All 16 corner-(0,0) choices feed
+// the same alternating col/row descent, so they all fall into the
+// same basin — for some torus syndromes that basin's floor is a
+// local minimum, not the global one. Relocating the corner block to
+// sit *inside the residual support of that local minimum* — the
+// area of qubits the stuck solution still thinks are flipped — seeds
+// the descent with a fresh basin centered exactly where the trouble
+// is, instead of guessing blindly. Only candidate corners actually
+// drawn from that zone are tried, and capped, so this stays O(n).
+// ============================================================
+#define MAX_ESCAPE_CORNERS 48
+static int solve_plane_escape(int r, int s, uint8_t *syn, uint8_t *out, double *best_wt) {
+    int n=r*s, improved=0;
+    static int cand_cx[MAX_ESCAPE_CORNERS], cand_cy[MAX_ESCAPE_CORNERS];
+    int ncand=0;
+    // The zone of local minima = support of the current best (stuck) solution.
+    for(int q=0; q<n && ncand<MAX_ESCAPE_CORNERS; q++) {
+        if(!out[q]) continue;
+        int qi=q/s, qj=q%s;
+        int cx=qi-(qi&1), cy=qj-(qj&1);  // align to the 2x2 parity block
+        int dup=0;
+        for(int k=0;k<ncand;k++) if(cand_cx[k]==cx && cand_cy[k]==cy) {dup=1;break;}
+        if(!dup) { cand_cx[ncand]=cx; cand_cy[ncand]=cy; ncand++; }
+    }
+    static uint8_t base[MAX_N], work[MAX_N], ns_h[MAX_N], base2[MAX_N];
+    for(int c=0;c<ncand;c++) {
+        int cx=cand_cx[c], cy=cand_cy[c];
+        compute_base_at(r,s,syn,cx,cy,base);
+        for(int h=0;h<16;h++) {
+            build_nullspace_single_at(r,s,cx,cy,h,ns_h);
+            for(int q=0;q<n;q++) work[q]=base[q]^ns_h[q];
+            for(int j=0;j<s;j++) for(int px=0;px<2;px++) {
+                int pat=best_col_pat_free(r,s,work,j,px,n);
+                apply_col_free(r,s,work,j,px,pat);
+            }
+            for(int i=0;i<r;i++) for(int py=0;py<2;py++) {
+                int pat=best_row_pat_free(r,s,work,i,py,n);
+                apply_row_free(r,s,work,i,py,pat);
+            }
+            double cur_wt=0; for(int q=0;q<n;q++) if(work[q]) cur_wt+=cost_map[q];
+            // Same iterative descent as phase 1, anchored back at (0,0) —
+            // the corner relocation only chooses the seed, not the descent.
+            for(;;) {
+                double prev=cur_wt;
+                memset(base2,0,n);
+                for(int qi=0;qi<r;qi++) for(int qj=0;qj<s;qj++)
+                    if(qi<2||qj<2) base2[qi*s+qj]=work[qi*s+qj];
+                for(int qi=0;qi<r;qi++) for(int qj=0;qj<s;qj++) {
+                    if(qi<2||qj<2) continue;
+                    int ck=((qi-2+r)%r)*s+((qj-2+s)%s);
+                    base2[qi*s+qj]=syn[ck]^base2[((qi-2+r)%r)*s+qj]
+                                          ^base2[qi*s+((qj-2+s)%s)]
+                                          ^base2[((qi-2+r)%r)*s+((qj-2+s)%s)];
+                }
+                for(int j=0;j<s;j++) for(int px=0;px<2;px++) {
+                    int pat=best_col_pat_free(r,s,base2,j,px,n);
+                    apply_col_free(r,s,base2,j,px,pat);
+                }
+                for(int i=0;i<r;i++) for(int py=0;py<2;py++) {
+                    int pat=best_row_pat_free(r,s,base2,i,py,n);
+                    apply_row_free(r,s,base2,i,py,pat);
+                }
+                double w2=0; for(int q=0;q<n;q++) if(base2[q]) w2+=cost_map[q];
+                if(w2<cur_wt){cur_wt=w2;memcpy(work,base2,n);}
+                if(cur_wt==prev) break;
+            }
+            if(cur_wt < *best_wt) { *best_wt=cur_wt; memcpy(out,work,n); improved=1; }
+        }
+    }
+    return improved;
+}
+
 int solve_plane(int r, int s, uint8_t *syn, uint8_t *out) {
     int n=r*s; double best_wt=n+1.0;
     if(!ns_ready) build_nullspace(r,s);
@@ -264,6 +368,10 @@ int solve_plane(int r, int s, uint8_t *syn, uint8_t *out) {
         if(w3<best_wt){best_wt=w3;memcpy(out,base3,n);}
         if(best_wt==prev) break;
     }
+    // Phase 3: escape the torus's local-minima zone by relocating the
+    // nullzone block into it. Repeat — escaping can land in a new
+    // (smaller) local minimum whose own zone is worth re-probing too.
+    while(solve_plane_escape(r,s,syn,out,&best_wt)) { }
     return best_wt<=n;
 }
 
