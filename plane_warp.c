@@ -236,6 +236,248 @@ int solve_plane(int r, int s, uint8_t *syn, uint8_t *out) {
         }
         if(cur_wt<best_wt){best_wt=cur_wt;memcpy(out,work,n);}
     }
+    // Extended virtual expansion: try ROTATED optimization order
+    // (rows-first instead of columns-first) — different descent path.
+    for(;;) {
+        double prev=best_wt;
+        uint8_t base3[MAX_N]; memset(base3,0,n);
+        for(int qi=0;qi<r;qi++) for(int qj=0;qj<s;qj++) {
+            if(qi<2||qj<2) base3[qi*s+qj]=out[qi*s+qj];
+        }
+        for(int qi=0;qi<r;qi++) for(int qj=0;qj<s;qj++) {
+            if(qi<2||qj<2) continue;
+            int ck=((qi-2+r)%r)*s+((qj-2+s)%s);
+            base3[qi*s+qj]=syn[ck]^base3[((qi-2+r)%r)*s+qj]
+                                  ^base3[qi*s+((qj-2+s)%s)]
+                                  ^base3[((qi-2+r)%r)*s+((qj-2+s)%s)];
+        }
+        // ROTATED: rows-first then columns
+        for(int i=0;i<r;i++) for(int py=0;py<2;py++) {
+            int pat=best_row_pat_free(r,s,base3,i,py,n);
+            apply_row_free(r,s,base3,i,py,pat);
+        }
+        for(int j=0;j<s;j++) for(int px=0;px<2;px++) {
+            int pat=best_col_pat_free(r,s,base3,j,px,n);
+            apply_col_free(r,s,base3,j,px,pat);
+        }
+        double w3=0; for(int q=0;q<n;q++) if(base3[q]) w3+=cost_map[q];
+        if(w3<best_wt){best_wt=w3;memcpy(out,base3,n);}
+        if(best_wt==prev) break;
+    }
+    return best_wt<=n;
+}
+
+// ============================================================
+// LAYERED DECODER — explicit recursion to lower grid dimensions.
+//
+// The plus-shaped check only ever links qubits of equal parity
+// (qi mod 2, qj mod 2): every offset in syndrome_of is a multiple
+// of 2, so the r x s problem is exactly four independent
+// (r/2) x (s/2) problems, one per parity class. Each one obeys the
+// *same* recurrence at step 1 instead of step 2:
+//   S(a,b) = E(a,b) ^ E(a,b-1) ^ E(a-1,b) ^ E(a-1,b-1)   (mod hr,hs)
+// whose kernel is just "flip a whole row" / "flip a whole column"
+// (dimension hr+hs-1 per block, 4x that in total — the 156D figure
+// for hr=hs=20). Solve each block at this lower dimension and
+// recombine: that's the nullspace-driven recursive structure.
+// ============================================================
+
+static int blk_best_col(int m,int n,uint8_t *p,int j) {
+    int w0=0,w1=0;
+    for(int a=0;a<m;a++){ int v=p[a*n+j]; w0+=v; w1+=(v^1); }
+    return w1<w0;
+}
+static void blk_flip_col(int m,int n,uint8_t *p,int j){ for(int a=0;a<m;a++) p[a*n+j]^=1; }
+static int blk_best_row(int m,int n,uint8_t *p,int i) {
+    int w0=0,w1=0;
+    for(int b=0;b<n;b++){ int v=p[i*n+b]; w0+=v; w1+=(v^1); }
+    return w1<w0;
+}
+static void blk_flip_row(int m,int n,uint8_t *p,int i){ for(int b=0;b<n;b++) p[i*n+b]^=1; }
+
+// Particular solution of S(a,b)=E(a,b)^E(a,b-1)^E(a-1,b)^E(a-1,b-1)
+// given full row-0 / column-0 boundary values.
+static void blk_derive(int m,int n, uint8_t *S, uint8_t *row0, uint8_t *col0, uint8_t *E) {
+    int sz=m*n; memset(E,0,sz);
+    for(int b=0;b<n;b++) E[b]=row0[b];
+    for(int a=0;a<m;a++) E[a*n]=col0[a];
+    for(int a=1;a<m;a++) for(int b=1;b<n;b++)
+        E[a*n+b] = S[a*n+b]^E[(a-1)*n+b]^E[a*n+(b-1)]^E[(a-1)*n+(b-1)];
+}
+
+static void blk_sweep(int m,int n,uint8_t *work,int order) {
+    for(;;) {
+        int changed=0;
+        if(order==0) {
+            for(int j=0;j<n;j++) if(blk_best_col(m,n,work,j)){blk_flip_col(m,n,work,j);changed=1;}
+            for(int i=0;i<m;i++) if(blk_best_row(m,n,work,i)){blk_flip_row(m,n,work,i);changed=1;}
+        } else {
+            for(int i=0;i<m;i++) if(blk_best_row(m,n,work,i)){blk_flip_row(m,n,work,i);changed=1;}
+            for(int j=0;j<n;j++) if(blk_best_col(m,n,work,j)){blk_flip_col(m,n,work,j);changed=1;}
+        }
+        if(!changed) break;
+    }
+}
+
+// Solve one (m x n) parity-class block at the lower grid dimension:
+// 2 corner seeds x 2 sweep orders, each refined by a boundary-reseed
+// loop (mirrors solve_plane's own iterative descent), keep the best.
+// ---- MWPM decoder for step-1 toric code on hr x hs ----
+// Finds defect vertices (odd checks), computes minimum-weight perfect matching.
+static void solve_mwpm(int hr, int hs, uint8_t *sub_syn, uint8_t *sub_out) {
+    int n=hr*hs, nd=0, defects[256];
+    memset(sub_out,0,n);
+    // Collect defect positions: checks where syndrome=1
+    for(int a=0;a<hr;a++) for(int b=0;b<hs;b++)
+        if(sub_syn[a*hs+b]) defects[nd++]=a*hs+b;
+    if(nd==0) return;  // no errors
+    if(nd>30) {  // too many defects, fall back to sweep directly
+        memset(sub_out,0,n);
+        // Copy syndrome to base via recurrence, then sweep
+        uint8_t base[MAX_N]; memset(base,0,n);
+        for(int a=0;a<hr;a++) for(int b=0;b<hs;b++) {
+            if(a==0||b==0) continue;
+            int ca=(a-1+hr)%hr, cb=(b-1+hs)%hs, ck=ca*hs+cb;
+            base[a*hs+b]=sub_syn[ck]^base[((a-1+hr)%hr)*hs+b]
+                                      ^base[a*hs+((b-1+hs)%hs)]
+                                      ^base[((a-1+hr)%hr)*hs+((b-1+hs)%hs)];
+        }
+        memcpy(sub_out,base,n);
+        blk_sweep(hr,hs,sub_out,0);
+        return;
+    }
+    // Compute all-pairs shortest distances on torus
+    int dist[256][256];
+    for(int i=0;i<nd;i++) for(int j=0;j<nd;j++) {
+        int ai=defects[i]/hs, bi=defects[i]%hs;
+        int aj=defects[j]/hs, bj=defects[j]%hs;
+        int dx=abs(ai-aj), dy=abs(bi-bj);
+        dist[i][j]=(dx<hr-dx?dx:hr-dx)+(dy<hs-dy?dy:hs-dy);
+    }
+    // DP over subsets for minimum-weight perfect matching (nd <= 30, 2^15=32K max)
+    int half=1<<nd, dp[32768];
+    for(int m=0;m<half;m++) dp[m]=9999;
+    dp[0]=0;
+    for(int m=0;m<half;m++) {
+        if(dp[m]>=9999) continue;
+        // Find first unmatched defect
+        int u=-1;
+        for(int i=0;i<nd;i++) if(!(m&(1<<i))){u=i;break;}
+        if(u<0) continue;
+        for(int v=u+1;v<nd;v++) if(!(m&(1<<v))) {
+            int nm=m|(1<<u)|(1<<v);
+            int w=dp[m]+dist[u][v];
+            if(w<dp[nm]) dp[nm]=w;
+        }
+    }
+    int best_m=half-1, best_w=dp[half-1];
+    // Reconstruct matching and apply shortest paths
+    int m=best_m;
+    while(m) {
+        int u=-1,v=-1;
+        for(int i=0;i<nd;i++) if(m&(1<<i)){u=i;m^=(1<<i);break;}
+        for(int i=0;i<nd;i++) if(m&(1<<i)){v=i;m^=(1<<i);break;}
+        if(u<0||v<0) break;
+        // Flip qubits along shortest path from defects[u] to defects[v]
+        int au=defects[u]/hs, bu=defects[u]%hs;
+        int av=defects[v]/hs, bv=defects[v]%hs;
+        // Walk x then y (or y then x) on torus — shortest Manhattan path
+        int dx=(av-au+hr)%hr, sx=dx<=hr/2?1:-1;
+        int dy=(bv-bu+hs)%hs, sy=dy<=hs/2?1:-1;
+        int steps_x=dx<=hr/2?dx:hr-dx, steps_y=dy<=hs/2?dy:hs-dy;
+        for(int s=0;s<steps_x;s++) {
+            au=(au+sx+hr)%hr;
+            sub_out[au*hs+bu]^=1;
+        }
+        for(int s=0;s<steps_y;s++) {
+            bu=(bu+sy+hs)%hs;
+            sub_out[au*hs+bu]^=1;
+        }
+    }
+}
+
+static int solve_block_step1(int m, int n, uint8_t *S, uint8_t *out) {
+    int sz=m*n;
+    // Use MWPM for all sizes (DP up to 30 defects, sweep fallback)
+    if(sz <= 40000) {  // always use MWPM
+        solve_mwpm(m,n,S,out);
+        // Verify syndrome
+        uint8_t vsyn[MAX_N]; memset(vsyn,0,sz);
+        for(int a=0;a<m;a++) for(int b=0;b<n;b++) if(out[a*n+b])
+            for(int da=0;da<=1;da++) for(int db=0;db<=1;db++)
+                vsyn[((a-da+m)%m)*n+((b-db+n)%n)]^=1;
+        if(memcmp(vsyn,S,sz)==0) return 0;
+    }
+    // Fallback: standard sweep solver
+    int best=sz+1;
+    uint8_t row0[MAX_N], col0[MAX_N];
+    for (int corner=0; corner<2; corner++) {
+        memset(row0,0,n); memset(col0,0,m);
+        row0[0]=col0[0]=corner;
+        uint8_t base[MAX_N]; blk_derive(m,n,S,row0,col0,base);
+        for (int order=0; order<2; order++) {
+            uint8_t work[MAX_N]; memcpy(work,base,sz);
+            blk_sweep(m,n,work,order);
+            int wt=0; for(int q=0;q<sz;q++) wt+=work[q];
+            for(;;) {
+                for(int b=0;b<n;b++) row0[b]=work[b];
+                for(int a=0;a<m;a++) col0[a]=work[a*n];
+                uint8_t cand[MAX_N]; blk_derive(m,n,S,row0,col0,cand);
+                blk_sweep(m,n,cand,order);
+                int wt2=0; for(int q=0;q<sz;q++) wt2+=cand[q];
+                if (wt2<wt) { wt=wt2; memcpy(work,cand,sz); continue; }
+                break;
+            }
+            if (wt<best) { best=wt; memcpy(out,work,sz); }
+        }
+    }
+    return best;
+}
+
+// Recursive decomposition: split r x s into its 4 independent
+// (r/2) x (s/2) parity-class blocks, solve each at the lower grid
+// dimension, recombine. Falls back to solve_plane if r or s is odd
+// (no parity split exists in that case).
+int solve_plane_layered(int r, int s, uint8_t *syn, uint8_t *out) {
+    int n=r*s;
+    if (r%2 || s%2) return solve_plane(r,s,syn,out);
+    int hr=r/2, hs=s/2;
+    uint8_t sub_syn[MAX_N], sub_out[MAX_N];
+    for (int px=0; px<2; px++) for (int py=0; py<2; py++) {
+        for (int a=0;a<hr;a++) for (int b=0;b<hs;b++)
+            sub_syn[a*hs+b] = syn[(2*a+px)*s + (2*b+py)];
+        solve_block_step1(hr,hs,sub_syn,sub_out);
+        for (int a=0;a<hr;a++) for (int b=0;b<hs;b++)
+            out[(2*a+px)*s + (2*b+py)] = sub_out[a*hs+b];
+    }
+    // Cross-sub-lattice descent: use sub-lattice output as initial boundary,
+    // run full-grid extended descent to capture cross-boundary nullspace.
+    double best_wt=n+1.0; cost_init(n);
+    for(;;) {
+        double prev=best_wt;
+        uint8_t base3[MAX_N]; memset(base3,0,n);
+        for(int qi=0;qi<r;qi++) for(int qj=0;qj<s;qj++) {
+            if(qi<2||qj<2) base3[qi*s+qj]=out[qi*s+qj];
+        }
+        for(int qi=0;qi<r;qi++) for(int qj=0;qj<s;qj++) {
+            if(qi<2||qj<2) continue;
+            int ck=((qi-2+r)%r)*s+((qj-2+s)%s);
+            base3[qi*s+qj]=syn[ck]^base3[((qi-2+r)%r)*s+qj]
+                                  ^base3[qi*s+((qj-2+s)%s)]
+                                  ^base3[((qi-2+r)%r)*s+((qj-2+s)%s)];
+        }
+        for(int j=0;j<s;j++) for(int px=0;px<2;px++) {
+            int pat=best_col_pat_free(r,s,base3,j,px,n);
+            apply_col_free(r,s,base3,j,px,pat);
+        }
+        for(int i=0;i<r;i++) for(int py=0;py<2;py++) {
+            int pat=best_row_pat_free(r,s,base3,i,py,n);
+            apply_row_free(r,s,base3,i,py,pat);
+        }
+        double w3=0; for(int q=0;q<n;q++) if(base3[q]) w3+=cost_map[q];
+        if(w3<best_wt){best_wt=w3;memcpy(out,base3,n);}
+        if(best_wt==prev) break;
+    }
     return best_wt<=n;
 }
 
@@ -352,7 +594,11 @@ int main(int argc, char **argv) {
                     (g_fast?solve_plane_fast:solve_plane)(r,s,syn,dec);
                     uint8_t diff[MAX_N];
                     for(int q=0;q<n;q++) diff[q]=err[q]^dec[q];
-                    if(is_stabilizer(r,s,diff)) ok++;
+                    if(is_stabilizer(r,s,diff)) {
+                        // Verify syndrome consistency
+                        uint8_t chk[MAX_N]; syndrome_of(r,s,dec,chk);
+                        if(memcmp(chk,syn,n)==0) ok++;
+                    }
                 }
                 printf("%8d %8s %7.1f%%\n",w,
                     ok==trials?"ALL":({static char b[16];snprintf(b,16,"%d/%d",ok,trials);b;}),
@@ -370,7 +616,10 @@ int main(int argc, char **argv) {
             solve_plane(r,s,syn,dec);
             uint8_t diff[MAX_N];
             for(int q=0;q<n;q++) diff[q]=err[q]^dec[q];
-            if(is_stabilizer(r,s,diff)) ok++;
+            if(is_stabilizer(r,s,diff)) {
+                uint8_t chk[MAX_N]; syndrome_of(r,s,dec,chk);
+                if(memcmp(chk,syn,n)==0) ok++;
+            }
         }
         printf("Weight-%d: %d/%d (%.1f%%)\n",weight,ok,trials,100.0*ok/trials);
     }
