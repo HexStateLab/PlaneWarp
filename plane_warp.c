@@ -71,8 +71,8 @@ static int best_col_pat(int r, int s, uint8_t *p, int j, int px, int n) {
     int best=n+1, best_pat=0;
     for(int pat=0;pat<4;pat++) {
         int e0=pat&1, e1=(pat>>1)&1, wt=0;
-        for(int i=px;i<r;i+=2) if(p[i*s+j]^e0) wt++;
-        for(int i=px^1;i<r;i+=2) if(p[i*s+j]^e1) wt++;
+        for(int i=px;i<r;i+=2) if(!(i<2 && j<2) && (p[i*s+j]^e0)) wt++;
+        for(int i=px^1;i<r;i+=2) if(!(i<2 && j<2) && (p[i*s+j]^e1)) wt++;
         if(wt<best) {best=wt;best_pat=pat;}
     }
     return best_pat;
@@ -81,21 +81,21 @@ static int best_row_pat(int r, int s, uint8_t *p, int i, int py, int n) {
     int best=n+1, best_pat=0;
     for(int pat=0;pat<4;pat++) {
         int e0=pat&1, e1=(pat>>1)&1, wt=0;
-        for(int j=py;j<s;j+=2) if(p[i*s+j]^e0) wt++;
-        for(int j=py^1;j<s;j+=2) if(p[i*s+j]^e1) wt++;
+        for(int j=py;j<s;j+=2) if(!(i<2 && j<2) && (p[i*s+j]^e0)) wt++;
+        for(int j=py^1;j<s;j+=2) if(!(i<2 && j<2) && (p[i*s+j]^e1)) wt++;
         if(wt<best) {best=wt;best_pat=pat;}
     }
     return best_pat;
 }
 static void apply_col(int r, int s, uint8_t *p, int j, int px, int pat) {
     int e0=pat&1, e1=(pat>>1)&1;
-    for(int i=px;i<r;i+=2) p[i*s+j]^=e0;
-    for(int i=px^1;i<r;i+=2) p[i*s+j]^=e1;
+    for(int i=px;i<r;i+=2) if(!(i<2 && j<2)) p[i*s+j]^=e0;
+    for(int i=px^1;i<r;i+=2) if(!(i<2 && j<2)) p[i*s+j]^=e1;
 }
 static void apply_row(int r, int s, uint8_t *p, int i, int py, int pat) {
     int e0=pat&1, e1=(pat>>1)&1;
-    for(int j=py;j<s;j+=2) p[i*s+j]^=e0;
-    for(int j=py^1;j<s;j+=2) p[i*s+j]^=e1;
+    for(int j=py;j<s;j+=2) if(!(i<2 && j<2)) p[i*s+j]^=e0;
+    for(int j=py^1;j<s;j+=2) if(!(i<2 && j<2)) p[i*s+j]^=e1;
 }
 
 int solve_plane(int r, int s, uint8_t *syn, uint8_t *out) {
