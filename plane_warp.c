@@ -438,47 +438,70 @@ static int solve_block_step1(int m, int n, uint8_t *S, uint8_t *out) {
 // (r/2) x (s/2) parity-class blocks, solve each at the lower grid
 // dimension, recombine. Falls back to solve_plane if r or s is odd
 // (no parity split exists in that case).
+// Full decoder: 4 logical sectors × sub-lattice decompose × cross-boundary descent
 int solve_plane_layered(int r, int s, uint8_t *syn, uint8_t *out) {
     int n=r*s;
-    if (r%2 || s%2) return solve_plane(r,s,syn,out);
+    if(r%2 || s%2) return solve_plane(r,s,syn,out);
     int hr=r/2, hs=s/2;
-    uint8_t sub_syn[MAX_N], sub_out[MAX_N];
-    for (int px=0; px<2; px++) for (int py=0; py<2; py++) {
-        for (int a=0;a<hr;a++) for (int b=0;b<hs;b++)
-            sub_syn[a*hs+b] = syn[(2*a+px)*s + (2*b+py)];
-        solve_block_step1(hr,hs,sub_syn,sub_out);
-        for (int a=0;a<hr;a++) for (int b=0;b<hs;b++)
-            out[(2*a+px)*s + (2*b+py)] = sub_out[a*hs+b];
+    uint8_t best_full[MAX_N]; double best_full_wt=n+1.0;
+    // 4 logical sectors: I, X_L, Z_L, X_L·Z_L
+    for(int lop=0; lop<4; lop++) {
+        uint8_t syn_mod[MAX_N]; memcpy(syn_mod,syn,n);
+        // Inject logical: flip boundary syndromes (rows 0,r-2 for X; cols 0,s-2 for Z)
+        if(lop&1) for(int j=0;j<s;j++) { syn_mod[j]^=1; syn_mod[((r-2)%r)*s+j]^=1; }
+        if(lop&2) for(int i=0;i<r;i++) { syn_mod[i*s]^=1; syn_mod[i*s+((s-2)%s)]^=1; }
+        // Sub-lattice decompose and solve
+        uint8_t sub_syn[MAX_N], sub_out[MAX_N];
+        for(int px=0;px<2;px++) for(int py=0;py<2;py++) {
+            for(int a=0;a<hr;a++) for(int b=0;b<hs;b++)
+                sub_syn[a*hs+b]=syn_mod[(2*a+px)*s+(2*b+py)];
+            solve_block_step1(hr,hs,sub_syn,sub_out);
+            for(int a=0;a<hr;a++) for(int b=0;b<hs;b++)
+                out[(2*a+px)*s+(2*b+py)]=sub_out[a*hs+b];
+        }
+        double best_wt=n+1.0; cost_init(n);
+        // Cross-boundary descent
+        for(;;) {
+            double prev=best_wt;
+            uint8_t base3[MAX_N]; memset(base3,0,n);
+            for(int qi=0;qi<r;qi++) for(int qj=0;qj<s;qj++) {
+                if(qi<2||qj<2) base3[qi*s+qj]=out[qi*s+qj];
+            }
+            for(int qi=0;qi<r;qi++) for(int qj=0;qj<s;qj++) {
+                if(qi<2||qj<2) continue;
+                int ck=((qi-2+r)%r)*s+((qj-2+s)%s);
+                base3[qi*s+qj]=syn_mod[ck]^base3[((qi-2+r)%r)*s+qj]^base3[qi*s+((qj-2+s)%s)]^base3[((qi-2+r)%r)*s+((qj-2+s)%s)];
+            }
+            for(int j=0;j<s;j++) for(int px=0;px<2;px++) {
+                int pat=best_col_pat_free(r,s,base3,j,px,n);
+                apply_col_free(r,s,base3,j,px,pat);
+            }
+            for(int i=0;i<r;i++) for(int py=0;py<2;py++) {
+                int pat=best_row_pat_free(r,s,base3,i,py,n);
+                apply_row_free(r,s,base3,i,py,pat);
+            }
+            double w3=0; for(int q=0;q<n;q++) if(base3[q]) w3+=cost_map[q];
+            if(w3<best_wt){best_wt=w3;memcpy(out,base3,n);}
+            if(best_wt==prev) break;
+        }
+        // Logical cycle flips
+        for(int li=0;li<r;li++) {
+            uint8_t c[MAX_N]; memcpy(c,out,n);
+            for(int j=0;j<s;j++) c[li*s+j]^=1;
+            double w=0; for(int q=0;q<n;q++) if(c[q]) w+=cost_map[q];
+            if(w<best_wt){best_wt=w;memcpy(out,c,n);}
+        }
+        for(int lj=0;lj<s;lj++) {
+            uint8_t c[MAX_N]; memcpy(c,out,n);
+            for(int i=0;i<r;i++) c[i*s+lj]^=1;
+            double w=0; for(int q=0;q<n;q++) if(c[q]) w+=cost_map[q];
+            if(w<best_wt){best_wt=w;memcpy(out,c,n);}
+        }
+        double tot=0; for(int q=0;q<n;q++) if(out[q]) tot+=cost_map[q];
+        if(tot<best_full_wt){best_full_wt=tot;memcpy(best_full,out,n);}
     }
-    // Cross-sub-lattice descent: use sub-lattice output as initial boundary,
-    // run full-grid extended descent to capture cross-boundary nullspace.
-    double best_wt=n+1.0; cost_init(n);
-    for(;;) {
-        double prev=best_wt;
-        uint8_t base3[MAX_N]; memset(base3,0,n);
-        for(int qi=0;qi<r;qi++) for(int qj=0;qj<s;qj++) {
-            if(qi<2||qj<2) base3[qi*s+qj]=out[qi*s+qj];
-        }
-        for(int qi=0;qi<r;qi++) for(int qj=0;qj<s;qj++) {
-            if(qi<2||qj<2) continue;
-            int ck=((qi-2+r)%r)*s+((qj-2+s)%s);
-            base3[qi*s+qj]=syn[ck]^base3[((qi-2+r)%r)*s+qj]
-                                  ^base3[qi*s+((qj-2+s)%s)]
-                                  ^base3[((qi-2+r)%r)*s+((qj-2+s)%s)];
-        }
-        for(int j=0;j<s;j++) for(int px=0;px<2;px++) {
-            int pat=best_col_pat_free(r,s,base3,j,px,n);
-            apply_col_free(r,s,base3,j,px,pat);
-        }
-        for(int i=0;i<r;i++) for(int py=0;py<2;py++) {
-            int pat=best_row_pat_free(r,s,base3,i,py,n);
-            apply_row_free(r,s,base3,i,py,pat);
-        }
-        double w3=0; for(int q=0;q<n;q++) if(base3[q]) w3+=cost_map[q];
-        if(w3<best_wt){best_wt=w3;memcpy(out,base3,n);}
-        if(best_wt==prev) break;
-    }
-    return best_wt<=n;
+    memcpy(out,best_full,n);
+    return best_full_wt<=n;
 }
 
 // ---- Syndrome computation ----
