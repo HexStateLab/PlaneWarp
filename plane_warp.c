@@ -15,24 +15,6 @@
 // Adaptive corner: run one pass of threshold decoder (>=3 of 4 checks fire)
 // to get a rough error estimate, then use its centroid. O(n), much tighter
 // than raw syndrome centroid for multi-cluster errors.
-void adaptive_corner(int r, int s, uint8_t *syn, int *cx, int *cy) {
-    int n=r*s, sx=0, sy=0, count=0;
-    for(int qi=0;qi<r;qi++) for(int qj=0;qj<s;qj++) {
-        int q=qi*s+qj, hits=0;
-        for(int di=0;di<=2;di+=2) for(int dj=0;dj<=2;dj+=2)
-            hits += syn[((qi-di+r)%r)*s + ((qj-dj+s)%s)];
-        if(hits >= 3) { sx+=qi; sy+=qj; count++; }
-    }
-    if(count==0) {
-        // Fallback: raw syndrome centroid
-        for(int ci=0;ci<r;ci++) for(int cj=0;cj<s;cj++)
-            if(syn[ci*s+cj]) { sx+=ci; sy+=cj; count++; }
-    }
-    if(count==0) { *cx=0; *cy=0; return; }
-    *cx = (((sx + count/2) / count) & ~1) % r;
-    *cy = (((sy + count/2) / count) & ~1) % s;
-}
-
 // ---- Full 156D nullspace decoder via alternating optimization ----
 // Nullspace decomposes as v(i,j) = f(j) ⊕ g(i) ⊕ h(i%2,j%2).
 // f: 2·s DOF (even/odd pattern per column), g: 2·r DOF (per row), h: 4 DOF (corner).
