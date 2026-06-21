@@ -60,13 +60,31 @@ int solve_plane_fast(int r, int s, uint8_t *syn, uint8_t *out) {
     return best_wt<=n;
 }
 
-// ---- Full 156D nullspace decoder via alternating optimization ----
-// Nullspace decomposes as v(i,j) = f(j) ⊕ g(i) ⊕ h(i%2,j%2).
-// f: 2·s DOF (even/odd pattern per column), g: 2·r DOF (per row), h: 4 DOF (corner).
-// Alternating column→row optimization converges to global ML in 2-3 iterations.
-// O(16 × 3 × n) = O(n) per decode.
+// Precomputed 16 nullspace vectors: corner bits + propagated effects
+static uint8_t nullspace[16][MAX_N];
+static int ns_ready = 0;
 
-// Best pattern (0..3) for a column/row in a parity class
+static void build_nullspace(int r, int s) {
+    int n=r*s;
+    for(int h=0; h<16; h++) {
+        memset(nullspace[h],0,n);
+        // Set corner bits as boundary
+        for(int qi=0;qi<2;qi++) for(int qj=0;qj<2;qj++)
+            if(h&(1<<(qi*2+qj))) nullspace[h][qi*s+qj]=1;
+        // Propagate from boundary (OR-skip: rows 0-1 and cols 0-1 are fixed)
+        for(int qi=0;qi<r;qi++) for(int qj=0;qj<s;qj++) {
+            if(qi<2 || qj<2) continue;
+            int ci2=(qi-2+r)%r, cj2=(qj-2+s)%s;
+            nullspace[h][qi*s+qj] =
+                nullspace[h][((qi-2+r)%r)*s+qj]
+              ^ nullspace[h][qi*s+((qj-2+s)%s)]
+              ^ nullspace[h][((qi-2+r)%r)*s+((qj-2+s)%s)];
+        }
+    }
+    ns_ready=1;
+}
+
+// ---- Helpers: optimal 4-pattern per column/row (non-boundary qubits only) ----
 static int best_col_pat(int r, int s, uint8_t *p, int j, int px, int n) {
     int best=n+1, best_pat=0;
     for(int pat=0;pat<4;pat++) {
@@ -100,24 +118,24 @@ static void apply_row(int r, int s, uint8_t *p, int i, int py, int pat) {
 
 int solve_plane(int r, int s, uint8_t *syn, uint8_t *out) {
     int n=r*s, best_wt=n+1;
+    if(!ns_ready) build_nullspace(r,s);
     
-    // Compute particular solution at corner (0,0), ns=0
+    // Compute particular solution at corner (0,0), h=0 (boundary: rows 0-1, cols 0-1)
     uint8_t base[MAX_N]; memset(base,0,n);
     for(int qi=0;qi<r;qi++) for(int qj=0;qj<s;qj++) {
-        if(qi<2 && qj<2) continue;
+        if(qi<2 || qj<2) continue;
         int ci2=(qi-2+r)%r, cj2=(qj-2+s)%s, ck=ci2*s+cj2;
         base[qi*s+qj] = syn[ck] ^ base[((qi-2+r)%r)*s+qj]
                                  ^ base[qi*s+((qj-2+s)%s)]
                                  ^ base[((qi-2+r)%r)*s+((qj-2+s)%s)];
     }
     
-    // Try all 16 corner (h) choices
+    // Try all 16 corner (h) choices: shift by full nullspace vector, then alt opt
     for(int h=0; h<16; h++) {
-        uint8_t work[MAX_N]; memcpy(work,base,n);
-        for(int qi=0;qi<2;qi++) for(int qj=0;qj<2;qj++)
-            if(h&(1<<(qi*2+qj))) work[qi*s+qj]^=1;
+        uint8_t work[MAX_N];
+        for(int q=0;q<n;q++) work[q]=base[q]^nullspace[h][q];
         
-        // Alternating optimization: column→row, 3 iterations
+        // Alternating optimization on non-boundary qubits only
         for(int it=0; it<3; it++) {
             for(int j=0;j<s;j++) for(int px=0;px<2;px++) {
                 int pat=best_col_pat(r,s,work,j,px,n);
