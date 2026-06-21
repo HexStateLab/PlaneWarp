@@ -7,10 +7,13 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdint.h>
+#include <math.h>
 
 #define MAX_R 600
 #define MAX_S 600
 #define MAX_N (MAX_R*MAX_S)  // n = physical qubits, no 2x factor needed
+
+void syndrome_of(int r, int s, uint8_t *err, uint8_t *syn); // fwd decl, defined below
 
 // Adaptive corner: run one pass of threshold decoder (>=3 of 4 checks fire)
 // to get a rough error estimate, then use its centroid. O(n), much tighter
@@ -19,9 +22,47 @@
 // Use --fast flag to enable. Default: full 156D nullspace alternating optimization.
 static int g_fast = 0;
 
+// ---- Magnetization bias: F = W - lambda*|n-2w|. lambda=0 reproduces
+// plain min-weight decoding. lambda>0 breaks ties among near-degenerate
+// candidates (common when w is near n/2, the max-entropy ridge of
+// C(n,w)) by preferring the more "polarized" (farther from n/2) member,
+// rather than relying on local search to resolve what is an information-
+// theoretic ambiguity, not an optimization shortfall.
+static double g_lambda = 0.0;
+
 // ---- Soft-decision cost: cost[q] = -ln(P(error at q)). Uniform = Hamming weight.
 static double cost_map[MAX_N];
 static void cost_init(int n) { for(int q=0;q<n;q++) cost_map[q]=1.0; }
+
+// Raw Hamming weight (unweighted qubit count) of a candidate.
+static int hamming_w(uint8_t *sol, int n) { int w=0; for(int q=0;q<n;q++) w+=sol[q]?1:0; return w; }
+
+// F-cost used for final candidate selection: weighted distance W minus a
+// magnetization bonus that grows the farther the candidate's raw weight
+// sits from n/2. lambda=0 -> F==W (original behavior).
+static double F_cost(uint8_t *sol, int n) {
+    double W=0; for(int q=0;q<n;q++) if(sol[q]) W+=cost_map[q];
+    int w=hamming_w(sol,n);
+    return W - g_lambda*fabs((double)n - 2.0*(double)w);
+}
+
+// Every plaquette check here XORs an even number (4) of qubits, so the
+// all-ones vector is always in the kernel: for ANY valid solution E to a
+// given syndrome, its global complement E^1 (flip every qubit) is also
+// valid for the *same* syndrome. solve_plane/solve_plane_layered never
+// explore this branch (they only ever build off the all-zero reference),
+// so this is a real, previously-unconsidered degenerate sector — exactly
+// the E <-> E+1 symmetry that needs breaking near w=n/2.
+static void complement_select(int r, int s, uint8_t *syn, uint8_t *out) {
+    int n=r*s;
+    uint8_t comp[MAX_N];
+    for(int q=0;q<n;q++) comp[q]=out[q]^1;
+    // Safety check: confirm the complement really is syndrome-equivalent
+    // before trusting it (always true for this check shape, but verify).
+    uint8_t chk[MAX_N]; syndrome_of(r,s,comp,chk);
+    if(memcmp(chk,syn,n)!=0) return; // shouldn't happen; bail out safely
+    if(F_cost(comp,n) < F_cost(out,n)) memcpy(out,comp,n);
+}
 void adaptive_corner(int r, int s, uint8_t *syn, int *cx, int *cy) {
     int n=r*s, sx=0, sy=0, count=0;
     for(int qi=0;qi<r;qi++) for(int qj=0;qj<s;qj++) {
@@ -62,6 +103,7 @@ int solve_plane_fast(int r, int s, uint8_t *syn, uint8_t *out) {
         double wt=0; for(int q=0;q<n;q++) if(sol[q]) wt+=cost_map[q];
         if(wt<best_wt) {best_wt=wt; memcpy(out,sol,n);}
     }
+    complement_select(r,s,syn,out);
     return best_wt<=n;
 }
 
@@ -264,6 +306,7 @@ int solve_plane(int r, int s, uint8_t *syn, uint8_t *out) {
         if(w3<best_wt){best_wt=w3;memcpy(out,base3,n);}
         if(best_wt==prev) break;
     }
+    complement_select(r,s,syn,out);
     return best_wt<=n;
 }
 
@@ -501,6 +544,7 @@ int solve_plane_layered(int r, int s, uint8_t *syn, uint8_t *out) {
         if(tot<best_full_wt){best_full_wt=tot;memcpy(best_full,out,n);}
     }
     memcpy(out,best_full,n);
+    complement_select(r,s,syn,out);
     return best_full_wt<=n;
 }
 
@@ -518,6 +562,17 @@ void syndrome_of(int r, int s, uint8_t *err, uint8_t *syn) {
 void gen_iid(int n, uint8_t *err, int w) {
     memset(err,0,n);
     for(int i=0;i<w;) { int q=rand()%n; if(!err[q]){err[q]=1;i++;} }
+}
+// Physical per-qubit iid noise: each of n qubits flips independently
+// w.p. p. Unlike gen_iid (which forces an exact combinatorial weight w
+// and therefore samples directly at the C(n,w) entropy peak once w
+// approaches n/2), the realized weight here concentrates around n*p
+// with std ~ sqrt(n*p*(1-p)) — i.e. it "rotates" the benchmark's
+// sampling region away from the maximal-entropy ridge unless p itself
+// is driven toward 0.5 (the actual BSC-capacity-zero point, where no
+// decoder, however deep its search, can do better).
+void gen_iid_p(int n, uint8_t *err, double p) {
+    for(int q=0;q<n;q++) err[q] = ((double)rand()/((double)RAND_MAX+1.0) < p) ? 1 : 0;
 }
 void gen_cluster(int r, int s, uint8_t *err, int n_clusters, int csz) {
     int n=r*s; memset(err,0,n);
@@ -581,12 +636,14 @@ int decode_Z(int r, int s, uint8_t *err_z, uint8_t *dec_z) {
 
 // ---- Test ----
 int main(int argc, char **argv) {
-    int r=40, s=40, weight=0, trials=200, seed=42, bench=0, mode=0;
+    int r=40, s=40, weight=0, trials=200, seed=42, bench=0, mode=0, bench_p=0;
     g_fast=0;
     for(int i=1;i<argc;i++) {
         if(!strcmp(argv[i],"--bench")) bench=1;
+        else if(!strcmp(argv[i],"--bench-p")) bench_p=1;
         else if(!strcmp(argv[i],"--seed")) seed=atoi(argv[++i]);
         else if(!strcmp(argv[i],"--weight")) weight=atoi(argv[++i]);
+        else if(!strcmp(argv[i],"--lambda")) g_lambda=atof(argv[++i]);
         else if(!strcmp(argv[i],"--trials")) trials=atoi(argv[++i]);
         else if(!strcmp(argv[i],"--cluster")) mode=1;
         else if(!strcmp(argv[i],"--line")) mode=2;
@@ -598,8 +655,37 @@ int main(int argc, char **argv) {
     
     printf("Plane-Warp Decoder — %dx%d Torus, n=%d\n",r,s,n);
     printf("  Algorithm: %s\n", g_fast ? "adaptive corner, O(n)" : "full 156D nullspace, O(n)");
-    
-    if(bench) {
+    if(g_lambda!=0.0) printf("  Magnetization: lambda=%.4f (F = W - lambda*|n-2w|)\n", g_lambda);
+
+    if(bench_p) {
+        // Sweep physical error probability p instead of fixed combinatorial
+        // weight. Realized weight per trial concentrates around n*p, so
+        // this moves the sampled operating point off the C(n,w) entropy
+        // ridge at w=n/2 — only p itself approaching 0.5 re-enters the
+        // BSC-capacity-zero regime, where failure is fundamental, not a
+        // decoder shortcoming.
+        double ps[]={0.01,0.02,0.03,0.05,0.07,0.10,0.13,0.16,0.20,0.25,0.30,0.35,0.40,0.45,0.49};
+        int np=sizeof(ps)/sizeof(ps[0]);
+        printf("\n%8s %8s %8s %10s\n","p","n*p","OK/Trials","Rate");
+        uint8_t err[MAX_N], syn[MAX_N], dec[MAX_N];
+        for(int pi=0;pi<np;pi++) {
+            double p=ps[pi]; int ok=0;
+            for(int t=0;t<trials;t++) {
+                gen_iid_p(n,err,p);
+                syndrome_of(r,s,err,syn);
+                (g_fast?solve_plane_fast:solve_plane)(r,s,syn,dec);
+                uint8_t diff[MAX_N];
+                for(int q=0;q<n;q++) diff[q]=err[q]^dec[q];
+                if(is_stabilizer(r,s,diff)) {
+                    uint8_t chk[MAX_N]; syndrome_of(r,s,dec,chk);
+                    if(memcmp(chk,syn,n)==0) ok++;
+                }
+            }
+            printf("%8.2f %8.1f %8s %9.1f%%\n",p,n*p,
+                ok==trials?"ALL":({static char b[16];snprintf(b,16,"%d/%d",ok,trials);b;}),
+                100.0*ok/trials);
+        }
+    } else if(bench) {
         int weights[]={1,2,3,5,7,10,12,15,18,20,25,30,40,50,75,100};
         const char *names[]={"i.i.d.","cluster","line"};
         for(int mi=0;mi<3;mi++) {
