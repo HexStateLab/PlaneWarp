@@ -13,7 +13,7 @@ The `plane_warp` decoder on the 6×6 Bravyi-Bacon toric code delivers **84% logi
 | **Total qubits** | **72** |
 | CZ gates per round | 144 (4 per stabilizer × 36 checks) |
 | Code distance | d≈3 |
-| Logical qubits | 20 |
+| Logical qubits | 56 |
 | Encoding rate | 55.6% |
 | Stabilizer weight | 4 (plus-shaped) |
 
