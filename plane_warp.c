@@ -948,6 +948,92 @@ int run_selftest(int seed) {
     return fails;
 }
 
+// ============================================================
+// SYNDROME PRE-PROCESSOR — project noisy syndrome onto Im(H) by
+// solving the minimum-weight row/column parity correction.
+//
+// Constraint: a valid syndrome must have even parity in every row
+// and column of each of the 4 parity sub-lattices.  A measurement
+// flip breaks exactly one row and one column in its sub-lattice.
+//
+// We collect all odd rows and odd columns, then solve a minimum-
+// weight bipartite matching (Hungarian, O(k³)) to pair them.
+// Each matched pair (si,sj) identifies a flipped syndrome bit at
+// grid position (px+2*si, py+2*sj).
+//
+// This is the algebraic projection of S_meas onto Im(H):
+//   find N of minimal weight s.t. S_meas ⊕ N satisfies all 156
+//   sub-lattice row/column parity constraints.
+// ============================================================
+#define MAX_DEF 256
+
+static int hungarian(int n, int cost[MAX_DEF][MAX_DEF], int match_col[MAX_DEF]) {
+    int u[MAX_DEF+1], v[MAX_DEF+1], p[MAX_DEF+1], way[MAX_DEF+1];
+    memset(u,0,sizeof(u)); memset(v,0,sizeof(v)); memset(p,0,sizeof(p));
+    for(int i=1;i<=n;i++) {
+        p[0]=i; int j0=0;
+        int minv[MAX_DEF+1]; char used[MAX_DEF+1];
+        memset(minv,0x7f,sizeof(minv)); memset(used,0,sizeof(used));
+        do {
+            used[j0]=1;
+            int i0=p[j0], delta=0x7fffffff, j1=0;
+            for(int j=1;j<=n;j++) if(!used[j]) {
+                int cur=cost[i0-1][j-1]-u[i0]-v[j];
+                if(cur<minv[j]){ minv[j]=cur; way[j]=j0; }
+                if(minv[j]<delta){ delta=minv[j]; j1=j; }
+            }
+            for(int j=0;j<=n;j++) {
+                if(used[j]){ u[p[j]]+=delta; v[j]-=delta; }
+                else minv[j]-=delta;
+            }
+            j0=j1;
+        } while(p[j0]!=0);
+        do { int j1=way[j0]; p[j0]=p[j1]; j0=j1; } while(j0);
+    }
+    for(int j=1;j<=n;j++) match_col[p[j]-1]=j-1;
+    return 0;
+}
+
+static void preprocess_syndrome(int r, int s, uint8_t *syn) {
+    int hr=r/2, hs=s/2;
+    for(int pass=0;pass<3;pass++) {
+        int changed=0;
+        for(int px=0;px<2;px++) for(int py=0;py<2;py++) {
+            int odd_rows[MAX_DEF], odd_cols[MAX_DEF];
+            int nr=0, nc=0;
+            for(int si=0;si<hr;si++) {
+                int rp=0;
+                for(int sj=0;sj<hs;sj++) rp^=syn[(px+2*si)*s+(py+2*sj)];
+                if(rp&&nr<MAX_DEF) odd_rows[nr++]=si;
+            }
+            for(int sj=0;sj<hs;sj++) {
+                int cp=0;
+                for(int si=0;si<hr;si++) cp^=syn[(px+2*si)*s+(py+2*sj)];
+                if(cp&&nc<MAX_DEF) odd_cols[nc++]=sj;
+            }
+            if(nr==0||nc==0) continue;
+            int n=nr>nc?nr:nc; if(n>MAX_DEF) n=MAX_DEF;
+            int cost[MAX_DEF][MAX_DEF], match[MAX_DEF];
+            for(int i=0;i<n;i++) for(int j=0;j<n;j++) {
+                if(i<nr&&j<nc) {
+                    int dr=odd_rows[i]-odd_cols[j];
+                    dr=dr<0?-dr:dr;
+                    cost[i][j]=dr<hr-dr?dr:hr-dr;  // torus distance
+                } else cost[i][j]=999;
+            }
+            hungarian(n,cost,match);
+            for(int i=0;i<nr&&i<n;i++) {
+                int j=match[i];
+                if(j>=nc) continue;
+                int si=odd_rows[i], sj=odd_cols[j];
+                syn[(px+2*si)*s+(py+2*sj)]^=1;
+                changed=1;
+            }
+        }
+        if(!changed) break;
+    }
+}
+
 // ---- Test ----
 int main(int argc, char **argv) {
     int r=40, s=40, weight=0, trials=200, seed=42, bench=0, mode=0;
@@ -967,6 +1053,15 @@ int main(int argc, char **argv) {
             uint8_t syn[MAX_N], dec[MAX_N];
             int n=r*s;
             if (fread(syn,1,n,stdin)!=(size_t)n) { fprintf(stderr,"short read\n"); return 1; }
+            solve_plane(r,s,syn,dec);
+            fwrite(dec,1,n,stdout); fflush(stdout);
+            return 0;
+        }
+        else if(!strcmp(argv[i],"--decode-pp")) {
+            uint8_t syn[MAX_N], dec[MAX_N];
+            int n=r*s;
+            if (fread(syn,1,n,stdin)!=(size_t)n) { fprintf(stderr,"short read\n"); return 1; }
+            preprocess_syndrome(r,s,syn);
             solve_plane(r,s,syn,dec);
             fwrite(dec,1,n,stdout); fflush(stdout);
             return 0;
