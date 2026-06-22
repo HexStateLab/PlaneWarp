@@ -1096,24 +1096,39 @@ int main(int argc, char **argv) {
                 for(int q=0;q<n;q++) syn[q]=raw_syn[q]^guess_syn[q];
             }
             double base_cost=0; for(int q=0;q<n;q++) if(total_dec[q]) base_cost+=cost_map[q];
-            // Test residual positions: flip each, re-decode, keep if cheaper
-            uint8_t residual[MAX_N];
-            for(int q=0;q<n;q++) residual[q]=raw_syn[q]^syn[q];
-            for(int p=0;p<n;p++) if(residual[p]) {
-                uint8_t test_syn[MAX_N]; memcpy(test_syn,raw_syn,n);
-                test_syn[p]^=1;
-                preprocess_syndrome(r,s,test_syn);
-                uint8_t test_dec[MAX_N]; memset(test_dec,0,n);
-                for(int pass=0;pass<3;pass++) {
-                    preprocess_syndrome(r,s,test_syn);
-                    solve_plane(r,s,test_syn,dec);
-                    for(int q=0;q<n;q++) test_dec[q]^=dec[q];
-                    uint8_t gs[MAX_N];
-                    syndrome_of(r,s,test_dec,gs);
-                    for(int q=0;q<n;q++) test_syn[q]=raw_syn[q]^gs[q];
+            // Test preprocessor anomaly positions: each odd row/col pair
+            // identifies a candidate gate-error syndrome bit. Flip it,
+            // re-decode, keep if cheaper.
+            for(int px=0;px<2;px++) for(int py=0;py<2;py++) {
+                int hr=r/2, hs=s/2;
+                int odd_r[300], odd_c[300], nr=0, nc=0;
+                uint8_t syn_copy[MAX_N]; memcpy(syn_copy,raw_syn,n);
+                for(int si=0;si<hr;si++) {
+                    int rp=0; for(int sj=0;sj<hs;sj++) rp^=syn_copy[(px+2*si)*s+(py+2*sj)];
+                    if(rp) odd_r[nr++]=si;
                 }
-                double test_cost=0; for(int q=0;q<n;q++) if(test_dec[q]) test_cost+=cost_map[q];
-                if(test_cost<base_cost){base_cost=test_cost;memcpy(total_dec,test_dec,n);}
+                for(int sj=0;sj<hs;sj++) {
+                    int cp=0; for(int si=0;si<hr;si++) cp^=syn_copy[(px+2*si)*s+(py+2*sj)];
+                    if(cp) odd_c[nc++]=sj;
+                }
+                int k=nr<nc?nr:nc;
+                for(int i=0;i<k;i++) {
+                    int p=(px+2*odd_r[i])*s+(py+2*odd_c[i]);
+                    uint8_t test_syn[MAX_N]; memcpy(test_syn,raw_syn,n);
+                    test_syn[p]^=1;
+                    uint8_t test_dec[MAX_N]; memset(test_dec,0,n);
+                    memcpy(test_syn,raw_syn,n); test_syn[p]^=1;
+                    preprocess_syndrome(r,s,test_syn);
+                    for(int pass=0;pass<3;pass++) {
+                        preprocess_syndrome(r,s,test_syn);
+                        solve_plane(r,s,test_syn,dec);
+                        for(int q=0;q<n;q++) test_dec[q]^=dec[q];
+                        uint8_t gs[MAX_N]; syndrome_of(r,s,test_dec,gs);
+                        for(int q=0;q<n;q++) test_syn[q]=raw_syn[q]^gs[q];
+                    }
+                    double tc=0; for(int q=0;q<n;q++) if(test_dec[q]) tc+=cost_map[q];
+                    if(tc<base_cost){base_cost=tc;memcpy(total_dec,test_dec,n);}
+                }
             }
             fwrite(total_dec,1,n,stdout); fflush(stdout);
             return 0;
