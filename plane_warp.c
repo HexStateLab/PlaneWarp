@@ -1025,7 +1025,7 @@ int main(int argc, char **argv) {
             if (fread(raw_syn,1,n,stdin)!=(size_t)n) { fprintf(stderr,"short read\n"); return 1; }
             memcpy(syn, raw_syn, n);
             memset(total_dec, 0, n);
-            for(int pass=0;pass<5;pass++) {
+            for(int pass=0;pass<10;pass++) {
                 preprocess_syndrome(r,s,syn);
                 solve_plane(r,s,syn,dec);
                 for(int q=0;q<n;q++) total_dec[q]^=dec[q];
@@ -1053,22 +1053,30 @@ int main(int argc, char **argv) {
             fwrite(total_dec,1,n,stdout); fflush(stdout);
             return 0;
         }
-        else if(!strcmp(argv[i],"--decode-mr")) {
-            // Multi-round: stdin = round_count(u32) + round_count*N syndrome bytes
-            // Majority vote across rounds → preprocess → decode
-            uint8_t syn[MAX_N], mv_syn[MAX_N], dec[MAX_N];
-            int n=r*s, rounds;
-            if (fread(&rounds,4,1,stdin)!=1 || rounds<2 || rounds>16) { fprintf(stderr,"bad rounds\n"); return 1; }
+        else if(!strcmp(argv[i],"--decode-3d")) {
+            // 4D lift: decode each of 4 sub-lattice syndromes independently.
+            // Gate noise breaks the joint-image constraint: the 4 sub-lattice
+            // syndromes must come from the same error vector. MV across
+            // independent sub-lattice decodes filters gate-noise artifacts.
+            uint8_t syn_full[MAX_N], sub_syn[MAX_N], dec[MAX_N];
+            int n=r*s;
+            if (fread(syn_full,1,n,stdin)!=(size_t)n) { fprintf(stderr,"short read\n"); return 1; }
             int votes[MAX_N]; memset(votes,0,n*sizeof(int));
-            for(int rnd=0;rnd<rounds;rnd++) {
-                if (fread(syn,1,n,stdin)!=(size_t)n) { fprintf(stderr,"short read r%d\n",rnd); return 1; }
-                for(int q=0;q<n;q++) if(syn[q]) votes[q]++;
+            for(int px=0;px<2;px++) for(int py=0;py<2;py++) {
+                // Scatter sub-lattice syndrome to original grid positions
+                memset(sub_syn,0,n);
+                int hr=r/2, hs=s/2;
+                for(int si=0;si<hr;si++) for(int sj=0;sj<hs;sj++) {
+                    int pos=(px+2*si)*s+(py+2*sj);
+                    sub_syn[pos]=syn_full[pos];
+                }
+                solve_plane(r,s,sub_syn,dec);
+                for(int q=0;q<n;q++) if(dec[q]) votes[q]++;
             }
-            int thresh=rounds/2+1;
-            for(int q=0;q<n;q++) mv_syn[q]=(votes[q]>=thresh);
-            preprocess_syndrome(r,s,mv_syn);
-            solve_plane(r,s,mv_syn,dec);
-            fwrite(dec,1,n,stdout); fflush(stdout);
+            // MV across 4 sub-lattice decodes: ≥2/4 → correction
+            uint8_t out[MAX_N];
+            for(int q=0;q<n;q++) out[q]=(votes[q]>=2);
+            fwrite(out,1,n,stdout); fflush(stdout);
             return 0;
         }
         else if(!strcmp(argv[i],"--decode-z")) {
