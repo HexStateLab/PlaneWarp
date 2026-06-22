@@ -1004,44 +1004,6 @@ static void preprocess_syndrome(int r, int s, uint8_t *syn) {
 
 
 
-// ============================================================
-// SPACETIME DECODER — temporal tracking across measurement rounds.
-//
-// For each round t, compute the residual between the measured
-// syndrome and the syndrome implied by the accumulated correction:
-//   residual = S_t XOR H·total_dec
-// Preprocess residual (kill measurement noise), decode, accumulate.
-// This tracks both persistent data errors and per-round gate faults.
-// ============================================================
-static int decode_spacetime(int r, int s, int rounds,
-                            const uint8_t *rounds_buf, uint8_t *out) {
-    int n = r * s;
-    // Build confidence-weighted syndrome from temporal consistency.
-    // Bits present in ALL rounds = high confidence (data error).
-    // Bits present in SOME rounds = low confidence (gate noise).
-    uint8_t conf_syn[MAX_N]; memset(conf_syn, 0, n);
-    for (int q = 0; q < n; q++) {
-        int count = 0;
-        for (int t = 0; t < rounds; t++)
-            if (rounds_buf[(size_t)t * n + q]) count++;
-        // Only keep bits that appear in majority of rounds
-        if (count > rounds / 2) conf_syn[q] = 1;
-    }
-    // Decode the confidence-filtered syndrome
-    preprocess_syndrome(r, s, conf_syn);
-    uint8_t syn[MAX_N]; memcpy(syn, conf_syn, n);
-    uint8_t dec[MAX_N], total[MAX_N]; memset(total, 0, n);
-    for (int pass = 0; pass < 5; pass++) {
-        preprocess_syndrome(r, s, syn);
-        solve_plane(r, s, syn, dec);
-        for (int q = 0; q < n; q++) total[q] ^= dec[q];
-        uint8_t gs[MAX_N]; syndrome_of(r, s, total, gs);
-        for (int q = 0; q < n; q++) syn[q] = conf_syn[q] ^ gs[q];
-    }
-    memcpy(out, total, n);
-    return 1;
-}
-
 // ---- Test ----
 int main(int argc, char **argv) {
     int r=40, s=40, weight=0, trials=200, seed=42, bench=0, mode=0;
@@ -1061,10 +1023,9 @@ int main(int argc, char **argv) {
             uint8_t raw_syn[MAX_N], syn[MAX_N], dec[MAX_N], total_dec[MAX_N];
             int n=r*s;
             if (fread(raw_syn,1,n,stdin)!=(size_t)n) { fprintf(stderr,"short read\n"); return 1; }
-            // Path 1: full residual-loop decode
             memcpy(syn, raw_syn, n);
             memset(total_dec, 0, n);
-            for(int pass=0;pass<20;pass++) {
+            for(int pass=0;pass<10;pass++) {
                 preprocess_syndrome(r,s,syn);
                 solve_plane(r,s,syn,dec);
                 for(int q=0;q<n;q++) total_dec[q]^=dec[q];
@@ -1072,37 +1033,7 @@ int main(int argc, char **argv) {
                 syndrome_of(r,s,total_dec,guess_syn);
                 for(int q=0;q<n;q++) syn[q]=raw_syn[q]^guess_syn[q];
             }
-            double w_full=0; for(int q=0;q<n;q++) if(total_dec[q]) w_full+=1.0;
-            // Path 2: 3D sub-lattice min-weight decode
-            uint8_t best3d[MAX_N]; double w_3d=n+1; int got3d=0;
-            preprocess_syndrome(r,s,raw_syn);
-            for(int u=0;u<4;u++) {
-                int px=u/2, py=u%2;
-                uint8_t sub_syn[MAX_N]; memset(sub_syn,0,n); int has=0;
-                int hr=r/2, hs=s/2;
-                for(int si=0;si<hr;si++) for(int sj=0;sj<hs;sj++) {
-                    int pos=(px+2*si)*s+(py+2*sj);
-                    if((sub_syn[pos]=raw_syn[pos])) has=1;
-                }
-                if(!has) continue;
-                memcpy(syn,sub_syn,n);
-                uint8_t td[MAX_N]; memset(td,0,n);
-                for(int pass=0;pass<5;pass++) {
-                    preprocess_syndrome(r,s,syn);
-                    solve_plane(r,s,syn,dec);
-                    for(int q=0;q<n;q++) td[q]^=dec[q];
-                    uint8_t gs[MAX_N]; syndrome_of(r,s,td,gs);
-                    for(int q=0;q<n;q++) syn[q]=sub_syn[q]^gs[q];
-                }
-                double wt=0; for(int q=0;q<n;q++) if(td[q]) wt+=1.0;
-                if(wt>0 && wt<w_3d){w_3d=wt;memcpy(best3d,td,n);got3d=1;}
-            }
-            // Pick lower-weight correction
-            if(got3d && w_3d < w_full)
-                fwrite(best3d,1,n,stdout);
-            else
-                fwrite(total_dec,1,n,stdout);
-            fflush(stdout);
+            fwrite(total_dec,1,n,stdout); fflush(stdout);
             return 0;
         }
         else if(!strcmp(argv[i],"--decode-pp")) {
@@ -1175,22 +1106,6 @@ int main(int argc, char **argv) {
             free(votes);
             preprocess_syndrome(r,s,mv_syn);
             solve_plane(r,s,mv_syn,dec);
-            fwrite(dec,1,n,stdout); fflush(stdout);
-            return 0;
-        }
-        else if(!strcmp(argv[i],"--decode-st")) {
-            int n=r*s, rounds;
-            if (fread(&rounds,4,1,stdin)!=1 || rounds<1 || rounds>4096) {
-                fprintf(stderr,"bad rounds\n"); return 1;
-            }
-            uint8_t *buf = malloc((size_t)rounds*n);
-            if(!buf){ fprintf(stderr,"oom\n"); return 1; }
-            if (fread(buf,1,(size_t)rounds*n,stdin)!=(size_t)rounds*n) {
-                fprintf(stderr,"short read\n"); free(buf); return 1;
-            }
-            uint8_t dec[MAX_N];
-            decode_spacetime(r,s,rounds,buf,dec);
-            free(buf);
             fwrite(dec,1,n,stdout); fflush(stdout);
             return 0;
         }
