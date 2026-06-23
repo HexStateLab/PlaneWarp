@@ -1100,7 +1100,7 @@ int main(int argc, char **argv) {
         else if(!strcmp(argv[i],"--selftest")) selftest=1;
         else if(!strcmp(argv[i],"--scaling")) { scaling=1; if(i+1<argc && argv[i+1][0]!='-') scaling_trials=atoi(argv[++i]); }
         else if(!strcmp(argv[i],"--no-escape")) g_escape_enabled=0;
-        else if(!strcmp(argv[i],"--decode-soft")) {
+        else if(!strcmp(argv[i],"--cnot")) {
             // Soft-decision decode: stdin = n bytes syndrome, then n float64
             // per-qubit error probabilities (little-endian). Same iterative
             // residual loop as --decode, but the decoder minimizes ML
@@ -1125,7 +1125,7 @@ int main(int argc, char **argv) {
             fwrite(total_dec,1,n,stdout); fflush(stdout);
             return 0;
         }
-        else if(!strcmp(argv[i],"--decode")) {
+        else if(!strcmp(argv[i],"--decode") || !strcmp(argv[i],"--cz")) {
             uint8_t raw_syn[MAX_N], syn[MAX_N], dec[MAX_N], total_dec[MAX_N];
             int n=r*s;
             if (fread(raw_syn,1,n,stdin)!=(size_t)n) { fprintf(stderr,"short read\n"); return 1; }
