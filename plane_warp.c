@@ -26,28 +26,35 @@ static int g_fast = 0;
 // Exposed so the verification suite can A/B it directly against
 // identical syndromes to prove it's strictly non-regressive.
 int g_escape_enabled = 1;
-
-// ---- Soft-decision cost: cost[q] = -ln(P(error at q)). Uniform = Hamming weight.
-static double cost_map[MAX_N];
-static int    g_use_cost_model = 0;        // when set, cost_init loads the model below
-static double g_cost_model[MAX_N];
-static void cost_init(int n) {
-    if(g_use_cost_model) for(int q=0;q<n;q++) cost_map[q]=g_cost_model[q];
-    else                 for(int q=0;q<n;q++) cost_map[q]=1.0;
-}
-// Load a per-qubit error model. The ML weight of placing a flip on qubit q
-// is log((1-p_q)/p_q): a high-error qubit gets a LOW cost, so the decoder
-// prefers to explain the syndrome through it. With a uniform p this reduces
-// exactly to Hamming weight, so default behaviour is unchanged.
-static void cost_set_from_probs(int n, const double *perr) {
-    for(int q=0;q<n;q++) {
-        double p=perr[q];
-        if(p<1e-9) p=1e-9; else if(p>0.49) p=0.49;
-        g_cost_model[q]=log((1.0-p)/p);
+// Correction-weight cap (in flips). 0 = disabled (no ceiling). When set, the
+// decoder ABSTAINS — returns the empty correction — on any shot whose best
+// correction exceeds the cap. Rationale: on a code whose typical error is
+// light, a heavy minimum-weight correction is a low-confidence signal (the
+// syndrome is likely corrupted by measurement faults or a basis/model
+// mismatch), and applying it does more harm than leaving the data alone.
+// This is the deliberate form of the under-correction that a mis-scaled cost
+// sentinel produced by accident on the CNOT circuits.
+int g_weight_cap = 0;
+// Auto cap: if >0, the cap is derived per-decode from this expected per-qubit
+// data-error rate p as  ceil(p*n + 2*sqrt(p*n*(1-p)))  — the ~2-sigma upper
+// bound on how many real errors a shot should plausibly carry. A correction
+// heavier than that is implausible for genuine noise, so the decoder abstains.
+// It scales with the noise level, so you set it once from the hardware rate
+// instead of hand-tuning a flip count.
+double g_cap_auto_rate = 0.0;
+static int effective_cap(int n) {
+    if(g_cap_auto_rate > 0.0) {
+        double mu  = g_cap_auto_rate * n;
+        double thr = mu + 2.0*sqrt(mu*(1.0 - g_cap_auto_rate));
+        int cap = (int)(thr + 0.5);                   // round to nearest
+        return cap < 1 ? 1 : cap;
     }
-    g_use_cost_model=1;
+    return g_weight_cap;                                // manual cap (0 = off)
 }
-static void cost_clear_model(void){ g_use_cost_model=0; }
+
+// ---- Decode cost: uniform => Hamming weight (min flips). ----
+static double cost_map[MAX_N];
+static void cost_init(int n) { for(int q=0;q<n;q++) cost_map[q]=1.0; }
 void adaptive_corner(int r, int s, uint8_t *syn, int *cx, int *cy) {
     int n=r*s, sx=0, sy=0, count=0;
     for(int qi=0;qi<r;qi++) for(int qj=0;qj<s;qj++) {
@@ -148,32 +155,32 @@ static void build_nullspace_single_at(int r, int s, int cx, int cy, int h, uint8
 // ---- Helpers: optimal 4-pattern per column/row (boundary-relative) ----
 // Boundary is the 2x2 block at (cx,cy). Protect those qubits.
 static int best_col_pat(int r, int s, uint8_t *p, int j, int px, int cx, int cy, int n) {
-    (void)n; double best=1e18; int best_pat=0;
+    int best=n+1, best_pat=0;
     for(int pat=0;pat<4;pat++) {
-        int e0=pat&1, e1=(pat>>1)&1; double wt=0;
+        int e0=pat&1, e1=(pat>>1)&1, wt=0;
         for(int i=px;i<r;i+=2) {
             int ri=(i-cx+r)%r, rj=(j-cy+s)%s;
-            if(!(ri<2 && rj<2) && (p[i*s+j]^e0)) wt+=cost_map[i*s+j];
+            if(!(ri<2 && rj<2) && (p[i*s+j]^e0)) wt++;
         }
         for(int i=px^1;i<r;i+=2) {
             int ri=(i-cx+r)%r, rj=(j-cy+s)%s;
-            if(!(ri<2 && rj<2) && (p[i*s+j]^e1)) wt+=cost_map[i*s+j];
+            if(!(ri<2 && rj<2) && (p[i*s+j]^e1)) wt++;
         }
         if(wt<best) {best=wt;best_pat=pat;}
     }
     return best_pat;
 }
 static int best_row_pat(int r, int s, uint8_t *p, int i, int py, int cx, int cy, int n) {
-    (void)n; double best=1e18; int best_pat=0;
+    int best=n+1, best_pat=0;
     for(int pat=0;pat<4;pat++) {
-        int e0=pat&1, e1=(pat>>1)&1; double wt=0;
+        int e0=pat&1, e1=(pat>>1)&1, wt=0;
         for(int j=py;j<s;j+=2) {
             int ri=(i-cx+r)%r, rj=(j-cy+s)%s;
-            if(!(ri<2 && rj<2) && (p[i*s+j]^e0)) wt+=cost_map[i*s+j];
+            if(!(ri<2 && rj<2) && (p[i*s+j]^e0)) wt++;
         }
         for(int j=py^1;j<s;j+=2) {
             int ri=(i-cx+r)%r, rj=(j-cy+s)%s;
-            if(!(ri<2 && rj<2) && (p[i*s+j]^e1)) wt+=cost_map[i*s+j];
+            if(!(ri<2 && rj<2) && (p[i*s+j]^e1)) wt++;
         }
         if(wt<best) {best=wt;best_pat=pat;}
     }
@@ -204,21 +211,21 @@ static void apply_row(int r, int s, uint8_t *p, int i, int py, int cx, int cy, i
 
 // Free variants: no boundary protection, for refinement passes
 static int best_col_pat_free(int r, int s, uint8_t *p, int j, int px, int n) {
-    (void)n; double best=1e18; int best_pat=0;
+    int best=n+1, best_pat=0;
     for(int pat=0;pat<4;pat++) {
-        int e0=pat&1, e1=(pat>>1)&1; double wt=0;
-        for(int i=px;i<r;i+=2) if(p[i*s+j]^e0) wt+=cost_map[i*s+j];
-        for(int i=px^1;i<r;i+=2) if(p[i*s+j]^e1) wt+=cost_map[i*s+j];
+        int e0=pat&1, e1=(pat>>1)&1, wt=0;
+        for(int i=px;i<r;i+=2) if(p[i*s+j]^e0) wt++;
+        for(int i=px^1;i<r;i+=2) if(p[i*s+j]^e1) wt++;
         if(wt<best){best=wt;best_pat=pat;}
     }
     return best_pat;
 }
 static int best_row_pat_free(int r, int s, uint8_t *p, int i, int py, int n) {
-    (void)n; double best=1e18; int best_pat=0;
+    int best=n+1, best_pat=0;
     for(int pat=0;pat<4;pat++) {
-        int e0=pat&1, e1=(pat>>1)&1; double wt=0;
-        for(int j=py;j<s;j+=2) if(p[i*s+j]^e0) wt+=cost_map[i*s+j];
-        for(int j=py^1;j<s;j+=2) if(p[i*s+j]^e1) wt+=cost_map[i*s+j];
+        int e0=pat&1, e1=(pat>>1)&1, wt=0;
+        for(int j=py;j<s;j+=2) if(p[i*s+j]^e0) wt++;
+        for(int j=py^1;j<s;j+=2) if(p[i*s+j]^e1) wt++;
         if(wt<best){best=wt;best_pat=pat;}
     }
     return best_pat;
@@ -406,6 +413,15 @@ int solve_plane(int r, int s, uint8_t *syn, uint8_t *out) {
     // whose own zone is worth re-probing too.
     if(g_escape_enabled && best_wt > n/20.0) {
         while(solve_plane_escape(r,s,syn,out,&best_wt)) { }
+    }
+    // Confidence cap: if the correction we'd apply is heavier than the
+    // caller trusts (manual --cap, or --cap-auto derived from the noise
+    // rate), abstain — apply nothing rather than risk a logical fault from
+    // an untrustworthy syndrome.
+    int cap = effective_cap(n);
+    if(cap > 0) {
+        int flips=0; for(int q=0;q<n;q++) flips+=out[q];
+        if(flips > cap) { memset(out,0,n); return 0; }
     }
     return best_wt<=n;
 }
@@ -1042,7 +1058,9 @@ static void preprocess_syndrome(int r, int s, uint8_t *syn) {
 // code sizes and fits log(p_L) vs d to extract Lambda and p_th.
 // ============================================================
 static void run_scaling(int trials) {
-    g_fast = 1;                                   // O(n) solver for the sweep
+    // NB: this routine calls solve_plane() directly (the full O(n) nullspace
+    // solver), so g_fast is irrelevant here — do not be fooled into using the
+    // --fast approximation, which sits above threshold and gives garbage.
     int Ls[] = {8,12,16,20,24};                   // d = L/2 in {4,6,8,10,12}
     int nL = 5;
     double ps[] = {0.02,0.03,0.04,0.05};
@@ -1050,39 +1068,59 @@ static void run_scaling(int trials) {
     static uint8_t err[MAX_N], syn[MAX_N], dec[MAX_N];
 
     printf("Sub-threshold scaling law — plane_warp decoder, i.i.d. data noise, %d trials/point\n", trials);
-    printf("p_L(d) = A*(p/p_th)^(d/2);   Lambda = p_th/p = suppression per +2 distance\n\n");
-    printf("    p   ");
+    printf("p_L(d) = A*(p/p_th)^(d/2);   Lambda = p_th/p = suppression per +2 distance\n");
+    printf("Each p is run twice on the SAME shots:  cap off,  then  --cap-auto = p (calibrated).\n");
+    printf("Metric = sound AND no logical error. An abstain leaves a residual syndrome, so under\n");
+    printf("this full-correction metric every abstain is scored as a failure (see note below).\n\n");
+    printf("    p   cap ");
     for(int li=0;li<nL;li++) printf("   d=%-2d  ", Ls[li]/2);
     printf("    Lambda   p_th(fit)\n");
 
     for(int pi=0; pi<nP; pi++) {
         double p = ps[pi];
-        double xs[8], ys[8]; int m=0;
-        printf("  %4.1f%% ", p*100);
+        double pL_off[8], pL_cap[8];
         for(int li=0; li<nL; li++) {
-            int L=Ls[li], n=L*L, d=L/2, fail=0;
+            int L=Ls[li], n=L*L, fail_off=0, fail_cap=0;
             for(int t=0;t<trials;t++) {
                 for(int q=0;q<n;q++) err[q] = ((double)rand()/RAND_MAX < p) ? 1 : 0;
                 syndrome_of(L,L,err,syn);
+                g_cap_auto_rate = 0.0;                 // cap OFF
                 solve_plane(L,L,syn,dec);
-                if(!(verify_sound(L,L,syn,dec) && verify_correct(L,L,err,dec))) fail++;
+                if(!(verify_sound(L,L,syn,dec) && verify_correct(L,L,err,dec))) fail_off++;
+                g_cap_auto_rate = p;                   // cap AUTO, calibrated to the noise
+                solve_plane(L,L,syn,dec);
+                if(!(verify_sound(L,L,syn,dec) && verify_correct(L,L,err,dec))) fail_cap++;
             }
-            double pL = (double)fail/trials;
-            printf(" %7.5f", pL);
-            if(fail>=5){ xs[m]=d; ys[m]=log(pL); m++; }   // only fit statistically meaningful cells
+            pL_off[li] = (double)fail_off/trials;
+            pL_cap[li] = (double)fail_cap/trials;
         }
-        if(m>=2) {
-            double sx=0,sy=0,sxx=0,sxy=0;
-            for(int i=0;i<m;i++){ sx+=xs[i]; sy+=ys[i]; sxx+=xs[i]*xs[i]; sxy+=xs[i]*ys[i]; }
-            double b = (m*sxy - sx*sy)/(m*sxx - sx*sx);   // slope of log(p_L) vs d
-            double Lambda = exp(-2.0*b), p_th = Lambda*p;
-            printf("    %6.2f    %5.2f%%\n", Lambda, p_th*100);
-        } else {
-            printf("    (need >=2 nonzero points to fit)\n");
+        g_cap_auto_rate = 0.0;
+        for(int which=0; which<2; which++) {
+            double *pL = which ? pL_cap : pL_off;
+            printf("  %4.1f%% %-4s", p*100, which ? "auto" : "off");
+            double xs[8], ys[8]; int m=0;
+            for(int li=0; li<nL; li++) {
+                printf(" %7.5f", pL[li]);
+                int fail = (int)(pL[li]*trials + 0.5);
+                if(fail>=5){ xs[m]=Ls[li]/2; ys[m]=log(pL[li]); m++; }
+            }
+            if(m>=2) {
+                double sx=0,sy=0,sxx=0,sxy=0;
+                for(int i=0;i<m;i++){ sx+=xs[i]; sy+=ys[i]; sxx+=xs[i]*xs[i]; sxy+=xs[i]*ys[i]; }
+                double b = (m*sxy - sx*sy)/(m*sxx - sx*sx);   // slope of log(p_L) vs d
+                double Lambda = exp(-2.0*b), p_th = Lambda*p;
+                printf("    %6.2f    %5.2f%%\n", Lambda, p_th*100);
+            } else {
+                printf("    (need >=2 nonzero points to fit)\n");
+            }
         }
     }
     printf("\nLambda>1: below threshold (distance helps); Lambda<1: above (distance hurts).\n");
-    printf("Suppress logical error: +2 distance -> /Lambda;  lower physical p -> larger Lambda.\n");
+    printf("Read this as a CONTROL: on clean (trustworthy) data noise the syndrome is honest, so the\n");
+    printf("cap has nothing to save you from — it can only abstain on correct-but-heavy corrections,\n");
+    printf("each of which scores as a failure here. Expect 'auto' >= 'off' in p_L, the gap being the\n");
+    printf("~2-sigma abstain mass the cap injects. The cap EARNS its keep on UNtrustworthy syndromes\n");
+    printf("(measurement-dominated / basis-mismatched, e.g. CNOT), which this i.i.d. sweep doesn't model.\n");
 }
 
 int main(int argc, char **argv) {
@@ -1100,31 +1138,8 @@ int main(int argc, char **argv) {
         else if(!strcmp(argv[i],"--selftest")) selftest=1;
         else if(!strcmp(argv[i],"--scaling")) { scaling=1; if(i+1<argc && argv[i+1][0]!='-') scaling_trials=atoi(argv[++i]); }
         else if(!strcmp(argv[i],"--no-escape")) g_escape_enabled=0;
-        else if(!strcmp(argv[i],"--cnot")) {
-            // Soft-decision decode: stdin = n bytes syndrome, then n float64
-            // per-qubit error probabilities (little-endian). Same iterative
-            // residual loop as --decode, but the decoder minimizes ML
-            // likelihood-weight from the model instead of Hamming weight.
-            uint8_t raw_syn[MAX_N], syn[MAX_N], dec[MAX_N], total_dec[MAX_N];
-            static double perr[MAX_N];
-            int n=r*s;
-            if (fread(raw_syn,1,n,stdin)!=(size_t)n) { fprintf(stderr,"short read (syn)\n"); return 1; }
-            if (fread(perr,sizeof(double),n,stdin)!=(size_t)n) { fprintf(stderr,"short read (model)\n"); return 1; }
-            cost_set_from_probs(n, perr);
-            memcpy(syn, raw_syn, n);
-            memset(total_dec, 0, n);
-            for(int pass=0;pass<10;pass++) {
-                preprocess_syndrome(r,s,syn);
-                solve_plane(r,s,syn,dec);
-                for(int q=0;q<n;q++) total_dec[q]^=dec[q];
-                uint8_t guess_syn[MAX_N];
-                syndrome_of(r,s,total_dec,guess_syn);
-                for(int q=0;q<n;q++) syn[q]=raw_syn[q]^guess_syn[q];
-            }
-            cost_clear_model();
-            fwrite(total_dec,1,n,stdout); fflush(stdout);
-            return 0;
-        }
+        else if(!strcmp(argv[i],"--cap")) g_weight_cap=atoi(argv[++i]);
+        else if(!strcmp(argv[i],"--cap-auto")) g_cap_auto_rate=atof(argv[++i]);
         else if(!strcmp(argv[i],"--decode") || !strcmp(argv[i],"--cz")) {
             uint8_t raw_syn[MAX_N], syn[MAX_N], dec[MAX_N], total_dec[MAX_N];
             int n=r*s;
