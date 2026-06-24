@@ -190,7 +190,14 @@ int solve_plane(int r, int s, uint8_t *syn, uint8_t *out); // fwd for fallback
 // coarse (1+Xc)(1+Yc)·Ec=Sc where Sc=C·S at stride 2. The constraint
 // is that E aggregated over 2×2 blocks must equal Ec. This couples
 // fine qubits within blocks that the fine kernel can't constrain.
+static void solve_plane_5d(int r, int s, uint8_t *syn, uint8_t *out);
+static void solve_plane_5d_mv(int r, int s, uint8_t *syn, uint8_t *syn_mv, uint8_t *out);
+
 static void solve_plane_5d(int r, int s, uint8_t *syn, uint8_t *out) {
+    solve_plane_5d_mv(r, s, syn, syn, out);
+}
+
+static void solve_plane_5d_mv(int r, int s, uint8_t *syn, uint8_t *syn_mv, uint8_t *out) {
     int n=r*s; cost_init(n);
     int hr=r/2, hs=s/2;
     if(hr<2||hs<2){solve_plane(r,s,syn,out);return;}
@@ -209,7 +216,7 @@ static void solve_plane_5d(int r, int s, uint8_t *syn, uint8_t *out) {
         uint8_t *Sf=malloc((size_t)r*s); uint8_t *Sc=malloc((size_t)fsize);
         if(!Sf||!Sc){free(Sf);free(Sc);continue;}
         for(int i=0;i<r;i++)for(int j=0;j<s;j++)
-            Sf[i*s+j]=syn[((i+dx[f])%r)*s+((j+dy[f])%s)];
+            Sf[i*s+j]=syn_mv[((i+dx[f])%r)*s+((j+dy[f])%s)];
         memset(Sc,0,(size_t)fsize);
         #define FCC(a,b) ((a)*hsc[f]+(b))
         for(int a=0;a<hrc[f];a++)for(int b=0;b<hsc[f];b++){
@@ -1263,20 +1270,31 @@ int main(int argc, char **argv) {
             return 0;
         }
         else if(!strcmp(argv[i],"--decode-persist")) {
-            // Multi-round: MV syndrome → solve_plane_5d with clean coarse targets
             int n=r*s, rounds;
             if (fread(&rounds,4,1,stdin)!=1 || rounds<2||rounds>16){fprintf(stderr,"bad rounds\n");return 1;}
             int *votes=calloc(n,sizeof(int)); if(!votes)return 1;
-            uint8_t syn[MAX_N];
+            uint8_t *all_syn=malloc((size_t)n*rounds), raw_last[MAX_N];
+            if(!all_syn){free(votes);return 1;}
             for(int rnd=0;rnd<rounds;rnd++){
-                if(fread(syn,1,n,stdin)!=(size_t)n){free(votes);return 1;}
-                for(int q=0;q<n;q++)if(syn[q])votes[q]++;
+                if(fread(all_syn+rnd*n,1,n,stdin)!=(size_t)n){free(votes);free(all_syn);return 1;}
+                for(int q=0;q<n;q++)if(all_syn[rnd*n+q])votes[q]++;
             }
-            uint8_t mv[MAX_N], dec[MAX_N];
+            uint8_t syn[MAX_N], mv[MAX_N], dec[MAX_N], total_dec[MAX_N];
             for(int q=0;q<n;q++) mv[q]=(votes[q]>rounds/2);
-            free(votes);
-            solve_plane_5d(r,s,mv,dec);
-            fwrite(dec,1,n,stdout); fflush(stdout);
+            memcpy(raw_last, all_syn+(rounds-1)*n, n);
+            memcpy(syn, raw_last, n);
+            memset(total_dec, 0, n);
+            free(votes); free(all_syn);
+            // 10-pass pipeline: coarse targets from MV, fine from last round
+            for(int pass=0;pass<10;pass++){
+                preprocess_syndrome(r,s,syn);
+                solve_plane_5d_mv(r,s,syn,mv,dec);
+                for(int q=0;q<n;q++) total_dec[q]^=dec[q];
+                uint8_t guess_syn[MAX_N];
+                syndrome_of(r,s,total_dec,guess_syn);
+                for(int q=0;q<n;q++) syn[q]=raw_last[q]^guess_syn[q];
+            }
+            fwrite(total_dec,1,n,stdout); fflush(stdout);
             return 0;
         }
         else if(!strcmp(argv[i],"--decode-mr")) {
