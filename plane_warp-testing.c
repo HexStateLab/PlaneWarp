@@ -186,10 +186,10 @@ static void apply_row_free(int r, int s, uint8_t *p, int i, int py, int pat) {
 static void solve_plane_5d(int r, int s, uint8_t *syn, uint8_t *out);
 int solve_plane(int r, int s, uint8_t *syn, uint8_t *out); // fwd for fallback
 
-// Multi-stride saddle-point: for each block size K that doesn't divide
-// the reduced dimension, compute coarse solution and require fine E's
-// K×K aggregate XOR to match. The boundary from non-divisible K creates
-// constraints that catch kernel elements invisible at even strides.
+// Coarse-scale saddle-point via C²: solve fine (1+X)(1+Y)·E=S and
+// coarse (1+Xc)(1+Yc)·Ec=Sc where Sc=C·S at stride 2. The constraint
+// is that E aggregated over 2×2 blocks must equal Ec. This couples
+// fine qubits within blocks that the fine kernel can't constrain.
 static void solve_plane_5d(int r, int s, uint8_t *syn, uint8_t *out) {
     int n=r*s; cost_init(n);
     int hr=r/2, hs=s/2;
@@ -197,61 +197,62 @@ static void solve_plane_5d(int r, int s, uint8_t *syn, uint8_t *out) {
     memset(out,0,n);
     #define SEC(a,b) ((a)*hs+(b))
     int sz=hr*hs;
+    // Adaptive block size: use K that doesn't divide hr/hs for boundary
+    int K = (hr%2==0||hs%2==0) ? 3 : 2;  // odd dims→K=2; even→K=3 creates boundary
+    int hrc=hr/K, hsc=hs/K;
+    if(hrc<2||hsc<2){ K=2; hrc=hr/2; hsc=hs/2; }
+    if(hrc<1||hsc<1){solve_plane(r,s,syn,out);return;}
+    
     for(int si=0;si<2;si++) for(int sj=0;sj<2;sj++){
-        uint8_t S[MAX_N],E[MAX_N];
-        double W[MAX_N]; memset(E,0,sz);
+        uint8_t S[MAX_N],E[MAX_N],E_c[MAX_N];
+        double W[MAX_N]; memset(E,0,sz); memset(E_c,0,hrc*hsc);
         for(int a=0;a<hr;a++)for(int b=0;b<hs;b++){
             int q=((si+2*a)%r)*s+((sj+2*b)%s);
             S[SEC(a,b)]=syn[q]; W[SEC(a,b)]=cost_map[q];
         }
-        // Forward-pass particular solution
+        // Coarse syndrome Sc = C·S at stride 2
+        uint8_t Sc[MAX_N]; memset(Sc,0,(size_t)hrc*hsc);
+        for(int a=0;a<hrc;a++)for(int b=0;b<hsc;b++){
+            int acc=0;
+            for(int da=0;da<=1;da++)for(int db=0;db<=1;db++)
+                acc^=S[SEC(K*a+da,K*b+db)];
+            Sc[a*hsc+b]=acc;
+        }
+        // Solve coarse problem: (1+Xc)(1+Yc)·Ec = Sc on hrc×hsc grid
+        #define SECC(a,b) ((a)*hsc+(b))
+        for(int a=0;a<hrc-1;a++)for(int b=0;b<hsc-1;b++)
+            E_c[SECC(a+1,b+1)]=Sc[SECC(a,b)]^E_c[SECC(a,b)]^E_c[SECC(a+1,b)]^E_c[SECC(a,b+1)];
+        // Coarse descent
+        for(;;){int chg=0;
+            for(int b=0;b<hsc;b++){
+                double w0=0,w1=0;
+                for(int a=0;a<hrc;a++){
+                    if(E_c[SECC(a,b)]) w0+=1.0; else w1+=1.0;
+                }
+                if(w1<w0){for(int a=0;a<hrc;a++)E_c[SECC(a,b)]^=1;chg=1;}
+            }
+            for(int a=0;a<hrc;a++){
+                double w0=0,w1=0;
+                for(int b=0;b<hsc;b++){
+                    if(E_c[SECC(a,b)]) w0+=1.0; else w1+=1.0;
+                }
+                if(w1<w0){for(int b=0;b<hsc;b++)E_c[SECC(a,b)]^=1;chg=1;}
+            }
+            if(!chg)break;
+        }
+        #undef SECC
+        // Fine solution from forward-pass
         for(int a=0;a<hr-1;a++)for(int b=0;b<hs-1;b++)
             E[SEC(a+1,b+1)]=S[SEC(a,b)]^E[SEC(a,b)]^E[SEC(a+1,b)]^E[SEC(a,b+1)];
-        // Multi-stride constraints: for each K that doesn't divide hr or hs,
-        // compute coarse solution and add aggregate mismatch to bundle cost.
-        #define MAX_K 6
-        uint8_t Ec_arr[MAX_K][MAX_N]; // coarse solutions
-        int hrc_arr[MAX_K], hsc_arr[MAX_K], K_active[MAX_K], nK=0;
-        for(int K=2;K<=MAX_K;K++){
-            int hrc=hr/K, hsc=hs/K;
-            if(hrc<2||hsc<2||(hr%K==0&&hs%K==0)) continue; // skip if K divides both
-            K_active[nK]=K; hrc_arr[nK]=hrc; hsc_arr[nK]=hsc;
-            // Compute coarse syndrome Sc via C·S at stride K
-            uint8_t Sc[MAX_N]; memset(Sc,0,(size_t)hrc*hsc);
-            for(int a=0;a<hrc;a++)for(int b=0;b<hsc;b++){
-                int acc=0;
-                for(int da=0;da<K;da++)for(int db=0;db<K;db++)
-                    acc^=S[SEC(K*a+da,K*b+db)];
-                Sc[a*hsc+b]=acc;
-            }
-            // Coarse solution: forward-pass on hrc×hsc grid
-            uint8_t *Ec=Ec_arr[nK]; memset(Ec,0,(size_t)hrc*hsc);
-            #define CC(a,b) ((a)*hsc+(b))
-            for(int a=0;a<hrc-1;a++)for(int b=0;b<hsc-1;b++)
-                Ec[CC(a+1,b+1)]=Sc[CC(a,b)]^Ec[CC(a,b)]^Ec[CC(a+1,b)]^Ec[CC(a,b+1)];
-            // Coarse descent
-            for(;;){int chg=0;
-                for(int b=0;b<hsc;b++){int w0=0,w1=0;
-                    for(int a=0;a<hrc;a++){if(Ec[CC(a,b)])w0++;else w1++;}
-                    if(w1<w0){for(int a=0;a<hrc;a++)Ec[CC(a,b)]^=1;chg=1;}}
-                for(int a=0;a<hrc;a++){int w0=0,w1=0;
-                    for(int b=0;b<hsc;b++){if(Ec[CC(a,b)])w0++;else w1++;}
-                    if(w1<w0){for(int b=0;b<hsc;b++)Ec[CC(a,b)]^=1;chg=1;}}
-                if(!chg)break;}
-            #undef CC
-            nK++;
-        }
-        // Fine descent with multi-stride bundle cost
+        // Bundle cost: |E| + λ·|aggregate(E) ⊕ E_c|
+        // aggregate(E)[a][b] = XOR of E over 2×2 block at (2a,2b)
         #define BCOST(E) ({ double c=0; \
-            for(int _a=0;_a<hr;_a++)for(int _b=0;_b<hs;_b++)if(E[SEC(_a,_b)])c+=W[SEC(_a,_b)]; \
-            for(int _k=0;_k<nK;_k++){ int K=K_active[_k]; int hrc=hrc_arr[_k],hsc=hsc_arr[_k]; \
-                uint8_t *Ec=Ec_arr[_k]; \
-                for(int _a=0;_a<hrc;_a++)for(int _b=0;_b<hsc;_b++){ \
-                    int agg=0; \
-                    for(int da=0;da<K;da++)for(int db=0;db<K;db++) \
-                        agg^=E[SEC(K*_a+da,K*_b+db)]; \
-                    if(agg!=Ec[_a*hsc+_b]) c+=2.0; \
-                } \
+            for(int _a=0;_a<hr;_a++)for(int _b=0;_b<hs;_b++) if(E[SEC(_a,_b)]) c+=W[SEC(_a,_b)]; \
+            for(int _a=0;_a<hrc;_a++)for(int _b=0;_b<hsc;_b++){ \
+                int agg=0; \
+                for(int da=0;da<K;da++)for(int db=0;db<K;db++) \
+                    agg^=E[SEC(K*_a+da,K*_b+db)]; \
+                if(agg!=E_c[_a*hsc+_b]) c+=2.0; \
             } c; })
         for(;;){int chg=0;
             for(int b=0;b<hs;b++){
