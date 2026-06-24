@@ -208,9 +208,10 @@ static void solve_plane_5d_with_ec(int r, int s, uint8_t *syn,
         }
         for(int a=0;a<hr-1;a++)for(int b=0;b<hs-1;b++)
             E[SEC(a+1,b+1)]=S[SEC(a,b)]^E[SEC(a,b)]^E[SEC(a+1,b)]^E[SEC(a,b+1)];
-        #define BCOST(E) ({ double c=0; \
+        #define BCOST(E,fidx) ({ double c=0; \
             for(int _a=0;_a<hr;_a++)for(int _b=0;_b<hs;_b++)if(E[SEC(_a,_b)])c+=W[SEC(_a,_b)]; \
-            for(int _f=0;_f<nfaces;_f++){ \
+            if(fidx<nfaces){ \
+              int _f=fidx; \
               for(int _a=0;_a<hrc[_f];_a++)for(int _b=0;_b<hsc[_f];_b++){ \
                 int agg=0; \
                 for(int da=0;da<K;da++)for(int db=0;db<K;db++) \
@@ -218,17 +219,18 @@ static void solve_plane_5d_with_ec(int r, int s, uint8_t *syn,
                 if(agg!=Ec_arr[_f][_a*hsc[_f]+_b]) c+=2.0; \
               } \
             } c; })
+        int fidx=si+2*sj;
         for(;;){int chg=0;
             for(int b=0;b<hs;b++){
-                double c0=BCOST(E);
+                double c0=BCOST(E,fidx);
                 for(int a=0;a<hr;a++)E[SEC(a,b)]^=1;
-                if(BCOST(E)>=c0){for(int a=0;a<hr;a++)E[SEC(a,b)]^=1;}
+                if(BCOST(E,fidx)>=c0){for(int a=0;a<hr;a++)E[SEC(a,b)]^=1;}
                 else chg=1;
             }
             for(int a=0;a<hr;a++){
-                double c0=BCOST(E);
+                double c0=BCOST(E,fidx);
                 for(int b=0;b<hs;b++)E[SEC(a,b)]^=1;
-                if(BCOST(E)>=c0){for(int b=0;b<hs;b++)E[SEC(a,b)]^=1;}
+                if(BCOST(E,fidx)>=c0){for(int b=0;b<hs;b++)E[SEC(a,b)]^=1;}
                 else chg=1;
             }
             if(!chg)break;
@@ -1344,14 +1346,19 @@ int main(int argc, char **argv) {
             int dx[4]={0,1,0,1}, dy[4]={0,0,1,1};
             for(int rnd=0;rnd<rounds;rnd++){
                 if(fread(syn,1,n,stdin)!=(size_t)n){goto cleanup_persist;}
-                // Accumulate coarse votes per face from this round
+                // Accumulate coarse votes per sector: decimate syndrome into hr×hs
+                // then aggregate K×K blocks of the sector grid
                 for(int f=0;f<4;f++){
                     if(!coarse_votes[f]) continue;
                     int hrc=hrc_arr[f], hsc=hsc_arr[f], *v=coarse_votes[f];
+                    int si=dx[f], sj=dy[f];
                     for(int a=0;a<hrc;a++)for(int b=0;b<hsc;b++){
                         int acc=0;
-                        for(int da=0;da<K;da++)for(int db=0;db<K;db++)
-                            acc^=syn[(((K*a+da+dx[f])%r)*s+((K*b+db+dy[f])%s))];
+                        for(int da=0;da<K;da++)for(int db=0;db<K;db++){
+                            int aa=K*a+da, bb=K*b+db;
+                            int q=((si+2*aa)%r)*s+((sj+2*bb)%s);
+                            acc^=syn[q];
+                        }
                         if(acc) v[a*hsc+b]++;
                     }
                 }
