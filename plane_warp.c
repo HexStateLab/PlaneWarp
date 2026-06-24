@@ -208,46 +208,9 @@ static void solve_plane_5d_with_ec(int r, int s, uint8_t *syn,
         }
         for(int a=0;a<hr-1;a++)for(int b=0;b<hs-1;b++)
             E[SEC(a+1,b+1)]=S[SEC(a,b)]^E[SEC(a,b)]^E[SEC(a+1,b)]^E[SEC(a,b+1)];
-        // Precompute coarse edge targets Dx, Dy per face from Ec
-        uint8_t Dx_arr[4][256], Dy_arr[4][256];
-        for(int _f=0;_f<nfaces;_f++){
-            uint8_t *Ec=Ec_arr[_f]; int H=hrc[_f],W_=hsc[_f];
-            uint8_t *Dx=Dx_arr[_f], *Dy=Dy_arr[_f];
-            memset(Dx,0,H*W_); memset(Dy,0,H*W_);
-            for(int a=0;a<H;a++){
-                for(int b=1;b<W_;b++) Dx[a*W_+b]=Ec[a*W_+b-1]^Dx[a*W_+b-1];
-                int o=0;for(int b=0;b<W_;b++)if(Dx[a*W_+b])o++;
-                if(o>W_-o)for(int b=0;b<W_;b++)Dx[a*W_+b]^=1;
-            }
-            for(int b=0;b<W_;b++){
-                for(int a=1;a<H;a++) Dy[a*W_+b]=Ec[(a-1)*W_+b]^Dy[(a-1)*W_+b];
-                int o=0;for(int a=0;a<H;a++)if(Dy[a*W_+b])o++;
-                if(o>H-o)for(int a=0;a<H;a++)Dy[a*W_+b]^=1;
-            }
-        }
         #define BCOST(E) ({ double c=0; \
-            for(int _a=0;_a<hr;_a++)for(int _b=0;_b<hs;_b++) if(E[SEC(_a,_b)])c+=W[SEC(_a,_b)]; \
+            for(int _a=0;_a<hr;_a++)for(int _b=0;_b<hs;_b++)if(E[SEC(_a,_b)])c+=W[SEC(_a,_b)]; \
             for(int _f=0;_f<nfaces;_f++){ \
-              uint8_t *Ec=Ec_arr[_f]; int H=hrc[_f],W_=hsc[_f]; \
-              uint8_t *Dx=Dx_arr[_f], *Dy=Dy_arr[_f]; \
-              for(int _a=0;_a<H;_a++)for(int _b=0;_b<W_;_b++){ \
-                int agg=0; \
-                for(int da=0;da<K;da++)for(int db=0;db<K;db++) \
-                    agg^=E[SEC(K*_a+da,K*_b+db)]; \
-                if(agg!=Ec[_a*W_+_b]) c+=2.0; \
-                if(_a+1<H){ \
-                  int ex=0; \
-                  for(int db=0;db<K;db++) \
-                    ex^=E[SEC(K*_a+0,K*_b+db)]^E[SEC(K*(_a+1)+0,K*_b+db)]; \
-                  if(ex!=Dx[_a*W_+_b]) c+=1.0; \
-                } \
-                if(_b+1<W_){ \
-                  int ey=0; \
-                  for(int da=0;da<K;da++) \
-                    ey^=E[SEC(K*_a+da,K*_b+0)]^E[SEC(K*_a+da,K*(_b+1)+0)]; \
-                  if(ey!=Dy[_a*W_+_b]) c+=1.0; \
-                } \
-              } \
               for(int _a=0;_a<hrc[_f];_a++)for(int _b=0;_b<hsc[_f];_b++){ \
                 int agg=0; \
                 for(int da=0;da<K;da++)for(int db=0;db<K;db++) \
