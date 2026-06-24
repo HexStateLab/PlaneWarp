@@ -193,66 +193,61 @@ int solve_plane(int r, int s, uint8_t *syn, uint8_t *out); // fwd for fallback
 static void solve_plane_5d(int r, int s, uint8_t *syn, uint8_t *out) {
     int n=r*s; cost_init(n);
     int hr=r/2, hs=s/2;
-    if(hr<1||hs<1){memset(out,0,n);return;}
+    if(hr<2||hs<2){solve_plane(r,s,syn,out);return;}
     memset(out,0,n);
     #define SEC(a,b) ((a)*hs+(b))
     int sz=hr*hs;
-    // Adaptive block size: use K that doesn't divide hr/hs for boundary
-    int K = (hr%2==0||hs%2==0) ? 3 : 2;  // odd dims→K=2; even→K=3 creates boundary
-    int hrc=hr/K, hsc=hs/K;
-    if(hrc<2||hsc<2){ K=2; hrc=hr/2; hsc=hs/2; }
-    if(hrc<1||hsc<1){solve_plane(r,s,syn,out);return;}
-    
+    // 4 faces: offsets (0,0),(1,0),(0,1),(1,1) on shifted syndromes
+    int dx[4]={0,1,0,1}, dy[4]={0,0,1,1};
+    int hrc[4], hsc[4], nfaces=0;
+    uint8_t Ec_arr[4][MAX_N];
+    for(int f=0;f<4;f++){
+        hrc[f]=hr/2; hsc[f]=hs/2;
+        if(hrc[f]<2||hsc[f]<2) continue;
+        uint8_t Sf[MAX_N]; // shifted syndrome
+        for(int i=0;i<r;i++)for(int j=0;j<s;j++)
+            Sf[i*s+j]=syn[((i+dx[f])%r)*s+((j+dy[f])%s)];
+        uint8_t Sc[MAX_N]; memset(Sc,0,(size_t)hrc[f]*hsc[f]);
+        #define FCC(a,b) ((a)*hsc[f]+(b))
+        for(int a=0;a<hrc[f];a++)for(int b=0;b<hsc[f];b++){
+            int acc=0;
+            for(int da=0;da<=1;da++)for(int db=0;db<=1;db++)
+                acc^=Sf[(2*a+da)*s+(2*b+db)];
+            Sc[FCC(a,b)]=acc;
+        }
+        uint8_t *Ec=Ec_arr[nfaces]; memset(Ec,0,(size_t)hrc[f]*hsc[f]);
+        for(int a=0;a<hrc[f]-1;a++)for(int b=0;b<hsc[f]-1;b++)
+            Ec[FCC(a+1,b+1)]=Sc[FCC(a,b)]^Ec[FCC(a,b)]^Ec[FCC(a+1,b)]^Ec[FCC(a,b+1)];
+        for(;;){int chg=0;
+            for(int b=0;b<hsc[f];b++){int w0=0,w1=0;
+                for(int a=0;a<hrc[f];a++){if(Ec[FCC(a,b)])w0++;else w1++;}
+                if(w1<w0){for(int a=0;a<hrc[f];a++)Ec[FCC(a,b)]^=1;chg=1;}}
+            for(int a=0;a<hrc[f];a++){int w0=0,w1=0;
+                for(int b=0;b<hsc[f];b++){if(Ec[FCC(a,b)])w0++;else w1++;}
+                if(w1<w0){for(int b=0;b<hsc[f];b++)Ec[FCC(a,b)]^=1;chg=1;}}
+            if(!chg)break;}
+        #undef FCC
+        nfaces++;
+    }
+    if(nfaces==0){solve_plane(r,s,syn,out);return;}
+
     for(int si=0;si<2;si++) for(int sj=0;sj<2;sj++){
-        uint8_t S[MAX_N],E[MAX_N],E_c[MAX_N];
-        double W[MAX_N]; memset(E,0,sz); memset(E_c,0,hrc*hsc);
+        uint8_t S[MAX_N],E[MAX_N]; double W[MAX_N]; memset(E,0,sz);
         for(int a=0;a<hr;a++)for(int b=0;b<hs;b++){
             int q=((si+2*a)%r)*s+((sj+2*b)%s);
             S[SEC(a,b)]=syn[q]; W[SEC(a,b)]=cost_map[q];
         }
-        // Coarse syndrome Sc = C·S at stride 2
-        uint8_t Sc[MAX_N]; memset(Sc,0,(size_t)hrc*hsc);
-        for(int a=0;a<hrc;a++)for(int b=0;b<hsc;b++){
-            int acc=0;
-            for(int da=0;da<=1;da++)for(int db=0;db<=1;db++)
-                acc^=S[SEC(K*a+da,K*b+db)];
-            Sc[a*hsc+b]=acc;
-        }
-        // Solve coarse problem: (1+Xc)(1+Yc)·Ec = Sc on hrc×hsc grid
-        #define SECC(a,b) ((a)*hsc+(b))
-        for(int a=0;a<hrc-1;a++)for(int b=0;b<hsc-1;b++)
-            E_c[SECC(a+1,b+1)]=Sc[SECC(a,b)]^E_c[SECC(a,b)]^E_c[SECC(a+1,b)]^E_c[SECC(a,b+1)];
-        // Coarse descent
-        for(;;){int chg=0;
-            for(int b=0;b<hsc;b++){
-                double w0=0,w1=0;
-                for(int a=0;a<hrc;a++){
-                    if(E_c[SECC(a,b)]) w0+=1.0; else w1+=1.0;
-                }
-                if(w1<w0){for(int a=0;a<hrc;a++)E_c[SECC(a,b)]^=1;chg=1;}
-            }
-            for(int a=0;a<hrc;a++){
-                double w0=0,w1=0;
-                for(int b=0;b<hsc;b++){
-                    if(E_c[SECC(a,b)]) w0+=1.0; else w1+=1.0;
-                }
-                if(w1<w0){for(int b=0;b<hsc;b++)E_c[SECC(a,b)]^=1;chg=1;}
-            }
-            if(!chg)break;
-        }
-        #undef SECC
-        // Fine solution from forward-pass
         for(int a=0;a<hr-1;a++)for(int b=0;b<hs-1;b++)
             E[SEC(a+1,b+1)]=S[SEC(a,b)]^E[SEC(a,b)]^E[SEC(a+1,b)]^E[SEC(a,b+1)];
-        // Bundle cost: |E| + λ·|aggregate(E) ⊕ E_c|
-        // aggregate(E)[a][b] = XOR of E over 2×2 block at (2a,2b)
+        // Bundle cost: |E| + Σ_f |aggregate(E) ⊕ Ec_f|
         #define BCOST(E) ({ double c=0; \
-            for(int _a=0;_a<hr;_a++)for(int _b=0;_b<hs;_b++) if(E[SEC(_a,_b)]) c+=W[SEC(_a,_b)]; \
-            for(int _a=0;_a<hrc;_a++)for(int _b=0;_b<hsc;_b++){ \
-                int agg=0; \
-                for(int da=0;da<K;da++)for(int db=0;db<K;db++) \
-                    agg^=E[SEC(K*_a+da,K*_b+db)]; \
-                if(agg!=E_c[_a*hsc+_b]) c+=2.0; \
+            for(int _a=0;_a<hr;_a++)for(int _b=0;_b<hs;_b++)if(E[SEC(_a,_b)])c+=W[SEC(_a,_b)]; \
+            for(int _f=0;_f<nfaces;_f++){ \
+              for(int _a=0;_a<hrc[_f];_a++)for(int _b=0;_b<hsc[_f];_b++){ \
+                int agg=E[SEC(2*_a+0,2*_b+0)]^E[SEC(2*_a+1,2*_b+0)] \
+                        ^E[SEC(2*_a+0,2*_b+1)]^E[SEC(2*_a+1,2*_b+1)]; \
+                if(agg!=Ec_arr[_f][_a*hsc[_f]+_b]) c+=2.0; \
+              } \
             } c; })
         for(;;){int chg=0;
             for(int b=0;b<hs;b++){
