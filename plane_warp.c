@@ -1151,8 +1151,7 @@ int main(int argc, char **argv) {
             memset(total_dec, 0, n);
             for(int pass=0;pass<10;pass++) {
                 preprocess_syndrome(r,s,syn);
-                if(r/2>=4 && s/2>=4) solve_plane_5d(r,s,syn,dec);
-                else solve_plane(r,s,syn,dec);
+                solve_plane_5d(r,s,syn,dec);
                 for(int q=0;q<n;q++) total_dec[q]^=dec[q];
                 uint8_t guess_syn[MAX_N];
                 syndrome_of(r,s,total_dec,guess_syn);
