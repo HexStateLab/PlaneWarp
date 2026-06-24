@@ -1273,19 +1273,17 @@ int main(int argc, char **argv) {
             int n=r*s, rounds;
             if (fread(&rounds,4,1,stdin)!=1 || rounds<2||rounds>16){fprintf(stderr,"bad rounds\n");return 1;}
             int *votes=calloc(n,sizeof(int)); if(!votes)return 1;
-            uint8_t *all_syn=malloc((size_t)n*rounds), raw_last[MAX_N];
-            if(!all_syn){free(votes);return 1;}
+            uint8_t syn[MAX_N], raw_last[MAX_N];
             for(int rnd=0;rnd<rounds;rnd++){
-                if(fread(all_syn+rnd*n,1,n,stdin)!=(size_t)n){free(votes);free(all_syn);return 1;}
-                for(int q=0;q<n;q++)if(all_syn[rnd*n+q])votes[q]++;
+                if(fread(syn,1,n,stdin)!=(size_t)n){free(votes);return 1;}
+                for(int q=0;q<n;q++)if(syn[q])votes[q]++;
+                if(rnd==rounds-1) memcpy(raw_last,syn,n);
             }
-            uint8_t syn[MAX_N], mv[MAX_N], dec[MAX_N], total_dec[MAX_N];
+            uint8_t mv[MAX_N], dec[MAX_N], total_dec[MAX_N];
             for(int q=0;q<n;q++) mv[q]=(votes[q]>rounds/2);
-            memcpy(raw_last, all_syn+(rounds-1)*n, n);
+            free(votes);
             memcpy(syn, raw_last, n);
             memset(total_dec, 0, n);
-            free(votes); free(all_syn);
-            // 10-pass pipeline: coarse targets from MV, fine from last round
             for(int pass=0;pass<10;pass++){
                 preprocess_syndrome(r,s,syn);
                 solve_plane_5d_mv(r,s,syn,mv,dec);
