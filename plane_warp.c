@@ -1365,7 +1365,7 @@ int main(int argc, char **argv) {
                         if(acc) v[a*hsc+b]++;
                     }
                 }
-                if(rnd==rounds-1) memcpy(raw_last,syn,n);
+                if(rnd==rounds-1) memcpy(raw_last,rdat,n);
             }
             // Compute MV coarse solutions from accumulated votes
             uint8_t *Ec_arr[4]={0};
