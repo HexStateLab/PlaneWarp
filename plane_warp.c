@@ -199,6 +199,7 @@ static void solve_plane_5d_with_ec(int r, int s, uint8_t *syn,
     memset(out,0,n);
     #define SEC(a,b) ((a)*hs+(b))
     int sz=hr*hs;
+    int K=nfaces>0?hr/hrc[0]:2; // block size from coarse grid dims
     for(int si=0;si<2;si++) for(int sj=0;sj<2;sj++){
         uint8_t S[MAX_N],E[MAX_N]; double W[MAX_N]; memset(E,0,sz);
         for(int a=0;a<hr;a++)for(int b=0;b<hs;b++){
@@ -211,8 +212,9 @@ static void solve_plane_5d_with_ec(int r, int s, uint8_t *syn,
             for(int _a=0;_a<hr;_a++)for(int _b=0;_b<hs;_b++)if(E[SEC(_a,_b)])c+=W[SEC(_a,_b)]; \
             for(int _f=0;_f<nfaces;_f++){ \
               for(int _a=0;_a<hrc[_f];_a++)for(int _b=0;_b<hsc[_f];_b++){ \
-                int agg=E[SEC(2*_a+0,2*_b+0)]^E[SEC(2*_a+1,2*_b+0)] \
-                        ^E[SEC(2*_a+0,2*_b+1)]^E[SEC(2*_a+1,2*_b+1)]; \
+                int agg=0; \
+                for(int da=0;da<K;da++)for(int db=0;db<K;db++) \
+                    agg^=E[SEC(K*_a+da,K*_b+db)]; \
                 if(agg!=Ec_arr[_f][_a*hsc[_f]+_b]) c+=2.0; \
               } \
             } c; })
@@ -1325,13 +1327,14 @@ int main(int argc, char **argv) {
             // Stream rounds: accumulate coarse-level votes per face
             uint8_t syn[MAX_N], raw_last[MAX_N];
             int hr=r/2, hs=s/2;
+            int K=2; while(hr%K==0&&hs%K==0) K++; // first non-divisor creates boundary
             int nfaces=0, hrc_arr[4], hsc_arr[4];
-            { int any=0; for(int f=0;f<4;f++){int hrc=hr/2,hsc=hs/2;if(hrc>=1&&hsc>=1)any=1;}
+            { int any=0; for(int f=0;f<4;f++){int hrc=hr/K,hsc=hs/K;if(hrc>=1&&hsc>=1)any=1;}
               if(!any) goto fallback_single; }
             // Per-face coarse vote accumulators
             int *coarse_votes[4]={0}; int coarse_sz[4]={0};
             for(int f=0;f<4;f++){
-                hrc_arr[f]=hr/2; hsc_arr[f]=hs/2;
+                hrc_arr[f]=hr/K; hsc_arr[f]=hs/K;
                 if(hrc_arr[f]<1||hsc_arr[f]<1) continue;
                 coarse_sz[f]=hrc_arr[f]*hsc_arr[f];
                 coarse_votes[f]=calloc(coarse_sz[f],sizeof(int));
@@ -1347,8 +1350,8 @@ int main(int argc, char **argv) {
                     int hrc=hrc_arr[f], hsc=hsc_arr[f], *v=coarse_votes[f];
                     for(int a=0;a<hrc;a++)for(int b=0;b<hsc;b++){
                         int acc=0;
-                        for(int da=0;da<=1;da++)for(int db=0;db<=1;db++)
-                            acc^=syn[(((2*a+da+dx[f])%r)*s+((2*b+db+dy[f])%s))];
+                        for(int da=0;da<K;da++)for(int db=0;db<K;db++)
+                            acc^=syn[(((K*a+da+dx[f])%r)*s+((K*b+db+dy[f])%s))];
                         if(acc) v[a*hsc+b]++;
                     }
                 }
