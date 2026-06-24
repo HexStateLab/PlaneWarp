@@ -798,80 +798,115 @@ int run_selftest(int seed) {
 // O(n) deterministic, no distance calculations, no iteration.
 // ============================================================
 static void preprocess_syndrome(int r, int s, uint8_t *syn) {
-    // Pass 1: correlated Z⊗X events → complete the 3-of-4 2×2 block
-    for(int a=0; a<r; a++) for(int b=0; b<s; b++) {
-        int a1=(a+2)%r, b1=(b+2)%s;
-        int v00=syn[a*s+b], v10=syn[a1*s+b];
-        int v01=syn[a*s+b1], v11=syn[a1*s+b1];
-        if(v00+v10+v01+v11==3) {
-            if(!v00) syn[a*s+b]^=1;
-            else if(!v10) syn[a1*s+b]^=1;
-            else if(!v01) syn[a*s+b1]^=1;
-            else if(!v11) syn[a1*s+b1]^=1;
-        }
-    }
-    // Pass 2: product-code — flip real measurement sites (syn=1 edges).
-    // Iterate until no odd parities remain (handles cascading flips).
     int hr=r/2, hs=s/2;
-    for(int iter=0; iter<10; iter++) {
-        int any=0;
-        for(int i=0;i<2;i++) for(int j=0;j<2;j++) {
-            int odd_r[300], nr=0, odd_c[300], nc=0;
-            for(int si=0;si<hr;si++) {
-                int rp=0;
-                for(int sj=0;sj<hs;sj++) rp^=syn[(i+2*si)*s+(j+2*sj)];
-                if(rp) odd_r[nr++]=si;
-            }
-            for(int sj=0;sj<hs;sj++) {
-                int cp=0;
-                for(int si=0;si<hr;si++) cp^=syn[(i+2*si)*s+(j+2*sj)];
-                if(cp) odd_c[nc++]=sj;
-            }
-            if(nr==0 && nc==0) continue;
-            any=1;
-            // Phase A: pair odd row with odd column where intersection = 1
-            int used_r[300]={0}, used_c[300]={0};
-            for(int ri=0;ri<nr;ri++) {
-                for(int ci=0;ci<nc;ci++) {
-                    if(used_r[ri]||used_c[ci]) continue;
-                    int pos=(i+2*odd_r[ri])*s+(j+2*odd_c[ci]);
-                    if(syn[pos]) {
-                        syn[pos]^=1;
-                        used_r[ri]=1; used_c[ci]=1;
-                    }
-                }
-            }
-            // Phase B: leftover rows → flip any incident syn=1 edge
-            for(int ri=0;ri<nr;ri++) {
-                if(used_r[ri]) continue;
-                for(int sj=0;sj<hs;sj++) {
-                    int pos=(i+2*odd_r[ri])*s+(j+2*sj);
-                    if(syn[pos]){syn[pos]^=1;used_r[ri]=1;break;}
-                }
-            }
-            // Phase C: leftover columns → flip any incident syn=1 edge
-            for(int ci=0;ci<nc;ci++) {
-                if(used_c[ci]) continue;
-                for(int si=0;si<hr;si++) {
-                    int pos=(i+2*si)*s+(j+2*odd_c[ci]);
-                    if(syn[pos]){syn[pos]^=1;used_c[ci]=1;break;}
-                }
-            }
-            // Phase D: stubborn leftovers → anchor pairs
-            int rem_r=0, rem_c=0;
-            for(int ri=0;ri<nr;ri++) if(!used_r[ri]) odd_r[rem_r++]=odd_r[ri];
-            for(int ci=0;ci<nc;ci++) if(!used_c[ci]) odd_c[rem_c++]=odd_c[ci];
-            for(int k=0;k+1<rem_r;k+=2)
-                syn[(i+2*odd_r[k])*s+(j+2*0)]^=1,
-                syn[(i+2*odd_r[k+1])*s+(j+2*0)]^=1;
-            for(int k=0;k+1<rem_c;k+=2)
-                syn[(i+2*0)*s+(j+2*odd_c[k])]^=1,
-                syn[(i+2*0)*s+(j+2*odd_c[k+1])]^=1;
+    for(int i=0;i<2;i++) for(int j=0;j<2;j++) {
+        int odd_r[300], odd_c[300], nr=0, nc=0;
+
+        // h_x·C = 0 → row parities
+        for(int si=0;si<hr;si++) {
+            int rp=0;
+            for(int sj=0;sj<hs;sj++) rp^=syn[(i+2*si)*s+(j+2*sj)];
+            if(rp) odd_r[nr++]=si;
         }
-        if(!any) break;
+        // h_y·C = 0 → column parities
+        for(int sj=0;sj<hs;sj++) {
+            int cp=0;
+            for(int si=0;si<hr;si++) cp^=syn[(i+2*si)*s+(j+2*sj)];
+            if(cp) odd_c[nc++]=sj;
+        }
+        // Phase 1 — intersections: pair row defects to column defects (cost 1)
+        int pairs = nr<nc ? nr : nc;
+        for(int k=0;k<pairs;k++)
+            syn[(i+2*odd_r[k])*s+(j+2*odd_c[k])]^=1;
+
+        // Phase 2 — leftover row pairs (cost 2 per pair)
+        for(int k=pairs;k+1<nr;k+=2)
+            syn[(i+2*odd_r[k])*s+(j+0*2)]^=1,
+            syn[(i+2*odd_r[k+1])*s+(j+0*2)]^=1;
+
+        // Phase 3 — leftover column pairs (cost 2 per pair)
+        for(int k=pairs;k+1<nc;k+=2)
+            syn[(i+0*2)*s+(j+2*odd_c[k])]^=1,
+            syn[(i+0*2)*s+(j+2*odd_c[k+1])]^=1;
     }
 }
 
+
+// ============================================================
+// ALGEBRAIC CORRELATED-DEPOLARIZE2 DECODER (exact, any density)
+//
+// A DEPOLARIZE2(anc,data) that lands X on the data qubit and Z on its ancilla
+// flips the data error's OWN check corner, so the two cancel there. The leftover
+// measured syndrome, per parity sector, is exactly  (X + Y + XY)*data  in the
+// sector variables X=x^2, Y=y^2.  Inverting that one polynomial recovers the
+// data EXACTLY at any error density — no matching, no min-weight search.
+//
+// (X+Y+XY) is a unit in GF(2)[X,Y]/<X^(r/2)+1, Y^(s/2)+1> unless it shares a
+// root with the moduli; the only obstruction is a common cube root of unity
+// (1+w+w^2=0), which requires 3 | r/2 AND 3 | s/2, i.e. 6|r and 6|s. For those
+// dimensions the channel is genuinely degenerate (a real kernel) and this
+// returns 0 instead of guessing.
+// ============================================================
+static uint8_t *alg_inv = NULL;            // sz x sz GF(2) inverse of (X+Y+XY)
+static int alg_r=-1, alg_s=-1, alg_sz=0, alg_singular=0;
+
+static int build_alg_inv(int r, int s) {
+    int hr=r/2, hs=s/2, sz=hr*hs;
+    if(alg_inv && alg_r==r && alg_s==s) return !alg_singular;
+    if((long)sz*sz > 64L*1024*1024) return 0;          // guard: huge dims
+    free(alg_inv);
+    alg_inv = (uint8_t*)malloc((size_t)sz*sz);
+    uint8_t *M = (uint8_t*)malloc((size_t)sz*sz);
+    if(!alg_inv || !M){ free(M); free(alg_inv); alg_inv=NULL; return 0; }
+    memset(M,0,(size_t)sz*sz);
+    memset(alg_inv,0,(size_t)sz*sz);
+    for(int i=0;i<sz;i++) alg_inv[(size_t)i*sz+i]=1;   // augmented identity
+    // channel: input (a,b) contributes to outputs (a-1,b),(a,b-1),(a-1,b-1)
+    for(int a=0;a<hr;a++) for(int b=0;b<hs;b++){
+        int in=a*hs+b;
+        int o1=((a-1+hr)%hr)*hs+b;
+        int o2=a*hs+((b-1+hs)%hs);
+        int o3=((a-1+hr)%hr)*hs+((b-1+hs)%hs);
+        M[(size_t)o1*sz+in]^=1; M[(size_t)o2*sz+in]^=1; M[(size_t)o3*sz+in]^=1;
+    }
+    alg_singular=0;
+    for(int c=0;c<sz;c++){
+        int piv=-1;
+        for(int rr=c;rr<sz;rr++) if(M[(size_t)rr*sz+c]){piv=rr;break;}
+        if(piv<0){ alg_singular=1; break; }
+        if(piv!=c) for(int k=0;k<sz;k++){
+            uint8_t t;
+            t=M[(size_t)c*sz+k];      M[(size_t)c*sz+k]=M[(size_t)piv*sz+k];           M[(size_t)piv*sz+k]=t;
+            t=alg_inv[(size_t)c*sz+k];alg_inv[(size_t)c*sz+k]=alg_inv[(size_t)piv*sz+k];alg_inv[(size_t)piv*sz+k]=t;
+        }
+        for(int rr=0;rr<sz;rr++) if(rr!=c && M[(size_t)rr*sz+c])
+            for(int k=0;k<sz;k++){ M[(size_t)rr*sz+k]^=M[(size_t)c*sz+k];
+                                   alg_inv[(size_t)rr*sz+k]^=alg_inv[(size_t)c*sz+k]; }
+    }
+    free(M);
+    alg_r=r; alg_s=s; alg_sz=sz;
+    return !alg_singular;
+}
+
+// Exact decode of the correlated channel. Returns 0 (zero output) if the
+// channel polynomial is singular for these dimensions.
+int decode_alg(int r, int s, uint8_t *raw, uint8_t *dec) {
+    int hr=r/2, hs=s/2, sz=hr*hs, n=r*s;
+    memset(dec,0,n);
+    if(!build_alg_inv(r,s)) return 0;
+    uint8_t sv[MAX_N];
+    for(int i=0;i<2;i++) for(int j=0;j<2;j++){
+        for(int a=0;a<hr;a++) for(int b=0;b<hs;b++)
+            sv[a*hs+b] = raw[(i+2*a)*s+(j+2*b)];
+        for(int a=0;a<hr;a++) for(int b=0;b<hs;b++){
+            int acc=0;
+            const uint8_t *row = &alg_inv[(size_t)(a*hs+b)*sz];
+            for(int k=0;k<sz;k++) acc ^= (row[k] & sv[k]);
+            if(acc) dec[(i+2*a)*s+(j+2*b)]=1;
+        }
+    }
+    return 1;
+}
 
 // ---- Test ----
 // ============================================================
@@ -991,6 +1026,16 @@ int main(int argc, char **argv) {
                 for(int q=0;q<n;q++) syn[q]=raw_syn[q]^guess_syn[q];
             }
             fwrite(total_dec,1,n,stdout); fflush(stdout);
+            return 0;
+        }
+        else if(!strcmp(argv[i],"--decode-alg")) {
+            // Exact algebraic inverse of the correlated DEPOLARIZE2 channel.
+            uint8_t raw[MAX_N], dec[MAX_N];
+            int n=r*s;
+            if (fread(raw,1,n,stdin)!=(size_t)n) { fprintf(stderr,"short read\n"); return 1; }
+            if(!decode_alg(r,s,raw,dec))
+                fprintf(stderr,"alg channel singular for %dx%d (needs not(6|r and 6|s))\n",r,s);
+            fwrite(dec,1,n,stdout); fflush(stdout);
             return 0;
         }
         else if(!strcmp(argv[i],"--decode-np")) {
