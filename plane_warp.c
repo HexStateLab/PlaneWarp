@@ -798,20 +798,8 @@ int run_selftest(int seed) {
 // O(n) deterministic, no distance calculations, no iteration.
 // ============================================================
 static void preprocess_syndrome(int r, int s, uint8_t *syn) {
-    // Build a mask of bits belonging to sum=4 2×2 blocks (standalone data
-    // errors — 4-bit plus-shaped pattern). Edge-flip must never touch these.
-    int n=r*s;
-    uint8_t is_data[MAX_N]; memset(is_data, 0, n);
-    for(int a=0; a<r; a++) for(int b=0; b<s; b++) {
-        int a1=(a+2)%r, b1=(b+2)%s;
-        int v00=syn[a*s+b], v10=syn[a1*s+b];
-        int v01=syn[a*s+b1], v11=syn[a1*s+b1];
-        if(v00+v10+v01+v11==4) {
-            is_data[a*s+b]=1; is_data[a1*s+b]=1;
-            is_data[a*s+b1]=1; is_data[a1*s+b1]=1;
-        }
-    }
-    // Pass 1: correlated DEPOLARIZE2 Z⊗X events — 2×2 block with 3 corners
+    // Pass 1: correlated DEPOLARIZE2 Z⊗X events leave a 2×2 check block
+    // with exactly 3 corners toggled — the ancilla corner cancels.
     for(int a=0; a<r; a++) for(int b=0; b<s; b++) {
         int a1=(a+2)%r, b1=(b+2)%s;
         int v00=syn[a*s+b], v10=syn[a1*s+b];
@@ -823,7 +811,7 @@ static void preprocess_syndrome(int r, int s, uint8_t *syn) {
             else if(!v11) syn[a1*s+b1]^=1;
         }
     }
-    // Pass 2: iterative edge-flip — never touch data-error bits
+    // Pass 2: iterative edge-flip product-code — pair odd rows/cols only
     // at positions where syn=1 (real measurement error sites).
     int hr=r/2, hs=s/2;
     for(int iter=0; iter<10; iter++) {
@@ -843,56 +831,27 @@ static void preprocess_syndrome(int r, int s, uint8_t *syn) {
             if(nr==0 && nc==0) continue;
             any=1;
             int used_r[300]={0}, used_c[300]={0};
-            // A: pair odd rows/cols preferring intersections where the
-            // row and column have few syn=1 neighbours (isolated meas error).
-            for(int pi=0; pi<nr+nc; pi++) {
-                int best_r=-1, best_c=-1, best_score=999999;
-                for(int ri=0;ri<nr;ri++) {
-                    if(used_r[ri]) continue;
-                    for(int ci=0;ci<nc;ci++) {
-                        if(used_c[ci]) continue;
-                        int pos=(i+2*odd_r[ri])*s+(j+2*odd_c[ci]);
-                        if(!syn[pos]) continue;
-                        // Score: count syn=1 in this row and column (fewer = more isolated)
-                        int rnz=0, cnz=0;
-                        for(int tj=0;tj<hs;tj++) if(syn[(i+2*odd_r[ri])*s+(j+2*tj)]) rnz++;
-                        for(int ti=0;ti<hr;ti++) if(syn[(i+2*ti)*s+(j+2*odd_c[ci])]) cnz++;
-                        int score=rnz*cnz;
-                        if(score<best_score){best_score=score;best_r=ri;best_c=ci;}
-                    }
+            // A: pair odd row with odd column where intersection = 1
+            for(int ri=0;ri<nr;ri++)
+                for(int ci=0;ci<nc;ci++) {
+                    if(used_r[ri]||used_c[ci]) continue;
+                    int pos=(i+2*odd_r[ri])*s+(j+2*odd_c[ci]);
+                    if(syn[pos]){syn[pos]^=1;used_r[ri]=1;used_c[ci]=1;}
                 }
-                if(best_r<0) break;
-                int pos=(i+2*odd_r[best_r])*s+(j+2*odd_c[best_c]);
-                syn[pos]^=1; used_r[best_r]=1; used_c[best_c]=1;
-            }
-            // B: leftover rows — prefer syn=1 edges on rows with fewest neighbours
+            // B: leftover rows → flip any incident syn=1 edge
             for(int ri=0;ri<nr;ri++) {
                 if(used_r[ri]) continue;
-                int best_j=-1, best_rnz=999;
                 for(int sj=0;sj<hs;sj++) {
                     int pos=(i+2*odd_r[ri])*s+(j+2*sj);
-                    if(!syn[pos]) continue;
-                    int rnz=0;
-                    for(int tj=0;tj<hs;tj++) if(syn[(i+2*odd_r[ri])*s+(j+2*tj)]) rnz++;
-                    if(rnz<best_rnz){best_rnz=rnz;best_j=sj;}
-                }
-                if(best_j>=0){
-                    syn[(i+2*odd_r[ri])*s+(j+2*best_j)]^=1; used_r[ri]=1;
+                    if(syn[pos]){syn[pos]^=1;used_r[ri]=1;break;}
                 }
             }
-            // C: leftover columns — prefer syn=1 edges on columns with fewest neighbours
+            // C: leftover columns → flip any incident syn=1 edge
             for(int ci=0;ci<nc;ci++) {
                 if(used_c[ci]) continue;
-                int best_i=-1, best_cnz=999;
                 for(int si=0;si<hr;si++) {
                     int pos=(i+2*si)*s+(j+2*odd_c[ci]);
-                    if(!syn[pos]) continue;
-                    int cnz=0;
-                    for(int ti=0;ti<hr;ti++) if(syn[(i+2*ti)*s+(j+2*odd_c[ci])]) cnz++;
-                    if(cnz<best_cnz){best_cnz=cnz;best_i=si;}
-                }
-                if(best_i>=0){
-                    syn[(i+2*best_i)*s+(j+2*odd_c[ci])]^=1; used_c[ci]=1;
+                    if(syn[pos]){syn[pos]^=1;used_c[ci]=1;break;}
                 }
             }
             // D: stubborn leftovers → anchor pairs
@@ -985,48 +944,6 @@ int decode_alg(int r, int s, uint8_t *raw, uint8_t *dec) {
         }
     }
     return 1;
-}
-
-// Filter & decode: detect sum=3 2×2 blocks (correlated events), but exclude
-// bits that ALSO appear in sum=4 blocks (standalone data errors). This separates
-// genuine 3-bit correlated patterns from 3-bit sub-blocks of 4-bit data errors.
-static void decode_alg_filtered(int r, int s, uint8_t *raw_syn, uint8_t *dec) {
-    int n=r*s; memset(dec, 0, n);
-    uint8_t filt[MAX_N], is_data[MAX_N];
-    memset(filt, 0, n);
-    memset(is_data, 0, n);
-    // Pass A: mark bits belonging to sum=4 blocks (standalone data errors)
-    for(int a=0; a<r; a++) for(int b=0; b<s; b++) {
-        int a1=(a+2)%r, b1=(b+2)%s;
-        int v00=raw_syn[a*s+b], v10=raw_syn[a1*s+b];
-        int v01=raw_syn[a*s+b1], v11=raw_syn[a1*s+b1];
-        if(v00+v10+v01+v11==4) {
-            is_data[a*s+b]=1; is_data[a1*s+b]=1;
-            is_data[a*s+b1]=1; is_data[a1*s+b1]=1;
-        }
-    }
-    // Pass B: include bits from sum=3 blocks ONLY if none of the 3 set
-    // corners are marked as data-error bits (they'd be standalone).
-    for(int a=0; a<r; a++) for(int b=0; b<s; b++) {
-        int a1=(a+2)%r, b1=(b+2)%s;
-        int v00=raw_syn[a*s+b], v10=raw_syn[a1*s+b];
-        int v01=raw_syn[a*s+b1], v11=raw_syn[a1*s+b1];
-        if(v00+v10+v01+v11==3) {
-            // Check if any of the 3 SET corners is from a data-error block
-            int tainted = 0;
-            if(v00 && is_data[a*s+b])   tainted=1;
-            if(v10 && is_data[a1*s+b])  tainted=1;
-            if(v01 && is_data[a*s+b1])  tainted=1;
-            if(v11 && is_data[a1*s+b1]) tainted=1;
-            if(!tainted) {
-                filt[a*s+b]   = raw_syn[a*s+b];
-                filt[a1*s+b]  = raw_syn[a1*s+b];
-                filt[a*s+b1]  = raw_syn[a*s+b1];
-                filt[a1*s+b1] = raw_syn[a1*s+b1];
-            }
-        }
-    }
-    decode_alg(r, s, filt, dec);
 }
 
 // ---- Test ----
@@ -1145,15 +1062,6 @@ int main(int argc, char **argv) {
                 uint8_t guess_syn[MAX_N];
                 syndrome_of(r,s,total_dec,guess_syn);
                 for(int q=0;q<n;q++) syn[q]=raw_syn[q]^guess_syn[q];
-                // After the first full pass, apply (X+Y+XY)^-1 to the
-                // sparse residual to catch any remaining correlated events.
-                if(pass==0) {
-                    uint8_t dec_a[MAX_N]; memset(dec_a, 0, n);
-                    decode_alg_filtered(r, s, syn, dec_a);
-                    for(int q=0;q<n;q++) total_dec[q] ^= dec_a[q];
-                    syndrome_of(r,s,total_dec,guess_syn);
-                    for(int q=0;q<n;q++) syn[q]=raw_syn[q]^guess_syn[q];
-                }
             }
             fwrite(total_dec,1,n,stdout); fflush(stdout);
             return 0;
