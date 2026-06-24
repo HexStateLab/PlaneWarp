@@ -208,19 +208,6 @@ static void solve_plane_5d_with_ec(int r, int s, uint8_t *syn,
         }
         for(int a=0;a<hr-1;a++)for(int b=0;b<hs-1;b++)
             E[SEC(a+1,b+1)]=S[SEC(a,b)]^E[SEC(a,b)]^E[SEC(a+1,b)]^E[SEC(a,b+1)];
-        // Edge targets: dx_ideal from ∂y·dx=S, dy_ideal from ∂x·dy=S
-        uint8_t dx_i[MAX_N], dy_i[MAX_N];
-        memset(dx_i,0,sz); memset(dy_i,0,sz);
-        for(int a=0;a<hr;a++){
-            for(int b=1;b<hs;b++) dx_i[SEC(a,b)]=S[SEC(a,b-1)]^dx_i[SEC(a,b-1)];
-            int o=0;for(int b=0;b<hs;b++)if(dx_i[SEC(a,b)])o++;
-            if(o>hs-o)for(int b=0;b<hs;b++)dx_i[SEC(a,b)]^=1;
-        }
-        for(int b=0;b<hs;b++){
-            for(int a=1;a<hr;a++) dy_i[SEC(a,b)]=S[SEC(a-1,b)]^dy_i[SEC(a-1,b)];
-            int o=0;for(int a=0;a<hr;a++)if(dy_i[SEC(a,b)])o++;
-            if(o>hr-o)for(int a=0;a<hr;a++)dy_i[SEC(a,b)]^=1;
-        }
         // Precompute coarse edge targets Dx, Dy per face from Ec
         uint8_t Dx_arr[4][256], Dy_arr[4][256];
         for(int _f=0;_f<nfaces;_f++){
@@ -239,11 +226,7 @@ static void solve_plane_5d_with_ec(int r, int s, uint8_t *syn,
             }
         }
         #define BCOST(E) ({ double c=0; \
-            for(int _a=0;_a<hr;_a++)for(int _b=0;_b<hs;_b++){\
-                if(E[SEC(_a,_b)])c+=W[SEC(_a,_b)]; \
-                if((E[SEC(_a,_b)]^E[SEC((_a+1)%hr,_b)])!=dx_i[SEC(_a,_b)])c+=1.0; \
-                if((E[SEC(_a,_b)]^E[SEC(_a,(_b+1)%hs)])!=dy_i[SEC(_a,_b)])c+=1.0; \
-            } \
+            for(int _a=0;_a<hr;_a++)for(int _b=0;_b<hs;_b++) if(E[SEC(_a,_b)])c+=W[SEC(_a,_b)]; \
             for(int _f=0;_f<nfaces;_f++){ \
               uint8_t *Ec=Ec_arr[_f]; int H=hrc[_f],W_=hsc[_f]; \
               uint8_t *Dx=Dx_arr[_f], *Dy=Dy_arr[_f]; \
