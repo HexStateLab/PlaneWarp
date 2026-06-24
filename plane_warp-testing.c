@@ -1342,8 +1342,11 @@ int main(int argc, char **argv) {
                 nfaces++;
             }
             int dx[4]={0,1,0,1}, dy[4]={0,0,1,1};
+            int *fine_votes=calloc(n,sizeof(int));
+            if(!fine_votes) goto cleanup_persist;
             for(int rnd=0;rnd<rounds;rnd++){
-                if(fread(syn,1,n,stdin)!=(size_t)n){goto cleanup_persist;}
+                if(fread(syn,1,n,stdin)!=(size_t)n){free(fine_votes);goto cleanup_persist;}
+                for(int q=0;q<n;q++) if(syn[q]) fine_votes[q]++;
                 // Accumulate coarse votes per face from this round
                 for(int f=0;f<4;f++){
                     if(!coarse_votes[f]) continue;
