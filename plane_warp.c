@@ -1141,18 +1141,26 @@ int main(int argc, char **argv) {
         else if(!strcmp(argv[i],"--cap-auto")) g_cap_auto_rate=atof(argv[++i]);
         else if(!strcmp(argv[i],"--decode") || !strcmp(argv[i],"--cz")) {
             uint8_t raw_syn[MAX_N], syn[MAX_N], dec[MAX_N], total_dec[MAX_N];
-            int n=r*s;
-            if (fread(raw_syn,1,n,stdin)!=(size_t)n) { fprintf(stderr,"short read\n"); return 1; }
+            int n=r*s, rounds=5;
+            uint8_t *syn_3d=malloc((size_t)n*rounds);
+            if(!syn_3d) return 1;
+            if (fread(syn_3d,1,n*rounds,stdin)!=(size_t)(n*rounds)) { free(syn_3d); return 1; }
+            // Last round for the fine pipeline
+            memcpy(raw_syn, syn_3d+(rounds-1)*n, n);
             memcpy(syn, raw_syn, n);
             memset(total_dec, 0, n);
+            uint8_t guess_syn[MAX_N];
             for(int pass=0;pass<10;pass++) {
                 preprocess_syndrome(r,s,syn);
-                solve_plane_5d(r,s,syn,dec);
+                solve_plane_5d(r,s,syn,dec, rounds, syn_3d);
                 for(int q=0;q<n;q++) total_dec[q]^=dec[q];
-                uint8_t guess_syn[MAX_N];
                 syndrome_of(r,s,total_dec,guess_syn);
                 for(int q=0;q<n;q++) syn[q]=raw_syn[q]^guess_syn[q];
             }
+            free(syn_3d);
+            fwrite(total_dec,1,n,stdout); fflush(stdout);
+            return 0;
+        }
             fwrite(total_dec,1,n,stdout); fflush(stdout);
             return 0;
         }
@@ -1335,11 +1343,3 @@ int main(int argc, char **argv) {
             uint8_t diff[MAX_N];
             for(int q=0;q<n;q++) diff[q]=err[q]^dec[q];
             if(is_stabilizer(r,s,diff)) {
-                uint8_t chk[MAX_N]; syndrome_of(r,s,dec,chk);
-                if(memcmp(chk,syn,n)==0) ok++;
-            }
-        }
-        printf("Weight-%d: %d/%d (%.1f%%)\n",weight,ok,trials,100.0*ok/trials);
-    }
-    return 0;
-}
