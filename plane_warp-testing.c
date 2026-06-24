@@ -217,7 +217,7 @@ static void solve_plane_5d_with_ec(int r, int s, uint8_t *syn,
               for(int _a=0;_a<hr;_a++)for(int _b=0;_b<hs;_b++){ \
                 int q=((si+2*_a)%r)*s+((sj+2*_b)%s); \
                 int ce=E[SEC(_a,_b)]^E[SEC((_a+1)%hr,_b)]^E[SEC(_a,(_b+1)%hs)]^E[SEC((_a+1)%hr,(_b+1)%hs)]; \
-                if(St[q]!=ce) c+=0.5; \
+                if(St[q]!=ce) c+=0.1; \
               } \
             } \
             for(int _f=0;_f<nfaces;_f++){ \
