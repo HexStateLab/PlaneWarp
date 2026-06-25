@@ -1,13 +1,15 @@
 // plane_warp.c — ML-optimal 4-spin plane-warp decoder for 2D BB code
 // 4 propagation spins × 16 nullspace enumerations = 64 candidates.
 // O(64n) per decode, provably exact. Topological stabilizer check.
-// Build: gcc -std=gnu11 -O3 -o plane_warp plane_warp.c -lm
+// Build: gcc -std=gnu11 -O3 -o plane_warp plane_warp.c -lm -lpthread
 // Run:   ./plane_warp [r] [s] [--bench] [--cluster|--line] [--weight W]
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <stdint.h>
 #include <math.h>
+#include <pthread.h>
+static int ts_rand(); // thread-safe rand forward
 
 #define MAX_R 600
 #define MAX_S 600
@@ -520,6 +522,7 @@ static void blk_sweep(int m,int n,uint8_t *work,int order) {
 // loop (mirrors solve_plane's own iterative descent), keep the best.
 // ---- MWPM decoder for step-1 toric code on hr x hs ----
 // Finds defect vertices (odd checks), computes minimum-weight perfect matching.
+static void kernel_enum_block(int m, int n, uint8_t *out); // fwd decl
 static void solve_mwpm(int hr, int hs, uint8_t *sub_syn, uint8_t *sub_out) {
     int n=hr*hs, nd=0, defects[256];
     memset(sub_out,0,n);
@@ -528,26 +531,30 @@ static void solve_mwpm(int hr, int hs, uint8_t *sub_syn, uint8_t *sub_out) {
         if(sub_syn[a*hs+b]) defects[nd++]=a*hs+b;
     if(nd==0) return;  // no errors
     
-    if(nd>15) {  // Fallback to deterministic sweep if DP is too expensive
-        memset(sub_out,0,n);
-        uint8_t base[MAX_N]; memset(base,0,n);
-        
-        // Randomize the anchor for the sweep rather than hardcoding (0,0)
-        int anchor_a = rand() % hr;
-        int anchor_b = rand() % hs;
-        
-        for(int ri=0; ri<hr; ri++) for(int rj=0; rj<hs; rj++) {
-            if(ri==0 || rj==0) continue;
-            int a = (anchor_a + ri) % hr;
-            int b = (anchor_b + rj) % hs;
-            int ca=(a-1+hr)%hr, cb=(b-1+hs)%hs, ck=ca*hs+cb;
-            base[a*hs+b] = sub_syn[ck] 
-                           ^ base[ca*hs+b] 
-                           ^ base[a*hs+cb] 
-                           ^ base[ca*hs+cb];
+    if(nd>15) {  // Greedy MWPM: match closest pair repeatedly
+        int used[256]={0}, nused=0;
+        while(nused < nd) {
+            int u=-1;
+            for(int i=0;i<nd;i++) if(!used[i]){u=i;break;}
+            if(u<0) break;
+            int best_v=-1, best_d=hr*hs;
+            for(int v=0;v<nd;v++) if(!used[v] && v!=u) {
+                int ai=defects[u]/hs, bi=defects[u]%hs;
+                int aj=defects[v]/hs, bj=defects[v]%hs;
+                int dx=abs(ai-aj), dy=abs(bi-bj);
+                int d=(dx<hr-dx?dx:hr-dx)+(dy<hs-dy?dy:hs-dy);
+                if(d<best_d){best_d=d;best_v=v;}
+            }
+            if(best_v<0) break;
+            used[u]=used[best_v]=1; nused+=2;
+            int au=defects[u]/hs, bu=defects[u]%hs;
+            int av=defects[best_v]/hs, bv=defects[best_v]%hs;
+            int dx=(av-au+hr)%hr, sx=dx<=hr/2?1:-1;
+            int dy=(bv-bu+hs)%hs, sy=dy<=hs/2?1:-1;
+            for(int s=0;s<(dx<=hr/2?dx:hr-dx);s++){au=(au+sx+hr)%hr;sub_out[au*hs+bu]^=1;}
+            for(int s=0;s<(dy<=hs/2?dy:hs-dy);s++){bu=(bu+sy+hs)%hs;sub_out[au*hs+bu]^=1;}
         }
-        memcpy(sub_out,base,n);
-        blk_sweep(hr,hs,sub_out,0);
+        kernel_enum_block(hr,hs,sub_out);
         return;
     }
     
@@ -605,8 +612,8 @@ static void solve_mwpm(int hr, int hs, uint8_t *sub_syn, uint8_t *sub_out) {
 // kernel elements (row/col flips) to find the globally minimum-weight
 // correction with the same syndrome.
 static void kernel_enum_block(int m, int n, uint8_t *out) {
-    if(m <= 12) {
-        // Exhaustive enumeration for small kernels
+    if(m <= 16) {
+        // Exhaustive enumeration for small-to-medium kernels
         int best_rmask=0, best_cmask=0, best_wt=m*n+1;
         for(int rmask=0; rmask<(1<<m); rmask++) {
             int cmask=0, wt=0;
@@ -624,21 +631,36 @@ static void kernel_enum_block(int m, int n, uint8_t *out) {
             if(flip) out[a*n+b] ^= 1;
         }
     } else {
-        // Fallback: Greedy Iterative Descent for large grids
-        for(;;) {
-            int chg=0;
-            for(int b=0;b<n;b++) {
-                int w0=0, w1=0;
-                for(int a=0;a<m;a++) { if(out[a*n+b]) w0++; else w1++; }
-                if(w1 < w0) { for(int a=0;a<m;a++) out[a*n+b]^=1; chg=1; }
+        // Multi-start greedy descent: run from many random starting points
+        // and keep the best, to avoid local minima.
+        uint8_t base[MAX_N]; memcpy(base,out,(size_t)m*n);
+        int best_wt = m*n+1; uint8_t best[MAX_N];
+        for(int restart=0; restart<64; restart++) {
+            uint8_t tmp[MAX_N]; memcpy(tmp,base,(size_t)m*n);
+            // Randomize row mask for diversity (first restart keeps original)
+            if(restart > 0) {
+                uint32_t rmask = (uint32_t)ts_rand();
+                for(int b=0;b<n;b++) if((rmask>>b)&1)
+                    for(int a=0;a<m;a++) tmp[a*n+b] ^= 1;
             }
-            for(int a=0;a<m;a++) {
-                int w0=0, w1=0;
-                for(int b=0;b<n;b++) { if(out[a*n+b]) w0++; else w1++; }
-                if(w1 < w0) { for(int b=0;b<n;b++) out[a*n+b]^=1; chg=1; }
+            for(;;) {
+                int chg=0;
+                for(int b=0;b<n;b++) {
+                    int w0=0,w1=0;
+                    for(int a=0;a<m;a++){if(tmp[a*n+b])w0++;else w1++;}
+                    if(w1<w0){for(int a=0;a<m;a++)tmp[a*n+b]^=1;chg=1;}
+                }
+                for(int a=0;a<m;a++) {
+                    int w0=0,w1=0;
+                    for(int b=0;b<n;b++){if(tmp[a*n+b])w0++;else w1++;}
+                    if(w1<w0){for(int b=0;b<n;b++)tmp[a*n+b]^=1;chg=1;}
+                }
+                if(!chg) break;
             }
-            if(!chg) break;
+            int wt=0; for(int q=0;q<m*n;q++) if(tmp[q]) wt++;
+            if(wt < best_wt){best_wt=wt;memcpy(best,tmp,(size_t)m*n);}
         }
+        memcpy(out,best,(size_t)m*n);
     }
 }
 
@@ -657,7 +679,7 @@ static int solve_block_step1(int m, int n, uint8_t *S, uint8_t *out) {
             return 0;
         }
     }
-    // Fallback: standard sweep solver
+    // Fallback: standard sweep solver (corner seeds + boundary reseed)
     int best=sz+1;
     uint8_t row0[MAX_N], col0[MAX_N];
     for (int corner=0; corner<2; corner++) {
@@ -1384,6 +1406,28 @@ static void run_scaling(int trials) {
     printf("(measurement-dominated / basis-mismatched, e.g. CNOT), which this i.i.d. sweep doesn't model.\n");
 }
 
+// Thread-safe rand wrapper
+static pthread_mutex_t ts_rand_lock = PTHREAD_MUTEX_INITIALIZER;
+static int ts_rand() { pthread_mutex_lock(&ts_rand_lock); int r=rand(); pthread_mutex_unlock(&ts_rand_lock); return r; }
+// Thread function for per-round persist decoding
+struct persist_round_args { int r,s,n,rnd; uint8_t *per_round,*dec_round; };
+static void *run_persist_round(void *arg) {
+    struct persist_round_args *a = (struct persist_round_args*)arg;
+    int r=a->r, s=a->s, n=a->n, rnd=a->rnd;
+    uint8_t syn[MAX_N], dec[MAX_N], acc[MAX_N], res[MAX_N];
+    memcpy(syn, a->per_round+rnd*n, n);
+    memset(acc,0,n); memcpy(res,syn,n);
+    for(int pass=0;pass<3;pass++){
+        preprocess_syndrome(r,s,res);
+        solve_plane_layered(r,s,res,dec);
+        for(int q=0;q<n;q++) acc[q]^=dec[q];
+        syndrome_of(r,s,acc,res);
+        for(int q=0;q<n;q++) res[q]^=syn[q];
+    }
+    memcpy(a->dec_round+rnd*n, acc, n);
+    return NULL;
+}
+
 int main(int argc, char **argv) {
     int r=40, s=40, weight=0, trials=200, seed=42, bench=0, mode=0;
     g_fast=0;
@@ -1565,22 +1609,25 @@ int main(int argc, char **argv) {
             for(int rnd=0;rnd<rounds;rnd++){
                 if(fread(per_round+rnd*n,1,n,stdin)!=(size_t)n){free(per_round);return 1;}
             }
-            // Phase 1: 3-pass decode each round, build consensus correction
+            // Phase 1: 3-pass decode each round (parallel), build consensus correction
             uint8_t *dec_round=malloc((size_t)rounds*n);
             if(!dec_round){free(per_round);return 1;}
-            uint8_t syn[MAX_N], dec[MAX_N], acc[MAX_N], res[MAX_N];
+            // Per-round thread data
+            struct { int r,s,n,rnd; uint8_t *per_round,*dec_round; } td[32];
+            pthread_t th[32];
+            pthread_attr_t attr;
+            pthread_attr_init(&attr);
+            pthread_attr_setstacksize(&attr, 8*1024*1024); // 8MB stack per thread
             for(int rnd=0;rnd<rounds;rnd++){
-                memcpy(syn,per_round+rnd*n,n);
-                memset(acc,0,n); memcpy(res,syn,n);
-                for(int pass=0;pass<3;pass++){
-                    preprocess_syndrome(r,s,res);
-                    solve_plane_layered(r,s,res,dec);
-                    for(int q=0;q<n;q++)acc[q]^=dec[q];
-                    syndrome_of(r,s,acc,res);
-                    for(int q=0;q<n;q++)res[q]^=syn[q];
-                }
-                memcpy(dec_round+rnd*n,acc,n);
+                td[rnd].r=r; td[rnd].s=s; td[rnd].n=n;
+                td[rnd].rnd=rnd; td[rnd].per_round=per_round; td[rnd].dec_round=dec_round;
             }
+            // Spawn threads (one per round)
+            for(int rnd=0;rnd<rounds;rnd++) {
+                pthread_create(&th[rnd], &attr, run_persist_round, &td[rnd]);
+            }
+            for(int rnd=0;rnd<rounds;rnd++) pthread_join(th[rnd], NULL);
+            pthread_attr_destroy(&attr);
             // Per-cell consensus: correct in > rounds/3 rounds
             uint8_t consensus[MAX_N]; memset(consensus,0,n);
             for(int q=0;q<n;q++){
@@ -1596,14 +1643,15 @@ int main(int argc, char **argv) {
             uint8_t residual[MAX_N];
             for(int q=0;q<n;q++)residual[q]=raw_last[q]^cons_syn[q];
             // Phase 2: pipeline decode the residual (15 passes with preprocessing)
-            uint8_t total[MAX_N]; memcpy(total,consensus,n);
-            memcpy(syn,residual,n);
+            uint8_t syn2[MAX_N], dec2[MAX_N], total[MAX_N];
+            memcpy(total,consensus,n);
+            memcpy(syn2,residual,n);
             for(int pass=0;pass<15;pass++){
-                preprocess_syndrome(r,s,syn);
-                solve_plane_layered(r,s,syn,dec);
-                for(int q=0;q<n;q++)total[q]^=dec[q];
-                syndrome_of(r,s,total,syn);
-                for(int q=0;q<n;q++)syn[q]^=raw_last[q];
+                preprocess_syndrome(r,s,syn2);
+                solve_plane_layered(r,s,syn2,dec2);
+                for(int q=0;q<n;q++)total[q]^=dec2[q];
+                syndrome_of(r,s,total,syn2);
+                for(int q=0;q<n;q++)syn2[q]^=raw_last[q];
             }
             fwrite(total,1,n,stdout);fflush(stdout);
             return 0;
