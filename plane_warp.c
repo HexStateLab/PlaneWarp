@@ -536,6 +536,41 @@ static void solve_mwpm(int hr, int hs, uint8_t *sub_syn, uint8_t *sub_out) {
     }
 }
 
+// Explore kernel (row/col flips) of a (1+x)(1+y) toric block to find the
+// minimum-weight correction with the same syndrome. Exhaustive enumeration
+// for m <= 12; greedy iterative descent otherwise.
+static void kernel_enum_block(int m, int n, uint8_t *out) {
+    if(m <= 12) {
+        int best_rmask=0, best_cmask=0, best_wt=m*n+1;
+        for(int rmask=0; rmask<(1<<m); rmask++) {
+            int cmask=0, wt=0;
+            for(int b=0;b<n;b++) {
+                int ones=0;
+                for(int a=0;a<m;a++) if(out[a*n+b] ^ ((rmask>>a)&1)) ones++;
+                if(ones > m-ones) { cmask |= (1<<b); wt += m-ones; }
+                else wt += ones;
+            }
+            if(wt < best_wt) { best_wt=wt; best_rmask=rmask; best_cmask=cmask; }
+        }
+        if(best_wt < m*n && best_wt >= 0) {
+            for(int a=0;a<m;a++) for(int b=0;b<n;b++) {
+                int flip = ((best_rmask>>a)&1) ^ ((best_cmask>>b)&1);
+                if(flip) out[a*n+b] ^= 1;
+            }
+        }
+    } else {
+        for(;;){ int chg=0;
+            for(int b=0;b<n;b++){ int w0=0,w1=0;
+                for(int a=0;a<m;a++){ if(out[a*n+b]) w0++; else w1++; }
+                if(w1<w0){ for(int a=0;a<m;a++) out[a*n+b]^=1; chg=1; } }
+            for(int a=0;a<m;a++){ int w0=0,w1=0;
+                for(int b=0;b<n;b++){ if(out[a*n+b]) w0++; else w1++; }
+                if(w1<w0){ for(int b=0;b<n;b++) out[a*n+b]^=1; chg=1; } }
+            if(!chg) break;
+        }
+    }
+}
+
 static int solve_block_step1(int m, int n, uint8_t *S, uint8_t *out) {
     int sz=m*n;
     // Use MWPM for all sizes (DP up to 30 defects, sweep fallback)
@@ -546,7 +581,10 @@ static int solve_block_step1(int m, int n, uint8_t *S, uint8_t *out) {
         for(int a=0;a<m;a++) for(int b=0;b<n;b++) if(out[a*n+b])
             for(int da=0;da<=1;da++) for(int db=0;db<=1;db++)
                 vsyn[((a-da+m)%m)*n+((b-db+n)%n)]^=1;
-        if(memcmp(vsyn,S,sz)==0) return 0;
+        if(memcmp(vsyn,S,sz)==0) {
+            kernel_enum_block(m,n,out);
+            return 0;
+        }
     }
     // Fallback: standard sweep solver
     int best=sz+1;
@@ -571,6 +609,7 @@ static int solve_block_step1(int m, int n, uint8_t *S, uint8_t *out) {
             if (wt<best) { best=wt; memcpy(out,work,sz); }
         }
     }
+    kernel_enum_block(m,n,out);
     return best;
 }
 
@@ -606,23 +645,7 @@ static int solve_plane_general(int r, int s, uint8_t *syn, uint8_t *out) {
         // block syndrome is in the image, so the row0=col0=0 recurrence below
         // closes around the torus seam exactly. No-op on clean syndromes.
         metacheck_repair_block(Lr, Lc, SB);
-        // ---- sound adjacent-toric block solve ----
-        // Block check (verified): S(A,B) = E(A,B)^E(A+1,B)^E(A,B+1)^E(A+1,B+1).
-        // Invert with row0=col0=0 boundary:
-        //   E[a][b] = S[a-1][b-1] ^ E[a-1][b] ^ E[a][b-1] ^ E[a-1][b-1]  (a,b>=1)
-        // then take minimum weight over the kernel (full row / full col flips).
-        memset(EB,0,(size_t)Lr*Lc);
-        for(int a=1;a<Lr;a++) for(int b=1;b<Lc;b++)
-            EB[a*Lc+b] = SB[(a-1)*Lc+(b-1)] ^ EB[(a-1)*Lc+b] ^ EB[a*Lc+(b-1)] ^ EB[(a-1)*Lc+(b-1)];
-        for(;;){ int chg=0;
-            for(int b=0;b<Lc;b++){ int w0=0,w1=0;
-                for(int a=0;a<Lr;a++){ if(EB[a*Lc+b]) w0++; else w1++; }
-                if(w1<w0){ for(int a=0;a<Lr;a++) EB[a*Lc+b]^=1; chg=1; } }
-            for(int a=0;a<Lr;a++){ int w0=0,w1=0;
-                for(int b=0;b<Lc;b++){ if(EB[a*Lc+b]) w0++; else w1++; }
-                if(w1<w0){ for(int b=0;b<Lc;b++) EB[a*Lc+b]^=1; chg=1; } }
-            if(!chg) break;
-        }
+        solve_block_step1(Lr, Lc, SB, EB);
         for(int tr=0; tr<Lr; tr++) for(int tc=0; tc<Lc; tc++)
             out[((cr+2*tr)%r)*s + ((cc+2*tc)%s)] = EB[tr*Lc+tc];
     }
@@ -631,26 +654,23 @@ static int solve_plane_general(int r, int s, uint8_t *syn, uint8_t *out) {
     if(cap > 0) { int f=0; for(int q=0;q<n;q++) f+=out[q]; if(f>cap){ memset(out,0,n); return 0; } }
     return 1;
 }
-// Full decoder: 4 logical sectors × sub-lattice decompose × cross-boundary descent
+// Full decoder: 4 logical sectors × general stride-2 decomposition ×
+// cross-boundary descent.  Handles any grid parity (even, odd, mixed).
 int solve_plane_layered(int r, int s, uint8_t *syn, uint8_t *out) {
     int n=r*s;
-    if(r%2 || s%2) return solve_plane(r,s,syn,out);
-    int hr=r/2, hs=s/2;
-    // Single-shot: repair the raw syndrome's 4 toric sub-blocks ONCE, up
-    // front, before the logical-coset injection below. Doing it here (not
-    // inside the lop loop) keeps measurement-fault repair separate from the
-    // deliberate logical-operator syndrome flips, which the metachecks would
-    // otherwise mistake for faults. Repairs into a local copy, leaving the
-    // caller's syndrome buffer untouched.
+    int gr = (r & 1) ? 1 : 2, gc = (s & 1) ? 1 : 2;
+    int hr=r/gr, hs=s/gc;  // sub-block dimensions
+    // Single-shot: repair the raw syndrome's sub-blocks ONCE, up
+    // front, before the logical-coset injection below.
     uint8_t syn_ss[MAX_N]; memcpy(syn_ss,syn,n);
     if(g_singleshot) {
         uint8_t ss_sub[MAX_N];
-        for(int px=0;px<2;px++) for(int py=0;py<2;py++) {
+        for(int px=0;px<gr;px++) for(int py=0;py<gc;py++) {
             for(int a=0;a<hr;a++) for(int b=0;b<hs;b++)
-                ss_sub[a*hs+b]=syn_ss[(2*a+px)*s+(2*b+py)];
+                ss_sub[a*hs+b]=syn_ss[((px+2*a)%r)*s+((py+2*b)%s)];
             metacheck_repair_block(hr,hs,ss_sub);
             for(int a=0;a<hr;a++) for(int b=0;b<hs;b++)
-                syn_ss[(2*a+px)*s+(2*b+py)]=ss_sub[a*hs+b];
+                syn_ss[((px+2*a)%r)*s+((py+2*b)%s)]=ss_sub[a*hs+b];
         }
     }
     uint8_t best_full[MAX_N]; double best_full_wt=n+1.0;
@@ -660,14 +680,14 @@ int solve_plane_layered(int r, int s, uint8_t *syn, uint8_t *out) {
         // Inject logical: flip boundary syndromes (rows 0,r-2 for X; cols 0,s-2 for Z)
         if(lop&1) for(int j=0;j<s;j++) { syn_mod[j]^=1; syn_mod[((r-2)%r)*s+j]^=1; }
         if(lop&2) for(int i=0;i<r;i++) { syn_mod[i*s]^=1; syn_mod[i*s+((s-2)%s)]^=1; }
-        // Sub-lattice decompose and solve
+        // Stride-2 decompose and solve each parity class block
         uint8_t sub_syn[MAX_N], sub_out[MAX_N];
-        for(int px=0;px<2;px++) for(int py=0;py<2;py++) {
+        for(int px=0;px<gr;px++) for(int py=0;py<gc;py++) {
             for(int a=0;a<hr;a++) for(int b=0;b<hs;b++)
-                sub_syn[a*hs+b]=syn_mod[(2*a+px)*s+(2*b+py)];
+                sub_syn[a*hs+b]=syn_mod[((px+2*a)%r)*s+((py+2*b)%s)];
             solve_block_step1(hr,hs,sub_syn,sub_out);
             for(int a=0;a<hr;a++) for(int b=0;b<hs;b++)
-                out[(2*a+px)*s+(2*b+py)]=sub_out[a*hs+b];
+                out[((px+2*a)%r)*s+((py+2*b)%s)]=sub_out[a*hs+b];
         }
         double best_wt=n+1.0; cost_init(n);
         // Cross-boundary descent
@@ -694,23 +714,30 @@ int solve_plane_layered(int r, int s, uint8_t *syn, uint8_t *out) {
             if(w3<best_wt){best_wt=w3;memcpy(out,base3,n);}
             if(best_wt==prev) break;
         }
-        // Logical cycle flips
-        for(int li=0;li<r;li++) {
-            uint8_t c[MAX_N]; memcpy(c,out,n);
-            for(int j=0;j<s;j++) c[li*s+j]^=1;
-            double w=0; for(int q=0;q<n;q++) if(c[q]) w+=cost_map[q];
-            if(w<best_wt){best_wt=w;memcpy(out,c,n);}
-        }
-        for(int lj=0;lj<s;lj++) {
-            uint8_t c[MAX_N]; memcpy(c,out,n);
-            for(int i=0;i<r;i++) c[i*s+lj]^=1;
-            double w=0; for(int q=0;q<n;q++) if(c[q]) w+=cost_map[q];
-            if(w<best_wt){best_wt=w;memcpy(out,c,n);}
+        if(r <= 12) {
+            kernel_enum_block(r,s,out);
+        } else {
+            for(int li=0;li<r;li++) {
+                uint8_t c[MAX_N]; memcpy(c,out,n);
+                for(int j=0;j<s;j++) c[li*s+j]^=1;
+                double w=0; for(int q=0;q<n;q++) if(c[q]) w+=cost_map[q];
+                if(w<best_wt){best_wt=w;memcpy(out,c,n);}
+            }
+            for(int lj=0;lj<s;lj++) {
+                uint8_t c[MAX_N]; memcpy(c,out,n);
+                for(int i=0;i<r;i++) c[i*s+lj]^=1;
+                double w=0; for(int q=0;q<n;q++) if(c[q]) w+=cost_map[q];
+                if(w<best_wt){best_wt=w;memcpy(out,c,n);}
+            }
         }
         double tot=0; for(int q=0;q<n;q++) if(out[q]) tot+=cost_map[q];
         if(tot<best_full_wt){best_full_wt=tot;memcpy(best_full,out,n);}
     }
     memcpy(out,best_full,n);
+    if(best_full_wt<=n) {
+        int cap = effective_cap(n);
+        if(cap > 0 && best_full_wt > cap) { memset(out,0,n); return 0; }
+    }
     return best_full_wt<=n;
 }
 
