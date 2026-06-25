@@ -1,3 +1,7 @@
+# Note
+
+Use with unlimited stack
+
 # plane_warp — Algebraic Decoder for 2D BB Codes
 
 Exact per-sector algebraic decoder for toroidal BB codes with plus-shaped
