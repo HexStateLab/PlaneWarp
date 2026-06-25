@@ -196,6 +196,8 @@ static void apply_row_free(int r, int s, uint8_t *p, int i, int py, int pat) {
 static void solve_plane_5d(int r, int s, uint8_t *syn, uint8_t *out);
 int solve_plane(int r, int s, uint8_t *syn, uint8_t *out); // fwd for fallback
 static void metacheck_repair_block(int hr, int hs, uint8_t *S); // single-shot fwd
+static int solve_plane_general(int r, int s, uint8_t *syn, uint8_t *out); // odd-grid fwd
+static int solve_block_step1(int m, int n, uint8_t *S, uint8_t *out);      // adjacent-toric fwd
 
 static void solve_plane_5d(int r, int s, uint8_t *syn, uint8_t *out);
 static void solve_plane_5d_mv(int r, int s, uint8_t *syn, uint8_t *syn_mv, uint8_t *out);
@@ -207,6 +209,10 @@ static void solve_plane_5d(int r, int s, uint8_t *syn, uint8_t *out) {
 static void solve_plane_5d_mv(int r, int s, uint8_t *syn, uint8_t *syn_mv, uint8_t *out) {
     int n=r*s; cost_init(n);
     int hr=r/2, hs=s/2;
+    // 5d face decomposition is even-only (same parity-split assumption as
+    // solve_plane); odd grids have no 4-block structure, so defer to the
+    // parity-general decoder via solve_plane.
+    if((r & 1) || (s & 1)) { solve_plane(r,s,syn,out); return; }
     if(hr<2||hs<2){solve_plane(r,s,syn,out);return;}
     memset(out,0,n);
     #define SEC(a,b) ((a)*hs+(b))
@@ -328,6 +334,13 @@ static void metacheck_repair_block(int hr, int hs, uint8_t *S) {
 }
 
 int solve_plane(int r, int s, uint8_t *syn, uint8_t *out) {
+    // The 4-toric-code parity split below is only valid when r and s are even:
+    // stride-2 then partitions each axis into two cycles of length r/2, s/2.
+    // On an ODD axis gcd(2,L)=1, so stride-2 is a single L-cycle and no such
+    // split exists — the assumptions below (hr=r/2, si in {0,1}) silently drop
+    // index L-1 and impose a non-existent block structure, producing unsound
+    // corrections. Route odd grids through the parity-general decoder instead.
+    if((r & 1) || (s & 1)) return solve_plane_general(r, s, syn, out);
     int n=r*s; cost_init(n);
     int hr=r/2, hs=s/2;
     if(hr < 1 || hs < 1) return 0;
@@ -561,10 +574,63 @@ static int solve_block_step1(int m, int n, uint8_t *S, uint8_t *out) {
     return best;
 }
 
-// Recursive decomposition: split r x s into its 4 independent
-// (r/2) x (s/2) parity-class blocks, solve each at the lower grid
-// dimension, recombine. Falls back to solve_plane if r or s is odd
-// (no parity split exists in that case).
+// ============================================================
+// PARITY-GENERAL DECODER — correct for any r,s (even, odd, or mixed).
+//
+// The stride-2 plus check H = (1+x^2)(1+y^2) partitions each axis by
+// the stride-2 walk. An axis of length L splits into g = gcd(2,L)
+// independent cycles (g=2 if L even, g=1 if L odd), each of length
+// L/g, and along each cycle "+2" becomes "+1" — i.e. each (row-cycle,
+// col-cycle) block is exactly a standard adjacent (1+x)(1+y) toric
+// code of size (Lr)x(Lc), which solve_block_step1 decodes soundly.
+//
+// Even x even reproduces the original 4 blocks of (r/2)x(s/2); odd x
+// odd is a SINGLE r x s block; mixed parity gives 2 blocks. The walk
+// order (cr+2*tr, cc+2*tc) mod (r,s) keeps the recurrence local. This
+// is the same decomposition the rest of the file relies on, generalised
+// off the even-only assumption so odd grids decode correctly instead of
+// silently dropping the last index.
+// ============================================================
+static int solve_plane_general(int r, int s, uint8_t *syn, uint8_t *out) {
+    int n=r*s; cost_init(n); memset(out,0,n);
+    int gr = (r & 1) ? 1 : 2, gc = (s & 1) ? 1 : 2;
+    int Lr = r/gr, Lc = s/gc;
+    uint8_t *SB=malloc((size_t)Lr*Lc), *EB=malloc((size_t)Lr*Lc);
+    if(!SB||!EB){ free(SB); free(EB); return 0; }
+    for(int cr=0; cr<gr; cr++) for(int cc=0; cc<gc; cc++) {
+        // Gather this parity class in stride-2 walk order: old (cr+2tr, cc+2tc).
+        for(int tr=0; tr<Lr; tr++) for(int tc=0; tc<Lc; tc++)
+            SB[tr*Lc+tc] = syn[((cr+2*tr)%r)*s + ((cc+2*tc)%s)];
+        // Repair the block's metachecks (row/col sums) first. This is the
+        // single-shot step AND a soundness precondition here: it guarantees the
+        // block syndrome is in the image, so the row0=col0=0 recurrence below
+        // closes around the torus seam exactly. No-op on clean syndromes.
+        metacheck_repair_block(Lr, Lc, SB);
+        // ---- sound adjacent-toric block solve ----
+        // Block check (verified): S(A,B) = E(A,B)^E(A+1,B)^E(A,B+1)^E(A+1,B+1).
+        // Invert with row0=col0=0 boundary:
+        //   E[a][b] = S[a-1][b-1] ^ E[a-1][b] ^ E[a][b-1] ^ E[a-1][b-1]  (a,b>=1)
+        // then take minimum weight over the kernel (full row / full col flips).
+        memset(EB,0,(size_t)Lr*Lc);
+        for(int a=1;a<Lr;a++) for(int b=1;b<Lc;b++)
+            EB[a*Lc+b] = SB[(a-1)*Lc+(b-1)] ^ EB[(a-1)*Lc+b] ^ EB[a*Lc+(b-1)] ^ EB[(a-1)*Lc+(b-1)];
+        for(;;){ int chg=0;
+            for(int b=0;b<Lc;b++){ int w0=0,w1=0;
+                for(int a=0;a<Lr;a++){ if(EB[a*Lc+b]) w0++; else w1++; }
+                if(w1<w0){ for(int a=0;a<Lr;a++) EB[a*Lc+b]^=1; chg=1; } }
+            for(int a=0;a<Lr;a++){ int w0=0,w1=0;
+                for(int b=0;b<Lc;b++){ if(EB[a*Lc+b]) w0++; else w1++; }
+                if(w1<w0){ for(int b=0;b<Lc;b++) EB[a*Lc+b]^=1; chg=1; } }
+            if(!chg) break;
+        }
+        for(int tr=0; tr<Lr; tr++) for(int tc=0; tc<Lc; tc++)
+            out[((cr+2*tr)%r)*s + ((cc+2*tc)%s)] = EB[tr*Lc+tc];
+    }
+    free(SB); free(EB);
+    int cap = effective_cap(n);
+    if(cap > 0) { int f=0; for(int q=0;q<n;q++) f+=out[q]; if(f>cap){ memset(out,0,n); return 0; } }
+    return 1;
+}
 // Full decoder: 4 logical sectors × sub-lattice decompose × cross-boundary descent
 int solve_plane_layered(int r, int s, uint8_t *syn, uint8_t *out) {
     int n=r*s;
