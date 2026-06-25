@@ -1058,19 +1058,24 @@ static void preprocess_syndrome(int r, int s, uint8_t *syn) {
     }
     // Pass 2: iterative edge-flip product-code — pair odd rows/cols only
     // at positions where syn=1 (real measurement error sites).
-    int hr=r/2, hs=s/2;
+    // For odd grids, stride-2 is a single cycle (gcd(2,odd)=1): the 4-class
+    // decomposition doesn't distribute the syndrome correctly and the
+    // edge-flip would remove valid syndrome bits. Skip entirely for odd axes.
+    if((r & 1) || (s & 1)) return;
     for(int iter=0; iter<10; iter++) {
         int any=0;
         for(int i=0;i<2;i++) for(int j=0;j<2;j++) {
+            int Lr=(r-i+1)/2, Lc=(s-j+1)/2;
+            if(Lr<1||Lc<1) continue;
             int odd_r[300], nr=0, odd_c[300], nc=0;
-            for(int si=0;si<hr;si++) {
+            for(int si=0;si<Lr;si++) {
                 int rp=0;
-                for(int sj=0;sj<hs;sj++) rp^=syn[(i+2*si)*s+(j+2*sj)];
+                for(int sj=0;sj<Lc;sj++) rp^=syn[(i+2*si)*s+(j+2*sj)];
                 if(rp) odd_r[nr++]=si;
             }
-            for(int sj=0;sj<hs;sj++) {
+            for(int sj=0;sj<Lc;sj++) {
                 int cp=0;
-                for(int si=0;si<hr;si++) cp^=syn[(i+2*si)*s+(j+2*sj)];
+                for(int si=0;si<Lr;si++) cp^=syn[(i+2*si)*s+(j+2*sj)];
                 if(cp) odd_c[nc++]=sj;
             }
             if(nr==0 && nc==0) continue;
@@ -1086,7 +1091,7 @@ static void preprocess_syndrome(int r, int s, uint8_t *syn) {
             // B: leftover rows → flip any incident syn=1 edge
             for(int ri=0;ri<nr;ri++) {
                 if(used_r[ri]) continue;
-                for(int sj=0;sj<hs;sj++) {
+                for(int sj=0;sj<Lc;sj++) {
                     int pos=(i+2*odd_r[ri])*s+(j+2*sj);
                     if(syn[pos]){syn[pos]^=1;used_r[ri]=1;break;}
                 }
@@ -1094,7 +1099,7 @@ static void preprocess_syndrome(int r, int s, uint8_t *syn) {
             // C: leftover columns → flip any incident syn=1 edge
             for(int ci=0;ci<nc;ci++) {
                 if(used_c[ci]) continue;
-                for(int si=0;si<hr;si++) {
+                for(int si=0;si<Lr;si++) {
                     int pos=(i+2*si)*s+(j+2*odd_c[ci]);
                     if(syn[pos]){syn[pos]^=1;used_c[ci]=1;break;}
                 }
