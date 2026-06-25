@@ -452,9 +452,7 @@ int solve_plane(int r, int s, uint8_t *syn, uint8_t *out) {
             for(int a=0;a<hr;a++) for(int b=0;b<hs;b++) if(E[SEC(a,b)]) wt+=W[SEC(a,b)];
             if(wt < best_sec) { best_sec = wt; memcpy(best_E, E, sz); }
         }
-        // Enumerate the 4 logical sectors on best_E via row/column parity flips.
-        // Flipping all of row 0 (E[0][*]) toggles the horizontal logical;
-        // flipping all of column 0 (E[*][0]) toggles the vertical logical.
+        #ifndef NO_LOGICAL_ENUM
         for(int log=0;log<4;log++) {
             memcpy(E, best_E, sz);
             if(log & 1) for(int b=0;b<hs;b++) E[SEC(0,b)] ^= 1;
@@ -464,6 +462,7 @@ int solve_plane(int r, int s, uint8_t *syn, uint8_t *out) {
             for(int a=0;a<hr;a++) for(int b=0;b<hs;b++) if(E[SEC(a,b)]) wt+=W[SEC(a,b)];
             if(wt < best_sec) { best_sec = wt; memcpy(best_E, E, sz); }
         }
+        #endif
         for(int a=0;a<hr;a++) for(int b=0;b<hs;b++)
             if(best_E[SEC(a,b)]) out[((si+2*a)%r)*s + ((sj+2*b)%s)] ^= 1;
     }
