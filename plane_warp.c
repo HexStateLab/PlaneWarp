@@ -1702,6 +1702,7 @@ int main(int argc, char **argv) {
                 if(fread(per_round+rnd*n,1,n,stdin)!=(size_t)n){free(per_round);return 1;}
             }
             // Phase 1: decode each diff syndrome  syn_c ⊕ syn_{c+1}  (W-axis rotation)
+            // Diffs are sparse (measurement noise only), so use solve_plane (not layered).
             uint8_t *delta=calloc((size_t)(rounds-1)*n,1);
             if(!delta){free(per_round);return 1;}
             for(int c=0;c<rounds-1;c++){
@@ -1710,7 +1711,7 @@ int main(int argc, char **argv) {
                 memset(acc,0,n); memcpy(res,diff,n);
                 for(int pass=0;pass<5;pass++){
                     preprocess_syndrome(r,s,res);
-                    solve_plane_layered(r,s,res,dec);
+                    solve_plane(r,s,res,dec);
                     for(int q=0;q<n;q++) acc[q]^=dec[q];
                     syndrome_of(r,s,acc,res);
                     for(int q=0;q<n;q++) res[q]^=diff[q];
