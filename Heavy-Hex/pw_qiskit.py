@@ -143,6 +143,9 @@ class PlaneWarp:
 
     def decode_tesseract(self, syndromes):
         rounds, r, s = syndromes.shape
+        if rounds == 1:
+            corr, _ = self.decode_layered(syndromes[0])
+            return corr
         n = r * s
         buf = struct.pack('<I', rounds)
         buf += syndromes.tobytes()
@@ -152,6 +155,10 @@ class PlaneWarp:
         p = subprocess.run([exe, str(r), str(s)] + flags +
                            ["--decode-tesseract"],
                            input=buf, capture_output=True)
+        if p.returncode != 0:
+            print(f"WARNING: tesseract decoder failed (rc={p.returncode}, stderr={p.stderr.decode().strip()}), falling back to 2D on round 0", file=sys.stderr)
+            corr, _ = self.decode_layered(syndromes[0])
+            return corr
         corr = np.frombuffer(p.stdout, dtype=np.uint8).reshape(r, s)
         return corr
 
