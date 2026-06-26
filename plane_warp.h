@@ -36,6 +36,18 @@ int is_stabilizer(int r, int s, uint8_t *diff);
 // Decode Z-type errors (shifted syndrome).
 int decode_Z(int r, int s, uint8_t *err_z, uint8_t *dec_z);
 
+// Linear basis decoder: given n verified (syndrome, correction) pairs,
+// decode a new syndrome by expressing it as XOR of basis vectors.
+//   n       — number of basis entries
+//   syns    — n * r*s bytes, each r*s block is a basis syndrome vector
+//   corrs   — n * r*s bytes, each r*s block is the corresponding correction
+//   new_syn — r*s bytes, the syndrome to decode
+//   out     — receives r*s bytes of the decoded correction (0‑filled if failed)
+// Returns 1 if new_syn was in the basis span (out is valid), 0 otherwise.
+int decode_linear_basis(int r, int s, int n,
+                        const uint8_t *syns, const uint8_t *corrs,
+                        const uint8_t *new_syn, uint8_t *out);
+
 // Global decoder knobs (set before calling any decode function):
 extern int g_fast;
 extern int g_escape_enabled;
