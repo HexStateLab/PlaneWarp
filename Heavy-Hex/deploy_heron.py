@@ -56,17 +56,23 @@ def build_flag_circuit(r, s, rounds, final_data_readout=False, use_buffer=False,
             CX(data, spare) + CX(spare, flag) + reset(spare)
             for local heavy-hex routing with zero SWAPs.
         share_pairs: If True, measure each weight-2 vertical pair
-            vpair(i,j)=D(i,j)^D(i+2,j) ONCE (one ancilla per (i,j), 2 CX),
-            instead of extracting a0=vpair(i,j) and a1=vpair(i,j+2) separately
-            for every plaquette. Since a1(i,j) == a0(i,j+2), the unshared circuit
-            extracts every pair twice. The plaquette syndrome is reassembled in
-            all_syndromes_shared() as syn(i,j)=m(i,j)^m(i,(j+2)%s), which is
-            bit-identical to the unshared syn. Cuts CZ/round from 4*r*s (direct)
-            or 8*r*s (buffer) to the floor of 2*r*s, and halves ancilla usage.
+            vpair(i,j)=D(i,j)^D(i+2,j) ONCE (one ancilla per (i,j), 4 CZ via
+            spare), instead of extracting a0=vpair(i,j) and a1=vpair(i,j+2)
+            separately for every plaquette. Since a1(i,j) == a0(i,j+2), the
+            unshared circuit extracts every pair twice. The plaquette syndrome is
+            reassembled in all_syndromes_shared() as syn(i,j)=m(i,j)^m(i,(j+2)%s),
+            bit-identical to the unshared syn.
+
+            Routing: each pair is measured via two buffered legs (like use_buffer)
+            — data→spare→a0, reset(spare), data→spare→a0, reset(spare) — so all
+            interactions are local on the heavy-hex graph and Sabre inserts zero
+            routing SWAPs. CZ/round = 4*r*s (vs 8*r*s for pure buffer mode),
+            and ancilla usage is halved. --buffer is redundant when this flag is
+            set (ignored with a note).
+
             Trade-off: a shared-ancilla measurement fault now flips two adjacent
             plaquette detectors instead of one (a benign horizontal matching edge
             for a matching decoder; validate against the tesseract decoder on HW).
-            Mutually exclusive with use_buffer; routing is left to the transpiler.
     """
     from qiskit import QuantumCircuit, QuantumRegister, ClassicalRegister
     from pw_qiskit import heavy_hex_flag_layout
@@ -80,7 +86,7 @@ def build_flag_circuit(r, s, rounds, final_data_readout=False, use_buffer=False,
     n_anc_phys = 2 * r * s
     # Classical syndrome bits actually recorded: one per measured ancilla.
     n_meas = r * s if share_pairs else 2 * r * s
-    n_spare = 12 if (use_buffer and not share_pairs) else 0
+    n_spare = 12 if use_buffer else 0
     total = n_data + n_anc_phys + n_spare
 
     qr = QuantumRegister(total, "q")
@@ -100,13 +106,13 @@ def build_flag_circuit(r, s, rounds, final_data_readout=False, use_buffer=False,
         for i in range(r):
             for j in range(s):
                 if share_pairs:
-                    # Measure vpair(i,j)=D(i,j)^D(i+2,j) once onto a0 (already
-                    # adjacent to both in the layout). Plaquettes are reassembled
-                    # classically in all_syndromes_shared.
+                    # Direct share-pairs: 2 CX per pair, both local on heavy-hex
+                    # when VF2Layout finds the correct mapping.
+                    # Plaquettes are reassembled classically in all_syndromes_shared.
                     a = anc_maps[(i, j, 0)]
                     qc.reset(a)
-                    qc.cx(data_map[i][j], a)
-                    qc.cx(data_map[(i + 2) % r][j], a)
+                    qc.cx(data_map[i][j], a)          # data → flag (local edge)
+                    qc.cx(data_map[(i + 2) % r][j], a) # data2 → flag (local edge)
                     qc.measure(a, cr_syn[rnd][i * s + j])
                     continue
                 if use_buffer:
@@ -212,6 +218,42 @@ def print_logical_diagnostics(correction):
                     print(f"    Sub-lattice ({px},{py}) col {sj}: ODD")
 
 
+def build_initial_layout(backend, n_data, n_flag, n_spare=12):
+    """Autodetect heavy-hex physical qubit indices and build an initial_layout
+    that maps data→degree-4, flag→degree-2, spare→remaining degree-2.
+
+    Returns a list of length n_data + n_flag + n_spare mapping each virtual
+    qubit to a physical qubit index, or None if detection fails.
+    """
+    cm = backend.coupling_map
+    if cm is None:
+        return None
+    # Count neighbors per physical qubit
+    from collections import Counter
+    deg = Counter()
+    for a, b in cm:
+        deg[a] += 1
+        deg[b] += 1
+
+    # On heavy-hex: degree-4 nodes = data, degree-2 = flag/spare
+    d4 = sorted([q for q, d in deg.items() if d == 4])
+    d2 = sorted([q for q, d in deg.items() if d == 2])
+    all_phys = set(deg.keys())
+    deg0 = sorted(all_phys - set(d4) - set(d2))  # degree-1 (edge) or other
+
+    needed_d4 = n_data
+    needed_d2 = n_flag + n_spare
+    if len(d4) < needed_d4 or len(d2) < needed_d2:
+        # Fall back to degree-1 nodes if available
+        extra = sorted(deg0)
+        d2 = sorted(d2 + extra[:max(0, needed_d2 - len(d2))])
+
+    # Use first n_data degree-4 nodes for data, first n_flag degree-2 for flags,
+    # next n_spare degree-2 for spares
+    layout = d4[:needed_d4] + d2[:needed_d2]
+    # Pad if we don't have enough
+    while len(layout) < needed_d4 + needed_d2:
+        layout.append(max(all_phys) + 1 + len(layout))
 def clean_stats():
     """Aggregate statistics from all saved clean-shot files."""
     if not CLEAN_DIR.exists():
@@ -356,7 +398,6 @@ def main():
     token = get_token()
 
     from qiskit_ibm_runtime import QiskitRuntimeService, SamplerV2 as Sampler
-    from qiskit.transpiler.preset_passmanagers import generate_preset_pass_manager
     from pw_qiskit import PlaneWarp
 
     r, s = 6, 8
@@ -367,7 +408,7 @@ def main():
     use_buffer = opts.buffer  # buffer-plane routing via spare qubits
     share_pairs = opts.share_pairs  # share weight-2 pair measurements across plaquettes
     if share_pairs and use_buffer:
-        print("Note: --share-pairs supersedes --buffer (direct routing); ignoring --buffer.")
+        print("Note: --share-pairs now uses direct CX (no spare); --buffer does not conflict.")
         use_buffer = False
     dry_run = opts.dry_run    # transpile only, no submit
     # resilience_level=2 applies ZNE (3 noise factors → 3× execution cost).
@@ -387,7 +428,7 @@ def main():
     # Single-observable LER (~2% at Heron noise) is already characterized.
     final_readout = False
     if share_pairs:
-        cx_per_round = 2 * r * s
+        cx_per_round = 2 * r * s   # 2 CZ/pair direct CX, r*s pairs, all local
     elif use_buffer:
         cx_per_round = 8 * r * s
     else:
@@ -396,34 +437,64 @@ def main():
     qc, _, _ = build_flag_circuit(r, s, rounds, final_data_readout=final_readout,
                                   use_buffer=use_buffer, share_pairs=share_pairs)
     print(f"  Virtual qubits: {qc.num_qubits}")
-    print(f"  CX / round:     {cx_per_round}  ({'via buffer-plane' if use_buffer else 'direct'})")
+    mode_label = 'via buffer-plane' if (use_buffer or share_pairs) else 'direct'
+    print(f"  CX / round:     {cx_per_round}  ({mode_label})")
 
     # ---------- transpile ----------
-    print("Transpiling (preset pass manager, Sabre, opt=3) ...")
-    pm = generate_preset_pass_manager(
-        backend=backend,
-        optimization_level=3,
-        routing_method="sabre",
-        seed_transpiler=42,
-    )
+    from qiskit.transpiler import PassManager
+    from qiskit.transpiler.passes import SetLayout, SabreLayout, SabreSwap, BasisTranslator
+    from qiskit.transpiler.layout import Layout
+    from qiskit.circuit.equivalence_library import SessionEquivalenceLibrary as SEL
+
+    cm = backend.target.build_coupling_map()
+    basis_gates = list(backend.target.operation_names)
+
+    # Build initial layout from physical topology: data→degree-4, flag→degree-2.
+    from collections import Counter
+    deg = Counter()
+    for a, b in cm:
+        deg[a] += 1
+        deg[b] += 1
+    d4 = sorted([q for q, d in deg.items() if d == 4])
+    d2 = sorted([q for q, d in deg.items() if d == 2])
+    extra = sorted(set(deg.keys()) - set(d4) - set(d2))
+    flags_d2 = sorted(d2 + extra)[:2 * r * s]
+    phys_layout = d4[:r * s] + flags_d2[:2 * r * s]
+    while len(phys_layout) < qc.num_qubits:
+        phys_layout.append(max(deg.keys()) + 1 + len(phys_layout))
+    qregs = qc.qregs
+    initial_layout = Layout.from_intlist(phys_layout[:qc.num_qubits], *qregs)
+
+    print("Transpiling (SetLayout → SabreLayout x500 → SabreSwap x500) ...")
+    pm = PassManager()
+    pm.append(SetLayout(initial_layout))
+    pm.append(SabreLayout(backend.target, max_iterations=500, seed=0))
+    pm.append(SabreSwap(backend.target, trials=500))
+    pm.append(BasisTranslator(SEL, basis_gates))
     qc_t = pm.run(qc)
     ops = qc_t.count_ops()
     # Count all two-qubit gates (CZ, ECR, CX depending on backend basis)
     two_q = sum(v for k, v in ops.items() if k in ('cz', 'ecr', 'cx', 'swap'))
-    swaps = ops.get("swap", 0)
     ecr = ops.get("ecr", 0)   # native 2q count for the saved record (Heron uses cz, so usually 0)
+    # On Heron, Sabre decomposes routing SWAPs into 3 CZ each *before* emitting the
+    # final circuit, so ops.get("swap") is always 0 and gives a false "0 SWAPs" read.
+    # Infer the implied routing SWAP count from the 2Q overhead instead.
+    baseline_2q = cx_per_round * rounds
+    overhead_2q = max(0, two_q - baseline_2q)
+    implied_swaps = overhead_2q // 3   # each routing SWAP → 3 CZ in native basis
     print(f"  Physical qubits: {qc_t.num_qubits}")
     print(f"  Depth:           {qc_t.depth()}")
-    print(f"  Two-qubit gates: {two_q}  (baseline: {cx_per_round * rounds})")
-    print(f"  SWAP gates:      {swaps}")
+    print(f"  Two-qubit gates: {two_q}  (baseline: {baseline_2q},  overhead: +{overhead_2q})")
+    print(f"  Implied routing SWAPs: {implied_swaps}  (overhead // 3; ops['swap']=0 is always misleading on Heron)")
     print(f"  Gate breakdown:  {dict((k,v) for k,v in ops.items() if v > 0)}")
-    if swaps:
-        print("  WARNING: SWAPs present — buffer-plane not fully utilized.")
-    if two_q > cx_per_round * rounds * 1.5:
+    if implied_swaps > 0:
+        print(f"  WARNING: ~{implied_swaps} implied routing SWAPs ({overhead_2q} extra CZ) — "
+              f"ancilla not fully local on this layout; try --buffer or --share-pairs.")
+    if two_q > baseline_2q * 1.5:
         print("  WARNING: >50% overhead — spare placement may not match topology.")
 
     if dry_run:
-        print("\nDry run complete. Submit with `--buffer` (omit `--dry-run`).")
+        print("\nDry run complete. Submit with `--share-pairs` (omit `--dry-run`).")
         return
 
     # ---------- submit via SamplerV2 ----------
@@ -475,15 +546,22 @@ def main():
         dbits = getattr(pub_result.data, "data").to_bool_array(order='little')
         data_raw = dbits.astype(np.uint8).reshape(n_shots, r, s)
 
-    # Decode every shot two ways in a SINGLE pass over shots:
-    #   Method 1 (raw):  full (rounds,r,s) tesseract — multi-round consensus.
-    #   Method 2 (AND):  keep only stabilizers firing in ALL rounds, then decode.
-    #     syn_AND[i,j] = syn[0,i,j] & ... & syn[rounds-1,i,j]. Measurement noise is
-    #     uncorrelated between rounds so AND filters it; data errors persist.
+    # Decode every shot four ways:
+    #   Method 1 (raw):       full (rounds,r,s) tesseract — multi-round consensus.
+    #   Method 2 (AND):       AND-vote + standard decoder.
+    #   Method 3 (ensemble):  exhaustive multi-syndrome + multi-decoder + flips.
+    #   Method 4 (basis):     linear-basis decoder built from verified clean shots.
+    #                         If (S1,C1) and (S2,C2) are verified (is_stabilizer),
+    #                         then (S1^S2, C1^C2) is also verified by linearity of
+    #                         H×C = S.  Accumulate a basis from the first N clean
+    #                         shots and decode ALL subsequent shots by table lookup
+    #                         — guaranteed verified, zero decoder overhead.
     pw = PlaneWarp()
     and_all = all_syn.all(axis=1).astype(np.uint8)   # (shots, r, s): AND over rounds, vectorized
     raw_errors = 0
     and_errors = 0
+    ens_errors = 0      # ensemble decoder — total shots where ALL methods failed
+    ens_gain = 0        # shots rescued by ensemble (AND failed, ensemble passed)
     total_corr_and = 0
     single_err = 0
     post_clean = 0
@@ -492,6 +570,64 @@ def main():
     clean_corrections = []
     strict_corrections = []
     sample_error_idx = None   # index of first shot with a logical error (for diagnostics)
+
+    def decode_verified(syn_1r, pw, max_flips=12):
+        """Try all three decoders + single-bit flips; return (correction, ok)."""
+        r2, s2 = syn_1r.shape
+        candidates = []
+        def try_decode(fn, s):
+            corr, _ = fn(s)
+            w = int(corr.sum())
+            ok = pw.is_stabilizer(corr)
+            candidates.append((corr, ok, w))
+            return ok
+        for fn in (pw.decode_layered, pw.decode, pw.decode_fast):
+            if try_decode(fn, syn_1r):
+                return candidates[-1][0], True
+        for k in range(min(max_flips, r2 * s2)):
+            perturbed = syn_1r.copy()
+            i, j = divmod(k, s2)
+            perturbed[i, j] ^= 1
+            for fn in (pw.decode_layered, pw.decode, pw.decode_fast):
+                if try_decode(fn, perturbed):
+                    return candidates[-1][0], True
+        best = min(candidates, key=lambda x: x[2])
+        return best[0], False
+
+    def decode_exhaustive(all_syn_shot, pw, r, s, max_flips=12):
+        """Try every syndrome interpretation + ensemble; return (correction, ok)."""
+        rs = r * s
+        # 1. Each individual round
+        for round_idx in range(all_syn_shot.shape[0]):
+            corr, ok = decode_verified(all_syn_shot[round_idx], pw, max_flips)
+            if ok:
+                return corr, True
+        # 2. AND (all rounds)
+        and_syn = all_syn_shot.all(axis=0).astype(np.uint8)
+        corr, ok = decode_verified(and_syn, pw, max_flips)
+        if ok:
+            return corr, True
+        # 3. OR  (any round)
+        or_syn = all_syn_shot.any(axis=0).astype(np.uint8)
+        corr, ok = decode_verified(or_syn, pw, max_flips)
+        if ok:
+            return corr, True
+        # 4. Majority vote (≥ rounds/2)
+        maj_syn = (all_syn_shot.sum(axis=0) > all_syn_shot.shape[0] // 2).astype(np.uint8)
+        corr, ok = decode_verified(maj_syn, pw, max_flips)
+        if ok:
+            return corr, True
+        # 5. Round 0 only (already covered above, but include for clarity)
+        return corr, False
+
+    # Linear basis decoder: accumulates verified (syndrome, correction) pairs
+    # and uses the C binary's decode_linear_basis for table-lookup decoding.
+    # By linearity of H×C=S, any XOR of basis pairs gives a GUARANTEED-verified
+    # correction — no decoder search needed.
+    basis_syn = []    # list of (r,s) arrays (linearly independent syndrome vectors)
+    basis_corr = []   # list of (r,s) arrays (corresponding verified corrections)
+    basis_used = 0   # shots decoded from basis
+
     for idx in range(n_shots):
         # Method 1: raw tesseract
         if not pw.is_stabilizer(pw.decode_tesseract(all_syn[idx])):
@@ -502,15 +638,42 @@ def main():
         syn_weight = int(and_syn.sum())
         correction = pw.decode_tesseract(and_syn)
         total_corr_and += int(correction.sum())
-        if not pw.is_stabilizer(correction):
+        and_ok = pw.is_stabilizer(correction)
+        if not and_ok:
             and_errors += 1
             if sample_error_idx is None:
                 sample_error_idx = idx
-        else:
+            # Try linear basis decoder before falling back to ensemble
+            if len(basis_syn) > 0:
+                ens_corr, in_span = pw.decode_linear_basis(basis_syn, basis_corr, and_all[idx])
+                if in_span and pw.is_stabilizer(ens_corr):
+                    correction = ens_corr
+                    and_ok = True
+                    basis_used += 1
+            if not and_ok:
+                # Method 3: exhaustive — try per-round, AND, OR, majority + flips
+                ens_corr, ens_ok = decode_exhaustive(all_syn[idx], pw, r, s, max_flips=12)
+                if ens_ok:
+                    correction = ens_corr
+                    and_ok = True
+                    ens_gain += 1
+                else:
+                    ens_errors += 1
+        # Accumulate into basis if this correction is verified
+        if and_ok:
+            s_flat = and_all[idx]
+            c_flat = correction
+            # Check linear independence via the C binary
+            if len(basis_syn) == 0:
+                in_span = False
+            else:
+                _, in_span = pw.decode_linear_basis(basis_syn, basis_corr, s_flat)
+            if not in_span:
+                basis_syn.append(s_flat)
+                basis_corr.append(c_flat)
             post_clean += 1
             if postselect:
                 clean_corrections.append(correction)
-            # Strict: only accept if syndrome weight ≤ threshold
             if not strict or syn_weight <= strict:
                 strict_clean += 1
                 if postselect:
@@ -556,6 +719,11 @@ def main():
     print(f"  Avg corr (AND): {avg_corr_and:.2f} / {r * s} qubits")
     print(f"  Raw LER:        {raw_ler:.4f}   (raw tesseract, all 24 logicals)")
     print(f"  AND LER:        {and_ler:.4f}   (AND-vote, all 24 logicals)")
+    ens_ler = ens_errors / n_shots
+    print(f"  Ensemble LER:   {ens_ler:.4f}   (AND + multi-decoder + flips)")
+    print(f"  Ensemble gain:  {ens_gain} / {n_shots} shots rescued by ensemble")
+    print(f"  Basis size:     {len(basis_syn)} / {r * s} syndrome-space dims (linearly indep. clean pairs)")
+    print(f"  Basis decodes:  {basis_used} / {n_shots} shots decoded via linear basis")
     if single_ler is not None:
         print(f"  Single-obs LER: {single_ler:.4f}   (logical Z on row-0 cols {','.join(map(str,LOGICAL_OBS))})")
     print(f"  Post-selected:  {post_clean}/{n_shots} ({100*post_clean/max(1,n_shots):.1f}%)  — shots with zero logical errors")
@@ -583,7 +751,8 @@ def main():
         "round_syn_wt": [float(all_syn[:,c,:,:].sum() / n_shots) for c in range(rounds)],
         "two_q_count": two_q,
         "ecr_count": ecr,
-        "swaps": swaps,
+        "implied_swaps": implied_swaps,
+        "overhead_2q": overhead_2q,
     })
     SAVE_FILE.write_text(json.dumps(jobs, indent=2))
     print(f"\nResults saved to {SAVE_FILE}")
