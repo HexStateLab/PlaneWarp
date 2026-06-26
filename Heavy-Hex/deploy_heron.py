@@ -546,16 +546,11 @@ def main():
         dbits = getattr(pub_result.data, "data").to_bool_array(order='little')
         data_raw = dbits.astype(np.uint8).reshape(n_shots, r, s)
 
-    # Decode every shot four ways:
-    #   Method 1 (raw):       full (rounds,r,s) tesseract — multi-round consensus.
-    #   Method 2 (AND):       AND-vote + standard decoder.
-    #   Method 3 (ensemble):  exhaustive multi-syndrome + multi-decoder + flips.
-    #   Method 4 (basis):     linear-basis decoder built from verified clean shots.
-    #                         If (S1,C1) and (S2,C2) are verified (is_stabilizer),
-    #                         then (S1^S2, C1^C2) is also verified by linearity of
-    #                         H×C = S.  Accumulate a basis from the first N clean
-    #                         shots and decode ALL subsequent shots by table lookup
-    #                         — guaranteed verified, zero decoder overhead.
+    # Decode every shot:
+    #   1. raw tesseract     — multi-round consensus (diagnostic)
+    #   2. AND-vote          — standard decoder on AND syndrome
+    #   3. linear basis      — table lookup in verified-pair space (C binary)
+    #   4. exhaustive        — multi-syndrome + multi-decoder + flips (fallback)
     pw = PlaneWarp()
     and_all = all_syn.all(axis=1).astype(np.uint8)   # (shots, r, s): AND over rounds, vectorized
     raw_errors = 0
@@ -720,10 +715,10 @@ def main():
     print(f"  Raw LER:        {raw_ler:.4f}   (raw tesseract, all 24 logicals)")
     print(f"  AND LER:        {and_ler:.4f}   (AND-vote, all 24 logicals)")
     ens_ler = ens_errors / n_shots
-    print(f"  Ensemble LER:   {ens_ler:.4f}   (AND + multi-decoder + flips)")
-    print(f"  Ensemble gain:  {ens_gain} / {n_shots} shots rescued by ensemble")
-    print(f"  Basis size:     {len(basis_syn)} / {r * s} syndrome-space dims (linearly indep. clean pairs)")
+    print(f"  Final LER:      {ens_ler:.4f}   (AND + basis + exhaustive)")
+    print(f"  Basis size:     {len(basis_syn)} / {r * s} syndrome-space dims")
     print(f"  Basis decodes:  {basis_used} / {n_shots} shots decoded via linear basis")
+    print(f"  Exhaustive gain: {ens_gain} / {n_shots} shots rescued by exhaustive fallback")
     if single_ler is not None:
         print(f"  Single-obs LER: {single_ler:.4f}   (logical Z on row-0 cols {','.join(map(str,LOGICAL_OBS))})")
     print(f"  Post-selected:  {post_clean}/{n_shots} ({100*post_clean/max(1,n_shots):.1f}%)  — shots with zero logical errors")
