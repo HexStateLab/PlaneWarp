@@ -1529,6 +1529,79 @@ static void *run_persist_round(void *arg) {
     return NULL;
 }
 
+// ------------------------------------------------------------
+// Linear basis decoder (native C)
+// ------------------------------------------------------------
+// Given n verified (syn, corr) pairs, decode new_syn by expressing it
+// as XOR of basis vectors via GF(2) Gaussian elimination.
+// Returns 1 if new_syn is in the span, 0 otherwise.
+int decode_linear_basis(int r, int s, int n,
+                        const uint8_t *syns, const uint8_t *corrs,
+                        const uint8_t *new_syn, uint8_t *out) {
+    int nn = r * s;
+    if (n <= 0 || nn <= 0) { memset(out, 0, nn); return 0; }
+
+    // Working copies for RREF
+    uint8_t *ws = malloc((size_t)n * nn);
+    uint8_t *wc = malloc((size_t)n * nn);
+    int *pivot = malloc((size_t)n * sizeof(int));
+    uint8_t *temp = malloc((size_t)nn);
+    uint8_t *coeffs = calloc((size_t)n, 1);
+    if (!ws || !wc || !pivot || !temp || !coeffs) {
+        free(ws); free(wc); free(pivot); free(temp); free(coeffs);
+        memset(out, 0, nn); return 0;
+    }
+    memcpy(ws, syns, (size_t)n * nn);
+    memcpy(wc, corrs, (size_t)n * nn);
+
+    // Forward elimination: build row-echelon form
+    for (int b = 0; b < n; b++) {
+        pivot[b] = -1;
+        for (int q = 0; q < nn; q++) {
+            if (ws[b * nn + q]) { pivot[b] = q; break; }
+        }
+        if (pivot[b] < 0) continue;
+        // Eliminate this pivot from all later basis vectors
+        for (int b2 = b + 1; b2 < n; b2++) {
+            if (ws[b2 * nn + pivot[b]]) {
+                for (int q = 0; q < nn; q++) {
+                    ws[b2 * nn + q] ^= ws[b * nn + q];
+                    wc[b2 * nn + q] ^= wc[b * nn + q];
+                }
+            }
+        }
+    }
+
+    // Decompose new_syn using the RREF basis
+    memcpy(temp, new_syn, nn);
+    for (int b = 0; b < n; b++) {
+        int p = pivot[b];
+        if (p >= 0 && temp[p]) {
+            for (int q = 0; q < nn; q++) temp[q] ^= ws[b * nn + q];
+            coeffs[b] = 1;
+        }
+    }
+
+    int ok = 1;
+    for (int q = 0; q < nn; q++) {
+        if (temp[q]) { ok = 0; break; }
+    }
+
+    if (ok) {
+        memset(out, 0, nn);
+        for (int b = 0; b < n; b++) {
+            if (coeffs[b]) {
+                for (int q = 0; q < nn; q++) out[q] ^= wc[b * nn + q];
+            }
+        }
+    } else {
+        memset(out, 0, nn);
+    }
+
+    free(ws); free(wc); free(pivot); free(temp); free(coeffs);
+    return ok;
+}
+
 int main(int argc, char **argv) {
     int r=40, s=40, weight=0, trials=200, seed=42, bench=0, mode=0;
     g_fast=0;
@@ -1909,6 +1982,38 @@ int main(int argc, char **argv) {
             solve_plane(r,s,syn_shift,dec);
             fwrite(dec,1,n,stdout); fflush(stdout);
             return 0;
+        }
+        else if(!strcmp(argv[i],"--decode-basis")) {
+            // Linear basis decoder: read n (4 bytes), then n*(syn+corr) pairs (each nn bytes),
+            // then the new syndrome (nn bytes). Output correction (nn bytes).
+            int nn = r * s, n;
+            if (fread(&n, 4, 1, stdin) != 1 || n < 0 || n > 1000000) {
+                fprintf(stderr, "bad basis count\n"); return 1;
+            }
+            uint8_t *syns = malloc((size_t)n * nn);
+            uint8_t *corrs = malloc((size_t)n * nn);
+            uint8_t *new_syn = malloc((size_t)nn);
+            uint8_t *out = malloc((size_t)nn);
+            if (!syns || !corrs || !new_syn || !out) {
+                free(syns); free(corrs); free(new_syn); free(out);
+                fprintf(stderr, "alloc fail\n"); return 1;
+            }
+            for (int k = 0; k < n; k++) {
+                if (fread(syns + k * nn, 1, nn, stdin) != (size_t)nn ||
+                    fread(corrs + k * nn, 1, nn, stdin) != (size_t)nn) {
+                    free(syns); free(corrs); free(new_syn); free(out);
+                    fprintf(stderr, "short read at entry %d\n", k); return 1;
+                }
+            }
+            if (fread(new_syn, 1, nn, stdin) != (size_t)nn) {
+                free(syns); free(corrs); free(new_syn); free(out);
+                fprintf(stderr, "short read of new_syn\n"); return 1;
+            }
+            int ok = decode_linear_basis(r, s, n, syns, corrs, new_syn, out);
+            fwrite(out, 1, nn, stdout);
+            fflush(stdout);
+            free(syns); free(corrs); free(new_syn); free(out);
+            return ok ? 0 : 1;
         }
         else if(argv[i][0]!='-'){r=atoi(argv[i]);if(i+1<argc&&argv[i+1][0]!='-')s=atoi(argv[++i]);}
     }
