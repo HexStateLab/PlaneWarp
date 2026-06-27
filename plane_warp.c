@@ -1768,8 +1768,9 @@ int main(int argc, char **argv) {
         }
         else if(!strcmp(argv[i],"--decode-tesseract")) {
             // AND-vote decoder: AND across all rounds to filter measurement noise,
-            // then one-shot 5D decode. Suitable for measurement-noise-dominated
-            // hardware (PM >> PG).  AND false-positive rate ~ (PM)^rounds ≈ 0.
+            // then one-shot 5D decode.  If the AND syndrome fails the parity
+            // check (measurement noise corrupted it), fall back to the last
+            // raw round which the 5D solver handles robustly.
             int n=r*s, rounds;
             if(fread(&rounds,4,1,stdin)!=1||rounds<2||rounds>4096){fprintf(stderr,"bad rounds\n");return 1;}
             uint8_t *per_round=malloc((size_t)rounds*n);
@@ -1784,6 +1785,24 @@ int main(int argc, char **argv) {
                 for(int c=0;c<rounds;c++) v &= per_round[c*n+q];
                 syn[q]=v;
             }
+            // Viability: every row and column of each parity sub-lattice must
+            // have even parity (syndrome must be in image of H).
+            int viable=1;
+            for(int px=0;px<2&&viable;px++) for(int py=0;py<2&&viable;py++) {
+                int hr=r/2, hs=s/2;
+                for(int si=0;si<hr;si++){
+                    int rp=0;
+                    for(int sj=0;sj<hs;sj++) rp ^= syn[(px+2*si)*s+(py+2*sj)];
+                    if(rp){viable=0;break;}
+                }
+                if(!viable) break;
+                for(int sj=0;sj<hs;sj++){
+                    int cp=0;
+                    for(int si=0;si<hr;si++) cp ^= syn[(px+2*si)*s+(py+2*sj)];
+                    if(cp){viable=0;break;}
+                }
+            }
+            if(!viable) memcpy(syn,per_round+(rounds-1)*n,n);
             free(per_round);
             uint8_t *out=calloc(n,1);
             if(!out){free(syn);return 1;}
