@@ -1,5 +1,15 @@
 # `deploy_heron.py` — Fault-Tolerant Logical Qubits on IBM Heron r2
 
+# Note
+
+For this to be 'whole' you MUST have a basis file with all vectors!!
+
+The previous release was a version that INCORRECTLY populated basis, I'm sorry!
+
+I will upload my basis file at some point.
+
+----
+
 Submit a (1+x²)(1+y²) surface code experiment to IBM Heron r2 (156 qubit heavy-hex QPU), decode with a triple-decoder ensemble, and post-select shots with zero logical errors. Achieves **>99% post-selected yield** at 8 rounds with the linear basis decoder.
 
 ## Theory
