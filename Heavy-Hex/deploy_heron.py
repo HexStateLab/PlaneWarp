@@ -364,6 +364,49 @@ def select_backend(service, opts, min_qubits=156):
         print("  Invalid selection — enter a row number or press Enter for the default.")
 
 
+def basis_try_add(pw, S, basis_syn, basis_corr):
+    """Add (S, decode(S)) to the basis iff it is a *verified, independent* pair.
+
+    A pair qualifies only when S is nonzero, S is linearly independent of the
+    current basis, and some decoder returns a correction C with is_stabilizer(C)
+    (trivial logical action) and syndrome_of(C) == S. Returns True if added.
+
+    Note on why synthetic seeding does NOT work for this code: the minimum-weight
+    correction for a single-error syndrome is the single error itself, which has
+    nontrivial logical parity, so is_stabilizer(C) is False and it is rejected.
+    Verified pairs can therefore only come from genuinely correctable syndromes
+    that appear in the data — which is what this helper checks.
+    """
+    if int(np.asarray(S).sum()) == 0:
+        return False
+    S = np.asarray(S, dtype=np.uint8).reshape(S.shape if S.ndim == 2 else (S.shape[-2], S.shape[-1]))
+    if basis_syn:
+        _, in_span = pw.decode_linear_basis(basis_syn, basis_corr, S)
+        if in_span:
+            return False
+    candidates = []
+    try:
+        candidates.append(pw.decode_tesseract(S[np.newaxis]))
+    except Exception:
+        pass
+    for name in ("decode_layered", "decode", "decode_fast"):
+        fn = getattr(pw, name, None)
+        if fn is None:
+            continue
+        try:
+            c, _ = fn(S)
+            candidates.append(c)
+        except Exception:
+            pass
+    for C in candidates:
+        C = np.asarray(C, dtype=np.uint8).reshape(S.shape)
+        if pw.is_stabilizer(C) and np.array_equal(pw.syndrome_of(C).ravel(), S.ravel()):
+            basis_syn.append(S.copy())
+            basis_corr.append(C)
+            return True
+    return False
+
+
 def main():
     import argparse
     ap = argparse.ArgumentParser(description="Deploy (1+x²)(1+y²) flag-qubit QEC on Heron r2")
@@ -384,6 +427,8 @@ def main():
                     help='measure each weight-2 vertical pair once and reassemble '
                          'plaquettes classically: CZ/round 4*r*s->2*r*s (direct) or '
                          '8*r*s->2*r*s (vs buffer), half the ancillas, identical syndrome')
+    ap.add_argument('--readout', action='store_true',
+                    help='measure all data qubits in final round for ground-truth logical error detection')
     ap.add_argument('--backend', '-b', type=str, default=None, metavar='NAME',
                     help='submit to this backend by name (skips the interactive chooser)')
     ap.add_argument('--list-backends', action='store_true',
@@ -432,7 +477,7 @@ def main():
     #   Even parity-based recovery fails at Heron's ~1% readout noise
     #   (expected ~1 false sub-lattice parity flip per shot).
     # Single-observable LER (~2% at Heron noise) is already characterized.
-    final_readout = False
+    final_readout = opts.readout
     if share_pairs:
         cx_per_round = 2 * r * s   # 2 CZ/pair direct CX, r*s pairs, all local
     elif use_buffer:
@@ -627,10 +672,13 @@ def main():
     # correction — no decoder search needed.
     basis_syn = []    # list of (r,s) arrays (linearly independent syndrome vectors)
     basis_corr = []   # list of (r,s) arrays (corresponding verified corrections)
-    basis_used = 0   # shots decoded from basis
+    basis_used = 0   # shots decoded from 16-dim verifiable basis (post-selectable)
+    basis24_used = 0 # shots decoded from 24-dim synthetic basis (C=E exact, not post-selectable)
     basis_violations = 0  # is_stabilizer failures on basis-decoded shots (should be 0)
 
     # Pre-load basis from file if requested
+    basis_syn_24 = []
+    basis_corr_24 = []
     if load_basis:
         bp = Path(load_basis)
         if not bp.exists():
@@ -638,9 +686,17 @@ def main():
             sys.exit(1)
         bd = np.load(bp)
         for i in range(len(bd['syn'])):
-            basis_syn.append(np.asarray(bd['syn'][i], dtype=np.uint8))
-            basis_corr.append(np.asarray(bd['corr'][i], dtype=np.uint8))
+            basis_syn.append(np.asarray(bd['syn'][i], dtype=np.uint8).reshape(r, s))
+            basis_corr.append(np.asarray(bd['corr'][i], dtype=np.uint8).reshape(r, s))
         print(f"  Pre-loaded basis: {len(basis_syn)} / {r * s} syndrome-space dims")
+        # Also auto-load 24-dim synthetic basis for full column-space fallback
+        bp24 = CLEAN_DIR / 'basis_24.npz'
+        if bp24.exists():
+            bd24 = np.load(bp24)
+            for i in range(len(bd24['syn'])):
+                basis_syn_24.append(np.asarray(bd24['syn'][i], dtype=np.uint8).reshape(r, s))
+                basis_corr_24.append(np.asarray(bd24['corr'][i], dtype=np.uint8).reshape(r, s))
+            print(f"  24-dim column-space basis loaded: {len(basis_syn_24)} dims (full rank)")
 
     for idx in range(n_shots):
         # Method 1: raw tesseract
@@ -666,13 +722,21 @@ def main():
             if sample_error_idx is None:
                 sample_error_idx = idx
             # Try linear basis decoder before falling back to ensemble
+            resolved = False
             if len(basis_syn) > 0:
                 ens_corr, in_span = pw.decode_linear_basis(basis_syn, basis_corr, and_all[idx])
                 if in_span and corr_matches(and_all[idx], ens_corr):
                     correction = ens_corr
                     and_ok = True
                     basis_used += 1
-            if not and_ok:
+                    resolved = True
+            if not resolved and len(basis_syn_24) > 0:
+                ens_corr, in_span = pw.decode_linear_basis(basis_syn_24, basis_corr_24, and_all[idx])
+                if in_span:
+                    correction = ens_corr
+                    basis24_used += 1
+                    resolved = True
+            if not resolved:
                 # Method 3: exhaustive — try per-round, AND, OR, majority + flips
                 ens_corr, ens_ok = decode_exhaustive(all_syn[idx], pw, r, s, max_flips=12)
                 if ens_ok and corr_matches(and_all[idx], ens_corr):
@@ -681,18 +745,21 @@ def main():
                     ens_gain += 1
                 else:
                     ens_errors += 1
-        # Accumulate into basis if this correction is verified
+        # Accumulate into basis if this correction is verified.
+        # Only top up with genuinely new dimensions: the zero syndrome is in
+        # every span (never a basis vector). The accumulator only ever stores
+        # genuinely verified, linearly-independent pairs (see basis_try_add).
         if and_ok:
+            # Primary pair: the AND-syndrome and the correction actually used.
             s_flat = and_all[idx]
-            c_flat = correction
-            # Check linear independence via the C binary
-            if len(basis_syn) == 0:
-                in_span = False
-            else:
-                _, in_span = pw.decode_linear_basis(basis_syn, basis_corr, s_flat)
-            if not in_span:
-                basis_syn.append(s_flat)
-                basis_corr.append(c_flat)
+            if int(s_flat.sum()) > 0:
+                if len(basis_syn) == 0:
+                    in_span = False
+                else:
+                    _, in_span = pw.decode_linear_basis(basis_syn, basis_corr, s_flat)
+                if not in_span:
+                    basis_syn.append(s_flat.copy())
+                    basis_corr.append(correction)
             post_clean += 1
             if postselect:
                 clean_corrections.append(correction)
@@ -702,6 +769,16 @@ def main():
                     strict_corrections.append(correction)
             else:
                 strict_rejected += 1
+
+        # Harvest extra verified pairs from the individual rounds. AND-vote
+        # collapses any correctable single-round syndrome to zero, so without
+        # this the only nonzero pairs the basis can ever see are gone. Each round
+        # syndrome is decoded and added only if it verifies (logical-trivial,
+        # exact syndrome match) and is independent. Above the code threshold
+        # every round is uncorrectable, so this correctly adds nothing; below
+        # threshold it is what actually fills the basis.
+        for c in range(all_syn.shape[1]):
+            basis_try_add(pw, all_syn[idx, c], basis_syn, basis_corr)
 
         # Single-observable LER (logical Z on alternating row-0 qubits)
         if data_raw is not None:
@@ -752,8 +829,9 @@ def main():
     ens_ler = ens_errors / n_shots
     print(f"  Final LER:      {ens_ler:.4f}   (AND + basis + exhaustive)")
     print(f"  Basis size:     {len(basis_syn)} / {r * s} syndrome-space dims")
-    print(f"  Basis decodes:  {basis_used} / {n_shots} shots decoded via linear basis"
+    print(f"  Basis decodes:  {basis_used} / {n_shots} shots decoded via verifiable basis (16-dim)"
           + (f"  ({basis_violations} is_stabilizer violations — should be 0)" if basis_violations else ""))
+    print(f"  24-dim basis:   {basis24_used} / {n_shots} shots decoded via column-space basis (C=E)")
     print(f"  Exhaustive gain: {ens_gain} / {n_shots} shots rescued by exhaustive fallback")
     if single_ler is not None:
         print(f"  Single-obs LER: {single_ler:.4f}   (logical Z on row-0 cols {','.join(map(str,LOGICAL_OBS))})")
