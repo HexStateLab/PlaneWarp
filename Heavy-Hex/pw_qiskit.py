@@ -178,12 +178,44 @@ class PlaneWarp:
         n = len(syns)
         buf = struct.pack('<I', n)
         for k in range(n):
-            buf += syns[k].tobytes()
-            buf += corrs[k].tobytes()
-        buf += new_syn.tobytes()
+            buf += np.ascontiguousarray(syns[k], dtype=np.uint8).tobytes()
+            buf += np.ascontiguousarray(corrs[k], dtype=np.uint8).tobytes()
+        buf += np.ascontiguousarray(new_syn, dtype=np.uint8).tobytes()
         import subprocess
         exe = os.path.join(_lib_dir, "plane_warp")
         p = subprocess.run([exe, str(r), str(s), "--decode-basis"],
+                           input=buf, capture_output=True)
+        if len(p.stdout) != nn:
+            return np.zeros((r, s), dtype=np.uint8), False
+        corr = np.frombuffer(p.stdout, dtype=np.uint8).reshape(r, s)
+        return corr, p.returncode == 0
+
+    def project_decode(self, syns, corrs, rounds):
+        """Consistency projection + linear basis decoder, all in C.
+
+        Takes 4 rounds of raw syndrome measurements (each (r,s) uint8),
+        projects onto Col(H) via consistent-bit Gaussian elimination,
+        then decodes with the linear basis decoder.
+
+        syns, corrs — lists of (r,s) numpy uint8 arrays (basis pairs).
+        rounds      — (4, r, s) numpy uint8 array, one round per axis-0 entry.
+
+        Returns (correction, ok) where ok=True if projection+decode succeeded.
+        """
+        if not syns or len(rounds) != 4:
+            return np.zeros(rounds[0].shape, dtype=np.uint8), False
+        r, s = syns[0].shape
+        nn = r * s
+        n = len(syns)
+        buf = struct.pack('<I', n)
+        for k in range(n):
+            buf += np.ascontiguousarray(syns[k], dtype=np.uint8).tobytes()
+            buf += np.ascontiguousarray(corrs[k], dtype=np.uint8).tobytes()
+        for rd in range(4):
+            buf += np.ascontiguousarray(rounds[rd], dtype=np.uint8).tobytes()
+        import subprocess
+        exe = os.path.join(_lib_dir, "plane_warp")
+        p = subprocess.run([exe, str(r), str(s), "--project-decode"],
                            input=buf, capture_output=True)
         if len(p.stdout) != nn:
             return np.zeros((r, s), dtype=np.uint8), False
