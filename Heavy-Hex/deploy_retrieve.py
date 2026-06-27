@@ -36,16 +36,16 @@ def all_syndromes(pub_result, rounds, r, s):
     first = getattr(pub_result.data, "syn_0")
     shots = first.num_shots
     syn = np.zeros((shots, rounds, r, s), dtype=np.uint8)
-    bits0 = getattr(pub_result.data, "syn_0").to_bool_array()
+    bits0 = getattr(pub_result.data, "syn_0").to_bool_array(order='little')
     shared = (bits0.shape[1] == n_stab)
     for c in range(rounds):
-        bits = getattr(pub_result.data, f"syn_{c}").to_bool_array()
-        for q in range(n_stab):
-            i, j = q // s, q % s
-            if shared:
-                syn[:, c, i, j] = bits[:, q].astype(np.uint8)
-            else:
-                syn[:, c, i, j] = bits[:, 2 * q] ^ bits[:, 2 * q + 1]
+        bits = getattr(pub_result.data, f"syn_{c}").to_bool_array(order='little')
+        if shared:
+            m = bits[:, :n_stab].reshape(shots, r, s)
+            syn[:, c] = m ^ np.roll(m, shift=-2, axis=2)
+        else:
+            pair = bits[:, :2 * n_stab].reshape(shots, n_stab, 2)
+            syn[:, c] = (pair[:, :, 0] ^ pair[:, :, 1]).reshape(shots, r, s)
     return syn
 
 
