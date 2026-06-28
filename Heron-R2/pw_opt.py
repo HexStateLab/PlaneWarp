@@ -11,7 +11,7 @@ import numpy as np
 from qiskit import QuantumCircuit, QuantumRegister, ClassicalRegister
 
 
-def build_circuit(r, s, rounds, logical_state="00", bell=False, measure_x=False):
+def build_circuit(r, s, rounds, logical_state="00", bell=False, bell_measure=False, measure_x=False):
     """Build optimized share-pair QEC circuit.
 
     Measures V(i,j) = data[i][j] ⊕ data[(i+2)%r][j] for i=0..r-3 (NOT r-2, r-1).
@@ -42,25 +42,46 @@ def build_circuit(r, s, rounds, logical_state="00", bell=False, measure_x=False)
                     anc_indices.append((px, py, p, q))
                     n_anc += 1
 
-    n_bell = 1 if bell else 0
-    total = n_data + n_anc + n_bell
+    n_bell_prep = 1 if bell else 0
+    n_bell_meas = 1 if bell_measure else 0
+    total = n_data + n_anc + n_bell_prep + n_bell_meas
+    b_prep_idx = n_data + n_anc
+    b_meas_idx = n_data + n_anc + n_bell_prep
+
     qr = QuantumRegister(total, "q")
     cr_syn = [ClassicalRegister(n_anc, f"syn_{c}") for c in range(rounds)]
     cr_data = ClassicalRegister(n_data, "data")
 
-    if bell:
-        cr_bell = ClassicalRegister(1, "bell")
-        qc = QuantumCircuit(qr, *cr_syn, cr_data, cr_bell)
-        b_idx = n_data + n_anc
-        qc.h(b_idx)
-        for i in range(r):
-            qc.cx(b_idx, data_map[i][0])
-        for j in range(1, s):
-            qc.cx(b_idx, data_map[0][j])
-        qc.h(b_idx)
-        qc.measure(b_idx, cr_bell[0])
+    if bell or bell_measure:
+        cregs = [*cr_syn, cr_data]
+        if bell:
+            cr_bell = ClassicalRegister(1, "bell")
+            cregs.append(cr_bell)
+        if bell_measure:
+            cr_bell_m = ClassicalRegister(1, "bell_m")
+            cregs.append(cr_bell_m)
+        qc = QuantumCircuit(qr, *cregs)
     else:
         qc = QuantumCircuit(qr, *cr_syn, cr_data)
+
+    if bell:
+        qc.h(b_prep_idx)
+        for i in range(r):
+            qc.cx(b_prep_idx, data_map[i][0])
+        for j in range(1, s):
+            qc.cx(b_prep_idx, data_map[0][j])
+        qc.h(b_prep_idx)
+        qc.measure(b_prep_idx, cr_bell[0])
+    elif bell_measure:
+        # Without prep measurement: just prepare the Bell state without measuring
+        qc.h(b_prep_idx)
+        for i in range(r):
+            qc.cx(b_prep_idx, data_map[i][0])
+        for j in range(1, s):
+            qc.cx(b_prep_idx, data_map[0][j])
+        qc.h(b_prep_idx)
+        # Don't measure — the Bell prep ancilla stays entangled with the data
+    else:
         if "1" in logical_state:
             if logical_state[1] == "1":
                 for jj in range(s):
@@ -88,6 +109,16 @@ def build_circuit(r, s, rounds, logical_state="00", bell=False, measure_x=False)
                         syn_idx = a_idx - n_data
                         qc.measure(a_idx, cr_syn[rnd][syn_idx])
         qc.barrier()
+
+    # Bell measurement after QEC: measures X_L1 X_L₂ of the (possibly corrupted) state
+    if bell_measure:
+        qc.h(b_meas_idx)
+        for i in range(r):
+            qc.cx(b_meas_idx, data_map[i][0])
+        for j in range(1, s):
+            qc.cx(b_meas_idx, data_map[0][j])
+        qc.h(b_meas_idx)
+        qc.measure(b_meas_idx, cr_bell_m[0])
 
     # X-basis rotation
     if measure_x:
@@ -173,10 +204,10 @@ def verify_optimized():
     assert ops_t.get('swap', 0) == 0, "SWAPs found in |00⟩!"
     print("  ✓ 0 SWAPs verified")
 
-    # Test Bell circuit
-    qc_b, dm_b, _, _, _ = build_circuit(r, s, rounds, bell=True)
+    # Test Bell circuit (prep + measure)
+    qc_b, dm_b, _, _, _ = build_circuit(r, s, rounds, bell=True, bell_measure=True)
     ops_b = qc_b.count_ops()
-    print(f"\nOptimized Bell circuit: {qc_b.num_qubits} qubits, "
+    print(f"\nOptimized Bell circuit (prep+measure): {qc_b.num_qubits} qubits, "
           f"CX={ops_b.get('cx',0)}")
     pm_b = generate_preset_pass_manager(backend=backend, optimization_level=3,
                                         seed_transpiler=42)
