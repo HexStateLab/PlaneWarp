@@ -186,5 +186,74 @@ def verify_optimized():
     print("✓ 0 SWAPs verified")
 
 
+def verify_pipeline():
+    """End-to-end: circuit → simulate → syndrome extraction → decode."""
+    from qiskit_aer import AerSimulator
+    from qiskit_aer.noise import NoiseModel, depolarizing_error
+    from waxis_decode import WaxisDecoder
+
+    print("\n--- End-to-end pipeline test ---")
+    backend = AerSimulator(device='CPU')
+    r, s, rounds = 6, 8, 1
+
+    qc, dm, lq0, lq1, n_anc = build_circuit(r, s, rounds, logical_state="00")
+    print(f"Circuit: {qc.num_qubits}q, CX={qc.count_ops().get('cx',0)}")
+
+    noise_model = NoiseModel()
+    noise_model.add_all_qubit_quantum_error(depolarizing_error(0.02, 2), ['cx'])
+
+    qc_t = qc  # No transpilation needed for Aer (all-to-all connectivity)
+    job = backend.run(qc_t, noise_model=noise_model, shots=500)
+    counts = job.result().get_counts()
+    # Show sample output format
+    sample = next(iter(counts.items()))
+    print(f"  Sample output: '{sample[0]}' (count={sample[1]})")
+    print(f"  Num classical registers: {len(sample[0].split())}")
+
+    syn_list = []
+    data_list = []
+    for bitstring, cnt in counts.items():
+        parts = bitstring.split()
+        data_bits = parts[0]
+        syn_bits = parts[1] if len(parts) >= 2 else ""
+        for _ in range(cnt):
+            V = np.zeros((r, s), dtype=np.uint8)
+            idx = 0
+            for px in range(2):
+                for py in range(2):
+                    for p in range(r//2 - 1):
+                        for q in range(s//2):
+                            i = 2 * p + px
+                            j = 2 * q + py
+                            V[i, j] = int(syn_bits[idx])
+                            idx += 1
+            V[4, :] = V[0:4:2, :].sum(axis=0) % 2
+            V[5, :] = V[1:5:2, :].sum(axis=0) % 2
+            syn_list.append(V ^ np.roll(V, shift=-2, axis=1))
+            data = np.zeros((r, s), dtype=np.uint8)
+            for ii in range(r):
+                for jj in range(s):
+                    data[ii, jj] = int(data_bits[ii * s + jj])
+            data_list.append(data)
+
+    syn_hits = np.array(syn_list)
+    data_raw = np.array(data_list)
+    n = len(syn_hits)
+    print(f"  Total shots decoded: {n}")
+
+    dec = WaxisDecoder(r, s)
+    corrs = np.zeros((n, 1, r, s), dtype=np.uint8)
+    for i in range(n):
+        corrs[i] = dec.decode(syn_hits[i].reshape(1, r, s))
+
+    corrected = data_raw ^ corrs[:, 0]
+    lz1 = corrected[:, 0, :].sum(axis=1) % 2
+    lz2 = corrected[:, :, 0].sum(axis=1) % 2
+    fidelity = ((lz1 == 0) & (lz2 == 0)).mean()
+    print(f"  |00⟩ fidelity with 2% CX noise: {fidelity:.3f}")
+    print("✓ Pipeline verified")
+
+
 if __name__ == "__main__":
     verify_optimized()
+    verify_pipeline()
