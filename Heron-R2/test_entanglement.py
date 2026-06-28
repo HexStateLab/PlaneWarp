@@ -45,7 +45,8 @@ def get_token():
     sys.exit(1)
 
 
-def build_circuit(r, s, rounds, logical_state="00", share_pairs=False, bell=False, measure_x=False):
+def build_circuit(r, s, rounds, logical_state="00", share_pairs=False,
+                  bell=False, measure_x=False, opt=False):
     """Build QEC circuit for a given logical state.
 
     Logical operators:
@@ -59,88 +60,127 @@ def build_circuit(r, s, rounds, logical_state="00", share_pairs=False, bell=Fals
       H → controlled-X_L1 (CX to column 0) → controlled-X_L2 (CX to row 0)
         → H → measure ancilla.
       |0⟩ outcome → |Φ⁺⟩_L, |1⟩ outcome → |Φ⁻⟩_L.
-      (Qubit (0,0) gets CX twice → X·X = I, no net flip.)
 
-    When measure_x=True, applies H⊗n to all data qubits before final Z readout,
-    converting measurement to X-basis for ⟨X₁X₂⟩ witness.
+    When opt=True: uses optimized share-pair with software-reconstructed V(2).
+    32 ancillas instead of 48, 64 CX, 0 SWAPs on heavy-hex.
+
+    When share_pairs=True: 48 ancillas, V(i,j+2) reconstructed in software.
+
+    When both False: standard flag circuit, 2 ancillas per stabilizer, 192 CX.
     """
     from qiskit import QuantumCircuit, QuantumRegister, ClassicalRegister
     from pw_qiskit import heavy_hex_flag_layout
 
     data_map, anc_maps, _, _ = heavy_hex_flag_layout(r, s)
     n_data = r * s
-    n_anc_phys = 2 * r * s
     n_bell = 1 if bell else 0
-    n_meas = r * s if share_pairs else 2 * r * s
-    total = n_data + n_anc_phys + n_bell
 
-    qr = QuantumRegister(total, "q")
-    cr_syn = [ClassicalRegister(n_meas, f"syn_{c}") for c in range(rounds)]
-    cr_data = ClassicalRegister(n_data, "data")
+    if opt:
+        hr = r // 2
+        hs = s // 2
+        n_anc = (hr - 1) * hs * 4  # (r//2 - 1) × (s//2) × 4 sectors
+        total = n_data + n_anc + n_bell
+        qr = QuantumRegister(total, "q")
+        cr_syn = [ClassicalRegister(n_anc, f"syn_{c}") for c in range(rounds)]
+        cr_data = ClassicalRegister(n_data, "data")
+        cr_bell = ClassicalRegister(1, "bell") if bell else None
+        qc = QuantumCircuit(qr, *cr_syn, cr_data, *(cr_bell,) if bell else ())
 
-    if bell:
-        cr_bell = ClassicalRegister(1, "bell")
-        qc = QuantumCircuit(qr, *cr_syn, cr_data, cr_bell)
-        b_idx = n_data + n_anc_phys  # bell ancilla = last qubit
-        qc.h(b_idx)
-        for i in range(r):
-            qc.cx(b_idx, data_map[i][0])        # controlled-X_L1: column 0
-        for j in range(s):
-            qc.cx(b_idx, data_map[0][j])        # controlled-X_L2: row 0
-        qc.h(b_idx)
-        qc.measure(b_idx, cr_bell[0])
+        if bell:
+            b_idx = n_data + n_anc
+            qc.h(b_idx)
+            for i in range(r):
+                qc.cx(b_idx, data_map[i][0])
+            for j in range(s):
+                qc.cx(b_idx, data_map[0][j])
+            qc.h(b_idx)
+            qc.measure(b_idx, cr_bell[0])
+        else:
+            if "1" in logical_state:
+                if logical_state[1] == "1":
+                    for jj in range(s):
+                        qc.x(data_map[0][jj])
+                if logical_state[0] == "1":
+                    for ii in range(r):
+                        qc.x(data_map[ii][0])
+
+        for rnd in range(rounds):
+            anc_idx = n_data
+            for px in range(2):
+                for py in range(2):
+                    for p in range(hr - 1):
+                        for q in range(hs):
+                            i = 2 * p + px
+                            j = 2 * q + py
+                            qc.reset(anc_idx)
+                            qc.cx(data_map[i][j], anc_idx)
+                            qc.cx(data_map[(i + 2) % r][j], anc_idx)
+                            qc.measure(anc_idx, cr_syn[rnd][anc_idx - n_data])
+                            anc_idx += 1
+            qc.barrier()
     else:
-        qc = QuantumCircuit(qr, *cr_syn, cr_data)
-        # Prepare |1⟩_L states by X_L1 and/or X_L2
-        if "1" in logical_state:
-            if logical_state[1] == "1":  # X_L2 = X on row 0
+        n_anc_phys = 2 * r * s
+        n_meas = r * s if share_pairs else 2 * r * s
+        total = n_data + n_anc_phys + n_bell
+        qr = QuantumRegister(total, "q")
+        cr_syn = [ClassicalRegister(n_meas, f"syn_{c}") for c in range(rounds)]
+        cr_data = ClassicalRegister(n_data, "data")
+
+        if bell:
+            cr_bell = ClassicalRegister(1, "bell")
+            qc = QuantumCircuit(qr, *cr_syn, cr_data, cr_bell)
+            b_idx = n_data + n_anc_phys
+            qc.h(b_idx)
+            for i in range(r):
+                qc.cx(b_idx, data_map[i][0])
+            for j in range(s):
+                qc.cx(b_idx, data_map[0][j])
+            qc.h(b_idx)
+            qc.measure(b_idx, cr_bell[0])
+        else:
+            qc = QuantumCircuit(qr, *cr_syn, cr_data)
+            if "1" in logical_state:
+                if logical_state[1] == "1":
+                    for jj in range(s):
+                        qc.x(data_map[0][jj])
+                if logical_state[0] == "1":
+                    for ii in range(r):
+                        qc.x(data_map[ii][0])
+
+        for rnd in range(rounds):
+            for ii in range(r):
                 for jj in range(s):
-                    qc.x(data_map[0][jj])
-            if logical_state[0] == "1":  # X_L1 = X on column 0
-                for ii in range(r):
-                    qc.x(data_map[ii][0])
+                    if share_pairs:
+                        a = anc_maps[(ii, jj, 0)]
+                        qc.reset(a)
+                        qc.cx(data_map[ii][jj], a)
+                        qc.cx(data_map[(ii + 2) % r][jj], a)
+                        qc.measure(a, cr_syn[rnd][ii * s + jj])
+                        continue
+                    a0 = anc_maps[(ii, jj, 0)]
+                    a1 = anc_maps[(ii, jj, 1)]
+                    qc.reset(a0)
+                    qc.cx(data_map[ii][jj], a0)
+                    qc.cx(data_map[(ii + 2) % r][jj], a0)
+                    qc.reset(a1)
+                    qc.cx(data_map[ii][(jj + 2) % s], a1)
+                    qc.cx(data_map[(ii + 2) % r][(jj + 2) % s], a1)
+                    qc.measure(a0, cr_syn[rnd][ii * s * 2 + jj * 2])
+                    qc.measure(a1, cr_syn[rnd][ii * s * 2 + jj * 2 + 1])
+            qc.barrier()
 
-    # QEC rounds
-    for rnd in range(rounds):
-        for ii in range(r):
-            for jj in range(s):
-                if share_pairs:
-                    a = anc_maps[(ii, jj, 0)]
-                    qc.reset(a)
-                    qc.cx(data_map[ii][jj], a)
-                    qc.cx(data_map[(ii + 2) % r][jj], a)
-                    qc.measure(a, cr_syn[rnd][ii * s + jj])
-                    continue
-
-                a0 = anc_maps[(ii, jj, 0)]
-                a1 = anc_maps[(ii, jj, 1)]
-
-                qc.reset(a0)
-                qc.cx(data_map[ii][jj], a0)
-                qc.cx(data_map[(ii + 2) % r][jj], a0)
-
-                qc.reset(a1)
-                qc.cx(data_map[ii][(jj + 2) % s], a1)
-                qc.cx(data_map[(ii + 2) % r][(jj + 2) % s], a1)
-
-                qc.measure(a0, cr_syn[rnd][ii * s * 2 + jj * 2])
-                qc.measure(a1, cr_syn[rnd][ii * s * 2 + jj * 2 + 1])
-        qc.barrier()
-
-    # X-basis rotation: H on all data qubits before readout
     if measure_x:
         for ii in range(r):
             for jj in range(s):
                 qc.h(data_map[ii][jj])
         qc.barrier()
 
-    # Final data readout
     for ii in range(r):
         for jj in range(s):
             qc.measure(data_map[ii][jj], cr_data[ii * s + jj])
 
-    lq0_qubits = [data_map[0][jj] for jj in range(s)]       # row 0
-    lq1_qubits = [data_map[ii][0] for ii in range(r)]       # column 0
+    lq0_qubits = [data_map[0][jj] for jj in range(s)]
+    lq1_qubits = [data_map[ii][0] for ii in range(r)]
 
     return qc, data_map, lq0_qubits, lq1_qubits
 
@@ -168,6 +208,42 @@ def all_syndromes_shared(pub_result, rounds, r, s):
         bits = getattr(pub_result.data, f"syn_{c}").to_bool_array(order='little')
         m = bits[:, :n_stab].reshape(shots, r, s)
         syn[:, c] = m ^ np.roll(m, shift=-2, axis=2)
+    return syn
+
+
+def all_syndromes_opt(pub_result, rounds, r, s):
+    """Extract (shots, rounds, r, s) from optimized share-pair circuit.
+
+    Measurements come in sector-major order (px, py, p, q).
+    V(i,j) measured for i=0..r-3, all j (32 of 48 for 6×8).
+    V(r-2,:) = Σ V(0:r-2:2,:) and V(r-1,:) = Σ V(1:r-1:2,:) mod 2.
+    S(i,j) = V(i,j) ⊕ V(i,j+2 mod s).
+    """
+    hr, hs = r // 2, s // 2
+    n_anc = (hr - 1) * hs * 4  # (r//2 - 1) × (s//2) × 4 sectors
+    first = getattr(pub_result.data, "syn_0")
+    shots = first.num_shots
+
+    syn = np.zeros((shots, rounds, r, s), dtype=np.uint8)
+    for c in range(rounds):
+        bits = getattr(pub_result.data, f"syn_{c}").to_bool_array(order='little')
+        m = bits[:, :n_anc].astype(np.uint8)
+
+        V = np.zeros((shots, r, s), dtype=np.uint8)
+        idx = 0
+        for px in range(2):
+            for py in range(2):
+                for p in range(hr - 1):
+                    for q in range(hs):
+                        i = 2 * p + px
+                        j = 2 * q + py
+                        V[:, i, j] = m[:, idx]
+                        idx += 1
+
+        V[:, r-2, :] = V[:, 0:r-2:2, :].sum(axis=1) % 2
+        V[:, r-1, :] = V[:, 1:r-1:2, :].sum(axis=1) % 2
+
+        syn[:, c] = V ^ np.roll(V, shift=-2, axis=2)
     return syn
 
 
@@ -220,25 +296,30 @@ def run_test(token, opts):
     shots = opts.shots
     share_pairs = opts.share_pairs
     logical_state = opts.state
+    opt = opts.opt
 
     # Pick backend
     service = QiskitRuntimeService(channel="ibm_quantum_platform", token=token)
     if opts.backend:
         backend = service.backend(opts.backend)
     else:
-        backend = service.backend("ibm_fez")
+        backend = service.backend("ibm_kingston")
     print(f"Backend: {backend.name} ({backend.num_qubits} qubits)")
 
     bell = (logical_state == "bell")
     # Build circuit
     qc, data_map, lq0_qubits, lq1_qubits = build_circuit(
         r, s, rounds, logical_state=logical_state, share_pairs=share_pairs, bell=bell,
-        measure_x=opts.measure_x,
+        measure_x=opts.measure_x, opt=opt,
     )
     basis = "X" if opts.measure_x else "Z"
     label = f"Bell-{basis}" if bell else f"|{logical_state}⟩"
+    hr, hs = r // 2, s // 2
+    n_anc = 4 * (hr - 1) * hs if opt else (r * s if share_pairs else 2 * r * s)
     print(f"Circuit: {r}×{s} grid, {rounds} rounds, {label}, {shots} shots")
-    print(f"  Data qubits: {r * s}, Ancillas: {2 * r * s}{', +1 Bell ancilla' if bell else ''}")
+    print(f"  Data qubits: {r * s}, Ancillas: {n_anc}{', +1 Bell ancilla' if bell else ''}")
+    if opt:
+        print(f"  Optimized: V(2) software-reconstructed, {n_anc} ancillas, 64 CX")
     if opts.measure_x:
         print(f"  Readout: H⊗n applied before measurement (X-basis)")
 
@@ -279,7 +360,7 @@ def run_test(token, opts):
     jobs[job_id] = {
         "r": r, "s": s, "rounds": rounds, "shots": shots,
         "backend": backend.name, "logical_state": logical_state,
-        "share_pairs": share_pairs,
+        "share_pairs": share_pairs, "opt": opt,
         "submitted": time.time(),
     }
     SAVE_FILE.write_text(json.dumps(jobs, indent=2, default=str))
@@ -297,6 +378,8 @@ def run_test(token, opts):
     if rounds == 0:
         n_shots = getattr(pub_result.data, "data").num_shots
         all_syn = np.zeros((n_shots, 0, r, s), dtype=np.uint8)
+    elif opt:
+        all_syn = all_syndromes_opt(pub_result, rounds, r, s)
     elif share_pairs:
         all_syn = all_syndromes_shared(pub_result, rounds, r, s)
     else:
@@ -318,7 +401,8 @@ def run_test(token, opts):
     RAW_DIR.mkdir(parents=True, exist_ok=True)
     kwargs = dict(syndromes=all_syn, data_raw=data_raw,
                   r=r, s=s, rounds=rounds, share_pairs=share_pairs,
-                  logical_state=logical_state, measure_x=opts.measure_x)
+                  logical_state=logical_state, measure_x=opts.measure_x,
+                  opt=opt)
     if bell_out is not None:
         kwargs["bell_out"] = bell_out
     np.savez_compressed(RAW_DIR / f"{job_id}.npz", **kwargs)
@@ -408,6 +492,8 @@ def main():
     ap.add_argument('--rounds', type=int, default=4)
     ap.add_argument('--backend', '-b', type=str, default=None, metavar='NAME')
     ap.add_argument('--share-pairs', action='store_true')
+    ap.add_argument('--opt', action='store_true',
+                    help='Optimized share-pair: software-reconstructed V(2), 32 anc, 64 CX')
     ap.add_argument('--measure-x', action='store_true',
                     help='Apply H before readout for X-basis measurement')
     ap.add_argument('--state', type=str, default="00",
