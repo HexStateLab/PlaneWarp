@@ -28,7 +28,7 @@ def build_circuit(r, s, rounds, logical_state="00", bell=False, measure_x=False)
     For r=6, s=8: sector size 3×4, measure p=0,1; compute p=2.
     """
     from pw_qiskit import heavy_hex_flag_layout
-    data_map, _, _, _ = heavy_hex_flag_layout(r, s)
+    data_map, anc_maps, _, _ = heavy_hex_flag_layout(r, s)
 
     n_data = r * s
     hr, hs = r // 2, s // 2
@@ -41,6 +41,32 @@ def build_circuit(r, s, rounds, logical_state="00", bell=False, measure_x=False)
                 for q in range(hs):
                     anc_indices.append((px, py, p, q))
                     n_anc += 1
+
+    # Build initial_layout for heavy-hex: pin each abstract qubit to its physical flag qubit
+    initial_layout = {}
+    for ii in range(r):
+        for jj in range(s):
+            initial_layout[data_map[ii][jj]] = data_map[ii][jj]
+    anc_physical = []
+    anc_global = n_data
+    for px in range(2):
+        for py in range(2):
+            for p in range(hr - 1):
+                for q in range(hs):
+                    i = 2 * p + px
+                    j = 2 * q + py
+                    phys = anc_maps[(i, j, 0)]
+                    anc_physical.append(phys)
+                    initial_layout[anc_global] = phys
+                    anc_global += 1
+
+    if bell:
+        used = set(data_map[ii][jj] for ii in range(r) for jj in range(s))
+        used.update(anc_physical)
+        for p in range(156):  # heavy-hex has 156 physical qubits
+            if p not in used:
+                initial_layout[n_data + n_anc] = p
+                break
 
     n_bell = 1 if bell else 0
     total = n_data + n_anc + n_bell
@@ -55,7 +81,7 @@ def build_circuit(r, s, rounds, logical_state="00", bell=False, measure_x=False)
         qc.h(b_idx)
         for i in range(r):
             qc.cx(b_idx, data_map[i][0])
-        for j in range(s):
+        for j in range(1, s):
             qc.cx(b_idx, data_map[0][j])
         qc.h(b_idx)
         qc.measure(b_idx, cr_bell[0])
@@ -104,7 +130,7 @@ def build_circuit(r, s, rounds, logical_state="00", bell=False, measure_x=False)
     lq0_qubits = [data_map[0][jj] for jj in range(s)]
     lq1_qubits = [data_map[ii][0] for ii in range(r)]
 
-    return qc, data_map, lq0_qubits, lq1_qubits, n_anc
+    return qc, data_map, lq0_qubits, lq1_qubits, n_anc, initial_layout
 
 
 def all_syndromes_opt(pub_result, rounds, r, s, n_anc):
@@ -170,20 +196,37 @@ def verify_optimized():
             break
 
     backend = FakeFez()
-    r, s, rounds = 6, 8, 1
-    qc, dm, lq0, lq1, n_anc = build_circuit(r, s, rounds, logical_state="00")
-    ops = qc.count_ops()
-    print(f"Optimized circuit: {qc.num_qubits} qubits ({r*s} data + {n_anc} anc), "
-          f"CX={ops.get('cx',0)}")
 
+    # Test |00⟩ circuit (no Bell)
+    r, s, rounds = 6, 8, 1
+    qc, dm, lq0, lq1, n_anc, il = build_circuit(r, s, rounds, logical_state="00")
+    ops = qc.count_ops()
+    print(f"Optimized |00⟩ circuit: {qc.num_qubits} qubits ({r*s} data + {n_anc} anc), "
+          f"CX={ops.get('cx',0)}")
+    ilist = [il[i] for i in range(qc.num_qubits)]
     qc_t = transpile(qc, backend=backend, coupling_map=cm_full,
                      basis_gates=['cx', 'id', 'rz', 'sx', 'x'],
-                     optimization_level=3, seed_transpiler=42)
+                     initial_layout=ilist,
+                     optimization_level=3)
     ops_t = qc_t.count_ops()
-    print(f"Transpiled: phys={qc_t.num_qubits}, depth={qc_t.depth()}, "
+    print(f"  Transpiled: phys={qc_t.num_qubits}, depth={qc_t.depth()}, "
           f"CX={ops_t.get('cx',0)}, SWAP={ops_t.get('swap',0)}")
-    assert ops_t.get('swap', 0) == 0, "SWAPs found!"
-    print("✓ 0 SWAPs verified")
+    assert ops_t.get('swap', 0) == 0, "SWAPs found in |00⟩!"
+    print("  ✓ 0 SWAPs verified")
+
+    # Test Bell circuit
+    qc_b, _, _, _, _, il_b = build_circuit(r, s, rounds, bell=True)
+    ops_b = qc_b.count_ops()
+    print(f"\nOptimized Bell circuit: {qc_b.num_qubits} qubits, "
+          f"CX={ops_b.get('cx',0)}")
+    ilist_b = [il_b[i] for i in range(qc_b.num_qubits)]
+    qc_b_t = transpile(qc_b, backend=backend, coupling_map=cm_full,
+                       basis_gates=['cx', 'id', 'rz', 'sx', 'x'],
+                       initial_layout=ilist_b,
+                       optimization_level=3)
+    ops_b_t = qc_b_t.count_ops()
+    print(f"  Transpiled: phys={qc_b_t.num_qubits}, depth={qc_b_t.depth()}, "
+          f"CX={ops_b_t.get('cx',0)}, SWAP={ops_b_t.get('swap',0)}")
 
 
 def verify_pipeline():
@@ -196,7 +239,7 @@ def verify_pipeline():
     backend = AerSimulator(device='CPU')
     r, s, rounds = 6, 8, 1
 
-    qc, dm, lq0, lq1, n_anc = build_circuit(r, s, rounds, logical_state="00")
+    qc, dm, lq0, lq1, n_anc, _ = build_circuit(r, s, rounds, logical_state="00")
     print(f"Circuit: {qc.num_qubits}q, CX={qc.count_ops().get('cx',0)}")
 
     noise_model = NoiseModel()
@@ -214,8 +257,8 @@ def verify_pipeline():
     data_list = []
     for bitstring, cnt in counts.items():
         parts = bitstring.split()
-        data_bits = parts[0]
-        syn_bits = parts[1] if len(parts) >= 2 else ""
+        data_bits = parts[0][::-1]    # Qiskit get_counts: clbit 0 is rightmost
+        syn_bits = parts[1][::-1] if len(parts) >= 2 else ""
         for _ in range(cnt):
             V = np.zeros((r, s), dtype=np.uint8)
             idx = 0
