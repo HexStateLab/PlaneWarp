@@ -11,7 +11,7 @@ import numpy as np
 from qiskit import QuantumCircuit, QuantumRegister, ClassicalRegister
 
 
-def build_circuit(r, s, rounds, logical_state="00", bell=False, bell_measure=False, measure_x=False, stabilizer_basis='Z', no_reset=True):
+def build_circuit(r, s, rounds, logical_state="00", bell=False, bell_measure=False, measure_x=False, stabilizer_basis='Z', no_reset=True, ghz=False, ghz_measure=False):
     """Build optimized share-pair QEC circuit.
 
     stabilizer_basis='Z': measure V(i,j) = Z_i Z_{i+2,j} (Z⊗Z stabilizers) via data→anc CX.
@@ -34,55 +34,59 @@ def build_circuit(r, s, rounds, logical_state="00", bell=False, bell_measure=Fal
 
     n_data = r * s
     hr, hs = r // 2, s // 2
-    n_anc = 0
-    anc_indices = []  # list of (sector_px, sector_py, p, q, global_anc_idx)
+    n_anc_phys = 2 * r * s
+    n_anc = 4 * (hr - 1) * hs
 
-    for px in range(2):
-        for py in range(2):
-            for p in range(hr - 1):  # all but last row in sector
-                for q in range(hs):
-                    anc_indices.append((px, py, p, q))
-                    n_anc += 1
-
-    n_bell_prep = 1 if bell else 0
-    n_bell_meas = 1 if bell_measure else 0
-    total = n_data + n_anc + n_bell_prep + n_bell_meas
-    b_prep_idx = n_data + n_anc
-    b_meas_idx = n_data + n_anc + n_bell_prep
+    n_extra = (1 if bell else 0) + (1 if bell_measure else 0) + (1 if ghz else 0) + (1 if ghz_measure else 0)
+    extra_qubits = []
+    if bell: extra_qubits.append(("bell", 1))
+    if bell_measure: extra_qubits.append(("bell_m", 1))
+    if ghz: extra_qubits.append(("ghz", 1))
+    if ghz_measure: extra_qubits.append(("ghz_m", 1))
+    extra_idx = {}
+    if bell: extra_idx["bell"] = anc_maps[(0, 0, 1)]
+    if bell_measure: extra_idx["bell_m"] = anc_maps[(0, 1, 1)]
+    if ghz: extra_idx["ghz"] = anc_maps[(r - 1, 0, 0)]
+    if ghz_measure: extra_idx["ghz_m"] = anc_maps[(r - 1, 1, 0)]
+    total = n_data + n_anc_phys
 
     qr = QuantumRegister(total, "q")
     cr_syn = [ClassicalRegister(n_anc, f"syn_{c}") for c in range(rounds)]
     cr_data = ClassicalRegister(n_data, "data")
+    cregs = [*cr_syn, cr_data]
+    extra_cr = {}
+    for name in extra_idx:
+        cr = ClassicalRegister(1, name)
+        extra_cr[name] = cr
+        cregs.append(cr)
+    qc = QuantumCircuit(qr, *cregs)
 
-    if bell or bell_measure:
-        cregs = [*cr_syn, cr_data]
-        if bell:
-            cr_bell = ClassicalRegister(1, "bell")
-            cregs.append(cr_bell)
-        if bell_measure:
-            cr_bell_m = ClassicalRegister(1, "bell_m")
-            cregs.append(cr_bell_m)
-        qc = QuantumCircuit(qr, *cregs)
-    else:
-        qc = QuantumCircuit(qr, *cr_syn, cr_data)
-
-    if bell:
+    if ghz:
+        g_idx = extra_idx["ghz"]
+        qc.h(g_idx)
+        for j in range(s - 1):
+            qc.cx(g_idx, data_map[r - 1][j])
+        for i in range(r - 1):
+            qc.cx(g_idx, data_map[i][s - 1])
+        qc.h(g_idx)
+        qc.measure(g_idx, extra_cr["ghz"][0])
+    elif bell:
+        b_prep_idx = extra_idx["bell"]
         qc.h(b_prep_idx)
         for i in range(r):
             qc.cx(b_prep_idx, data_map[i][0])
         for j in range(1, s):
             qc.cx(b_prep_idx, data_map[0][j])
         qc.h(b_prep_idx)
-        qc.measure(b_prep_idx, cr_bell[0])
+        qc.measure(b_prep_idx, extra_cr["bell"][0])
     elif bell_measure:
-        # Without prep measurement: just prepare the Bell state without measuring
+        b_prep_idx = extra_idx["bell_m"]
         qc.h(b_prep_idx)
         for i in range(r):
             qc.cx(b_prep_idx, data_map[i][0])
         for j in range(1, s):
             qc.cx(b_prep_idx, data_map[0][j])
         qc.h(b_prep_idx)
-        # Don't measure — the Bell prep ancilla stays entangled with the data
     else:
         # |+⟩⊗N preparation for X-stabilizer basis (satisfies X_i X_j = +1)
         if stabilizer_basis == 'X':
@@ -99,13 +103,14 @@ def build_circuit(r, s, rounds, logical_state="00", bell=False, bell_measure=Fal
 
     # QEC rounds
     for rnd in range(rounds):
-        anc_idx = n_data
+        slot = 0
         for px in range(2):
             for py in range(2):
                 for p in range(hr - 1):
                     for q in range(hs):
                         i = 2 * p + px
                         j = 2 * q + py
+                        anc_idx = anc_maps[(i, j, 0)]
                         if rnd == 0 or not no_reset:
                             qc.reset(anc_idx)
                         if stabilizer_basis == 'X':
@@ -118,19 +123,20 @@ def build_circuit(r, s, rounds, logical_state="00", bell=False, bell_measure=Fal
                         else:
                             qc.cx(data_map[i][j], anc_idx)
                             qc.cx(data_map[(i + 2) % r][j], anc_idx)
-                        qc.measure(anc_idx, cr_syn[rnd][anc_idx - n_data])
-                        anc_idx += 1
+                        qc.measure(anc_idx, cr_syn[rnd][slot])
+                        slot += 1
         qc.barrier()
 
     # Bell measurement after QEC: measures X_L1 X_L₂ of the (possibly corrupted) state
     if bell_measure:
-        qc.h(b_meas_idx)
+        bm_idx = extra_idx["bell_m"]
+        qc.h(bm_idx)
         for i in range(r):
-            qc.cx(b_meas_idx, data_map[i][0])
+            qc.cx(bm_idx, data_map[i][0])
         for j in range(1, s):
-            qc.cx(b_meas_idx, data_map[0][j])
-        qc.h(b_meas_idx)
-        qc.measure(b_meas_idx, cr_bell_m[0])
+            qc.cx(bm_idx, data_map[0][j])
+        qc.h(bm_idx)
+        qc.measure(bm_idx, extra_cr["bell_m"][0])
 
     # X-basis rotation
     if measure_x:
