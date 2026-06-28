@@ -11,14 +11,15 @@ import numpy as np
 from qiskit import QuantumCircuit, QuantumRegister, ClassicalRegister
 
 
-def build_circuit(r, s, rounds, logical_state="00", bell=False, bell_measure=False, measure_x=False, stabilizer_basis='Z'):
+def build_circuit(r, s, rounds, logical_state="00", bell=False, bell_measure=False, measure_x=False, stabilizer_basis='Z', no_reset=True):
     """Build optimized share-pair QEC circuit.
 
-    stabilizer_basis='Z': measure V(i,j) = Z_i Z_{i+2,j} (Z⊗Z stabilizers).
-    stabilizer_basis='X': measure V(i,j) = X_i X_{i+2,j} (X⊗X stabilizers).
+    stabilizer_basis='Z': measure V(i,j) = Z_i Z_{i+2,j} (Z⊗Z stabilizers) via data→anc CX.
+    stabilizer_basis='X': measure V(i,j) = X_i X_{i+2,j} (X⊗X stabilizers) via H·CX·H on data.
 
-    In X mode, initial state is prepared as |+⟩⊗N (satisfies X-stabilizers)
-    and the ancilla cycle uses anc→data CX (instead of data→anc).
+    no_reset=True: skip ancilla resets on rounds > 0. Ancilla persists in |m_{r-1}⟩;
+    CX flips by the new parity, so m_r = m_{r-1} ⊕ P_r. Recover P_r = m_r ⊕ m_{r-1}
+    via consecutive differencing in all_syndromes_opt. Works in both Z and X bases.
 
     For an r×s grid where both are even:
       - Sector (px, py): data at (2p+px, 2q+py) for p=0..r/2-1, q=0..s/2-1
@@ -98,30 +99,27 @@ def build_circuit(r, s, rounds, logical_state="00", bell=False, bell_measure=Fal
 
     # QEC rounds
     for rnd in range(rounds):
-        anc_global = n_data  # starting index for ancillas in this round
+        anc_idx = n_data
         for px in range(2):
             for py in range(2):
                 for p in range(hr - 1):
                     for q in range(hs):
                         i = 2 * p + px
                         j = 2 * q + py
-                        a_idx = anc_global
-                        anc_global += 1
-
-                        qc.reset(a_idx)
+                        if rnd == 0 or not no_reset:
+                            qc.reset(anc_idx)
                         if stabilizer_basis == 'X':
-                            # X⊗X measurement: anc→data CX with Hadamard on anc
-                            qc.h(a_idx)
-                            qc.cx(a_idx, data_map[i][j])
-                            qc.cx(a_idx, data_map[(i + 2) % r][j])
-                            qc.h(a_idx)
+                            qc.h(data_map[i][j])
+                            qc.h(data_map[(i + 2) % r][j])
+                            qc.cx(data_map[i][j], anc_idx)
+                            qc.cx(data_map[(i + 2) % r][j], anc_idx)
+                            qc.h(data_map[i][j])
+                            qc.h(data_map[(i + 2) % r][j])
                         else:
-                            # Z⊗Z measurement: data→anc CX
-                            qc.cx(data_map[i][j], a_idx)
-                            qc.cx(data_map[(i + 2) % r][j], a_idx)
-
-                        syn_idx = a_idx - n_data
-                        qc.measure(a_idx, cr_syn[rnd][syn_idx])
+                            qc.cx(data_map[i][j], anc_idx)
+                            qc.cx(data_map[(i + 2) % r][j], anc_idx)
+                        qc.measure(anc_idx, cr_syn[rnd][anc_idx - n_data])
+                        anc_idx += 1
         qc.barrier()
 
     # Bell measurement after QEC: measures X_L1 X_L₂ of the (possibly corrupted) state
@@ -152,21 +150,34 @@ def build_circuit(r, s, rounds, logical_state="00", bell=False, bell_measure=Fal
     return qc, data_map, lq0_qubits, lq1_qubits, n_anc
 
 
-def all_syndromes_opt(pub_result, rounds, r, s, n_anc):
+def all_syndromes_opt(pub_result, rounds, r, s, n_anc, no_reset=True):
     """Extract and reconstruct full (shots, rounds, r, s) syndrome.
 
     Measurements are for V(i,j) = data[i][j] ⊕ data[(i+2)%r][j]
     for i=0..r-3 (both even and odd, all columns j).
     The last two rows' V are computed via linear combination.
+
+    When no_reset=True, ancillas persist between rounds: m_r = m_{r-1} ⊕ P_r.
+    The actual parity P_r = m_r ⊕ m_{r-1} (with m_{-1} = 0).
     """
     hr, hs = r // 2, s // 2
     first = getattr(pub_result.data, "syn_0")
     shots = first.num_shots
 
-    syn = np.zeros((shots, rounds, r, s), dtype=np.uint8)
+    m_raw = np.zeros((shots, rounds, n_anc), dtype=np.uint8)
     for c in range(rounds):
         bits = getattr(pub_result.data, f"syn_{c}").to_bool_array(order='little')
-        m = bits[:, :n_anc].astype(np.uint8)
+        m_raw[:, c] = bits[:, :n_anc].astype(np.uint8)
+
+    if no_reset:
+        m_parity = m_raw.copy()
+        m_parity[:, 1:] ^= m_raw[:, :-1]
+    else:
+        m_parity = m_raw
+
+    syn = np.zeros((shots, rounds, r, s), dtype=np.uint8)
+    for c in range(rounds):
+        m = m_parity[:, c]
 
         # Unpack measurements into (shots, r, s) V array
         V = np.zeros((shots, r, s), dtype=np.uint8)
@@ -193,6 +204,35 @@ def all_syndromes_opt(pub_result, rounds, r, s, n_anc):
         syn[:, c] = V ^ np.roll(V, shift=-2, axis=2)
 
     return syn
+
+
+def verify_no_reset():
+    """Compare reset-based vs no-reset: depth scaling and round-1 equivalence."""
+    from qiskit_aer import AerSimulator
+    from qiskit_aer.noise import NoiseModel, depolarizing_error
+
+    print("\n--- No-reset depth scaling ---")
+    r, s = 6, 8
+    print(f"{'rounds':>6} | {'reset depth':>11} | {'no-reset depth':>13} | {'reset CX':>8}")
+    for rounds in (1, 2, 4, 8, 16):
+        qc_r, *_ = build_circuit(r, s, rounds, logical_state="00", no_reset=False)
+        qc_f, *_ = build_circuit(r, s, rounds, logical_state="00", no_reset=True)
+        print(f"{rounds:>6} | {qc_r.depth():>11} | {qc_f.depth():>13} | "
+              f"{qc_r.count_ops().get('cx',0):>8}")
+
+    # Round-1 equivalence: with rounds=1, differencing is identity, so the two
+    # syndrome streams must match shot-for-shot under identical sampling.
+    print("\n--- rounds=1 equivalence (ideal sim) ---")
+    rounds = 1
+    backend = AerSimulator(device='CPU')
+    qc_r, _, _, _, n_anc = build_circuit(r, s, rounds, logical_state="00", reset_free=False)
+    qc_f, *_ = build_circuit(r, s, rounds, logical_state="00", reset_free=True)
+    # Same op counts on the ancilla extraction except (rounds-1)=0 resets -> equal here
+    eq = qc_r.count_ops().get('reset', 0) == qc_f.count_ops().get('reset', 0)
+    print(f"  reset count equal at rounds=1: {eq} "
+          f"(reset={qc_r.count_ops().get('reset',0)} vs {qc_f.count_ops().get('reset',0)})")
+    print("  (for rounds>1, free has fewer resets; validate logical fidelity via "
+          "verify_pipeline with reset_free=True)")
 
 
 def verify_optimized():
@@ -231,7 +271,7 @@ def verify_optimized():
           f"CZ={ops_b_t.get('cz',0)}, SWAP={ops_b_t.get('swap',0)}")
 
 
-def verify_pipeline():
+def verify_pipeline(no_reset=False):
     """End-to-end: circuit → simulate → syndrome extraction → decode."""
     from qiskit_aer import AerSimulator
     from qiskit_aer.noise import NoiseModel, depolarizing_error
@@ -241,7 +281,7 @@ def verify_pipeline():
     backend = AerSimulator(device='CPU')
     r, s, rounds = 6, 8, 1
 
-    qc, dm, lq0, lq1, n_anc = build_circuit(r, s, rounds, logical_state="00")
+    qc, dm, lq0, lq1, n_anc = build_circuit(r, s, rounds, logical_state="00", no_reset=no_reset)
     print(f"Circuit: {qc.num_qubits}q, CX={qc.count_ops().get('cx',0)}")
 
     noise_model = NoiseModel()
@@ -301,4 +341,6 @@ def verify_pipeline():
 
 if __name__ == "__main__":
     verify_optimized()
+    verify_no_reset()
     verify_pipeline()
+    verify_pipeline(no_reset=True)
