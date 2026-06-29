@@ -279,6 +279,35 @@ def all_syndromes_opt(pub_result, rounds, r, s, n_anc, no_reset=True, free_final
     return syn
 
 
+def S_of(D):
+    """Syndrome of a data error D: S(i,j) = D(i,j) ^ D(i+2,j) ^ D(i,j+2) ^ D(i+2,j+2).
+    Uses roll-by-2 (right): S(i,j) = V(i,j) ^ V(i,j+2) where V(i,j) = D(i,j) ^ D(i+2,j)."""
+    V = D ^ np.roll(D, shift=-2, axis=0)
+    return V ^ np.roll(V, shift=-2, axis=1)
+
+def check_logical(state):
+    """Logical Z parities: (Z_L1, Z_L2) from a (r,s) state/correction array."""
+    return state[0, :].sum() % 2, state[:, 0].sum() % 2
+
+def syndrome_stream_efree(data_err):
+    """N identical syndromes S(D_N) where D_N = sum of errors across all rounds."""
+    D_N = data_err.sum(axis=0) % 2
+    S = S_of(D_N)
+    return np.tile(S, (data_err.shape[0], 1, 1))
+
+def syndrome_stream_ffinal(data_err, cx_z=None):
+    """Per-round syndromes S(cum_t) where cum_t = cumulative errors up to round t."""
+    N, r, s = data_err.shape
+    streams = np.zeros((N, r, s), dtype=np.uint8)
+    cum = np.zeros((r, s), dtype=np.uint8)
+    for t in range(N):
+        cum ^= data_err[t]
+        if cx_z is not None:
+            cum ^= cx_z[t]
+        streams[t] = S_of(cum)
+    return streams
+
+
 def verify_no_reset():
     """Compare reset-based vs no-reset: depth scaling and round-1 equivalence."""
     from qiskit_aer import AerSimulator
@@ -405,10 +434,15 @@ def verify_pipeline(no_reset=False):
         corrs[i] = dec.decode(syn_hits[i].reshape(1, r, s))
 
     corrected = data_raw ^ corrs[:, 0]
-    lz1 = corrected[:, 0, :].sum(axis=1) % 2
-    lz2 = corrected[:, :, 0].sum(axis=1) % 2
-    fidelity = ((lz1 == 0) & (lz2 == 0)).mean()
+    logicals = np.array([check_logical(c) for c in corrected])
+    fidelity = ((logicals[:, 0] == 0) & (logicals[:, 1] == 0)).mean()
     print(f"  |00⟩ fidelity with 2% CX noise: {fidelity:.3f}")
+
+    # Verify efree syndrome vs direct (S_of) match
+    syn_direct = S_of(data_raw[0])
+    syn_efree = all_syndromes_opt(None, 1, r, s, 0, data_raw=data_raw[:1], every_round_free=True)
+    match = np.array_equal(syn_direct, syn_efree[0, 0])
+    print(f"  efree syndrome matches S_of: {match}")
     print("✓ Pipeline verified")
 
 
