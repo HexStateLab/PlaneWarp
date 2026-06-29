@@ -62,6 +62,12 @@ def decode(decoder_name, all_syn, r, s):
         for i in range(n_shots):
             corrs[i] = dec.decode(all_syn[i])
         return corrs
+    elif decoder_name == "ffinal":
+        from sweep_efree import tesseract_decode_ffinal
+        corrs = np.zeros((n_shots, r, s), dtype=np.uint8)
+        for i in range(n_shots):
+            corrs[i] = tesseract_decode_ffinal(all_syn[i])
+        return corrs
     raise ValueError(f"unknown decoder: {decoder_name}")
 
 def run_test(token, opts):
@@ -77,29 +83,28 @@ def run_test(token, opts):
     bell_measure = opts.bell_measure
     ghz_measure = opts.ghz_measure
     no_reset = not opts.reset_every_round
-    free_final_round = opts.free_final_round
-    every_round_free = opts.every_round_free
+    free_final_round = not opts.no_free_final_round
 
-    if every_round_free:
-        free_final_round = False  # every_round_free supersedes
-        if opts.bell_measure or opts.ghz_measure:
-            print("NOTE: every_round_free removes QEC CX only; bell_measure/ghz_measure gadgets still cost CX")
-    elif free_final_round:
+    if free_final_round:
         readout_is_x = opts.measure_x
         stab_is_x = opts.x_stabilizer
         if readout_is_x != stab_is_x:
-            print("WARNING: free_final_round requires readout basis == stabilizer basis; disabling")
+            print("WARNING: --no-free-final-round forced: readout basis != stabilizer basis")
             free_final_round = False
         if opts.partial_x:
-            print("WARNING: free_final_round incompatible with partial_x (mixed basis); disabling")
+            print("WARNING: --no-free-final-round forced: partial_x is mixed basis")
             free_final_round = False
 
-    service = QiskitRuntimeService(channel="ibm_quantum_platform", token=token)
-    if opts.backend:
-        backend = service.backend(opts.backend)
+    if opts.dry_run:
+        backend = None
+        print("Backend: [dry-run]")
     else:
-        backend = service.backend("ibm_marrakesh")
-    print(f"Backend: {backend.name} ({backend.num_qubits} qubits)")
+        service = QiskitRuntimeService(channel="ibm_quantum_platform", token=token)
+        if opts.backend:
+            backend = service.backend(opts.backend)
+        else:
+            backend = service.backend("ibm_marrakesh")
+        print(f"Backend: {backend.name} ({backend.num_qubits} qubits)")
 
     qc, data_map, lq0_qubits, lq1_qubits, n_anc = build_circuit(
         r, s, rounds, logical_state=logical_state, bell=bell,
@@ -109,7 +114,6 @@ def run_test(token, opts):
         stabilizer_basis='X' if opts.x_stabilizer else 'Z',
         no_reset=no_reset,
         free_final_round=free_final_round,
-        every_round_free=every_round_free,
     )
     if opts.partial_x:
         basis = "X_partial"
@@ -122,23 +126,30 @@ def run_test(token, opts):
     else:
         label = f"|{logical_state}⟩"
     stab = "X" if opts.x_stabilizer else "Z"
-    cx_info = "0 CX (every round free)" if every_round_free else ""
-    print(f"Circuit: {r}×{s} grid, {rounds} rounds, {label}, {shots} shots  {cx_info}")
+    anc_rounds = rounds - 1 if free_final_round else rounds
+    cx_per_round = 8 * (r // 2 - 1) * (s // 2)
+    total_cx = anc_rounds * cx_per_round
+    ffr_note = f" (last round free from data)" if free_final_round else ""
+    print(f"Circuit: {r}×{s} grid, {rounds} rounds, {label}, {shots} shots")
     print(f"  Data: {r*s}, Ancillas: {n_anc}, {stab}-stab, no_reset={no_reset}")
-
-    print("Transpiling ...")
-    pm = generate_preset_pass_manager(
-        backend=backend, optimization_level=3,
-        routing_method="sabre", seed_transpiler=42,
-    )
-    qc_t = pm.run(qc)
-    ops = qc_t.count_ops()
-    two_q = sum(v for k, v in ops.items() if k in ('cz', 'ecr', 'cx', 'swap'))
-    print(f"  Physical qubits: {qc_t.num_qubits}, Depth: {qc_t.depth()}, Two-qubit gates: {two_q}")
+    print(f"  {anc_rounds} ancilla rounds × {cx_per_round} CX = {total_cx} CX{ffr_note}")
 
     if opts.dry_run:
+        ops = qc.count_ops()
+        two_q = sum(v for k, v in ops.items() if k in ('cz', 'ecr', 'cx', 'swap'))
+        print(f"  Physical qubits: {qc.num_qubits}, Two-qubit gates: {two_q}")
         print("\nDry run complete.")
         return
+    else:
+        print("Transpiling ...")
+        pm = generate_preset_pass_manager(
+            backend=backend, optimization_level=3,
+            routing_method="sabre", seed_transpiler=42,
+        )
+        qc_t = pm.run(qc)
+        ops = qc_t.count_ops()
+        two_q = sum(v for k, v in ops.items() if k in ('cz', 'ecr', 'cx', 'swap'))
+        print(f"  Physical qubits: {qc_t.num_qubits}, Depth: {qc_t.depth()}, Two-qubit gates: {two_q}")
 
     print(f"\nSubmitting ...")
     sampler = Sampler(mode=backend)
@@ -175,12 +186,11 @@ def run_test(token, opts):
     data_raw = dbits.astype(np.uint8).reshape(-1, r, s)
     n_shots = data_raw.shape[0]
 
-    if rounds == 0 and not every_round_free:
+    if rounds == 0:
         all_syn = np.zeros((n_shots, 0, r, s), dtype=np.uint8)
     else:
         all_syn = all_syndromes_opt(pub_result, rounds, r, s, n_anc, no_reset=no_reset,
-                                    free_final_round=free_final_round, data_raw=data_raw,
-                                    every_round_free=every_round_free)
+                                    free_final_round=free_final_round, data_raw=data_raw)
 
     bell_out = None
     if bell:
@@ -210,7 +220,7 @@ def run_test(token, opts):
                   logical_state=logical_state, measure_x=opts.measure_x,
                   partial_x=opts.partial_x,
                   bell_measure=bell_measure, ghz_measure=ghz_measure, no_reset=no_reset,
-                  free_final_round=free_final_round, every_round_free=every_round_free)
+                  free_final_round=free_final_round)
     if bell_out is not None:
         kwargs["bell_out"] = bell_out
     if ghz_out is not None:
@@ -223,7 +233,8 @@ def run_test(token, opts):
 
     print(f"\nDecoding {n_shots} shots ({basis}-basis readout) ...\n")
 
-    for dec_name in ("tesseract", "waxis"):
+    decoders = ("ffinal", "tesseract", "waxis")
+    for dec_name in decoders:
         t0 = time.time()
         corrs = decode(dec_name, all_syn, r, s)
         dt = time.time() - t0
@@ -430,12 +441,11 @@ def decode_last_job():
     ghz_m = data.get("ghz_m", None) if "ghz_m" in data else None
 
     free_final_round = bool(data.get("free_final_round", False))
-    every_round_free = bool(data.get("every_round_free", False))
     if partial_x:
         basis = "X_partial"
     else:
         basis = "X" if measure_x else "Z"
-    ffr = " free-final" if free_final_round else " all-free" if every_round_free else ""
+    ffr = " free-final" if free_final_round else ""
     print(f"Re-decoding job {job_id}")
     print(f"  {r}×{s} grid, {rounds} rounds, {n_shots} shots, {basis}-basis{ffr}")
     print(f"  Logical state: {logical_state}\n")
@@ -460,7 +470,8 @@ def decode_last_job():
 
     # Decoder loop (only if rounds > 0)
     if rounds > 0:
-        for dec_name in ("tesseract", "waxis"):
+        decoders = ("ffinal", "tesseract", "waxis")
+        for dec_name in decoders:
             t0 = time.time()
             corrs = decode(dec_name, all_syn, r, s)
             dt = time.time() - t0
@@ -625,14 +636,12 @@ def main():
     ap.add_argument('--redecode', action='store_true',
                     help='Re-decode last cached job without resubmitting')
     ap.add_argument('--shots', type=int, default=1000)
-    ap.add_argument('--rounds', type=int, default=4)
+    ap.add_argument('--rounds', type=int, default=2)
     ap.add_argument('--backend', '-b', type=str, default=None, metavar='NAME')
     ap.add_argument('--reset-every-round', action='store_true',
                     help='Reset ancillas every round (default: no-reset, save resets)')
-    ap.add_argument('--free-final-round', action='store_true',
-                    help='Run rounds-1 ancilla rounds; data readout supplies last syndrome (saves 64 CX)')
-    ap.add_argument('--every-round-free', action='store_true',
-                    help='Run 0 ancilla rounds; ALL rounds from data readout (0 CX, net error only)')
+    ap.add_argument('--no-free-final-round', action='store_true',
+                    help='Disable free final round; run all rounds as ancilla rounds (costs 64 extra CX)')
     ap.add_argument('--x-stabilizer', action='store_true',
                     help='Measure X⊗X stabilizers instead of Z⊗Z')
     ap.add_argument('--measure-x', action='store_true',
