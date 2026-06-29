@@ -14,57 +14,37 @@ _basis_cache = {}  # key: (r, s), value: (basis_syn, basis_corr, pivots, rank)
 
 
 def min_weight_kernel(corr, r, s):
-    """Find minimum-weight correction across all 4 logical sectors.
-
-    1. For each sector (Z1,Z2) ∈ {0,1}², switch into that sector by flipping
-       row 0 (toggles Z_L1) and/or column 0 (toggles Z_L2).
-    2. Within each sector, enumerate sub-lattice kernel elements to find the
-       minimum-weight representative.
-    3. Return the global minimum across all sectors.
+    """Find minimum-weight stabilizer-equivalent correction.
+    
+    Only enumerates STABILIZER kernel elements (row-0 and column-0 are pinned)
+    to preserve the logical state of the input correction.
     """
     hr, hs = r // 2, s // 2
-    best = corr.copy()
-    best_wt = best.sum()
+    cur = corr.copy()
+    for px in range(2):
+        for py in range(2):
+            sl = cur[px::2, py::2].copy()
+            best_sl = sl.copy()
+            best_sl_wt = sl.sum()
 
-    for target_z1 in (0, 1):
-        for target_z2 in (0, 1):
-            cur = corr.copy()
-            cur_z1 = cur[0, :].sum() % 2
-            cur_z2 = cur[:, 0].sum() % 2
+            # Only enumerate stabilizers: row-0 and column-0 never flipped
+            for rmask in range(0, 1 << hr, 2):      # bit 0 (row 0) pinned
+                for cmask in range(0, 1 << hs, 2):  # bit 0 (col 0) pinned
+                    temp = sl.copy()
+                    for ri in range(hr):
+                        if rmask & (1 << ri):
+                            temp[ri, :] ^= 1
+                    for ci in range(hs):
+                        if cmask & (1 << ci):
+                            temp[:, ci] ^= 1
+                    wt = temp.sum()
+                    if wt < best_sl_wt:
+                        best_sl_wt = wt
+                        best_sl = temp.copy()
 
-            if cur_z1 != target_z1:
-                cur[0, :] ^= 1
-            if cur_z2 != target_z2:
-                cur[:, 0] ^= 1
+            cur[px::2, py::2] = best_sl
 
-            for px in range(2):
-                for py in range(2):
-                    sl = cur[px::2, py::2].copy()
-                    best_sl = sl.copy()
-                    best_sl_wt = sl.sum()
-
-                    for rmask in range(1 << hr):
-                        for cmask in range(1 << hs):
-                            temp = sl.copy()
-                            for ri in range(hr):
-                                if rmask & (1 << ri):
-                                    temp[ri, :] ^= 1
-                            for ci in range(hs):
-                                if cmask & (1 << ci):
-                                    temp[:, ci] ^= 1
-                            wt = temp.sum()
-                            if wt < best_sl_wt:
-                                best_sl_wt = wt
-                                best_sl = temp.copy()
-
-                    cur[px::2, py::2] = best_sl
-
-            wt = cur.sum()
-            if wt < best_wt:
-                best_wt = wt
-                best = cur.copy()
-
-    return best
+    return cur
 
 
 class WaxisDecoder:
