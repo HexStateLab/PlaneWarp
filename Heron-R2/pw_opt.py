@@ -11,7 +11,7 @@ import numpy as np
 from qiskit import QuantumCircuit, QuantumRegister, ClassicalRegister
 
 
-def build_circuit(r, s, rounds, logical_state="00", bell=False, bell_measure=False, measure_x=False, partial_x=False, stabilizer_basis='Z', no_reset=True, ghz=False, ghz_measure=False, free_final_round=False):
+def build_circuit(r, s, rounds, logical_state="00", bell=False, bell_measure=False, measure_x=False, partial_x=False, stabilizer_basis='Z', no_reset=True, ghz=False, ghz_measure=False, free_final_round=False, every_round_free=False):
     """Build optimized share-pair QEC circuit.
 
     stabilizer_basis='Z': measure V(i,j) = Z_i Z_{i+2,j} (Z⊗Z stabilizers) via data→anc CX.
@@ -23,8 +23,15 @@ def build_circuit(r, s, rounds, logical_state="00", bell=False, bell_measure=Fal
     via consecutive differencing in all_syndromes_opt. Works in both Z and X bases.
 
     free_final_round=True: run rounds-1 ancilla rounds; the destructive data readout
-    at the end supplies the last round's Z-stabilizer syndrome. Only valid when
-    readout basis matches stabilizer basis (both Z or both X). Saves 64 CX.
+    at the end supplies the last round's Z-stabilizer syndrome. Saves 64 CX.
+
+    every_round_free=True: run 0 ancilla rounds; ALL rounds' syndromes are computed
+    from the final destructive data readout D_N. Since CX gates don't modify data,
+    D_r = D_0 ⊕ cumulative_errors = D_N ⊕ errors_{r..N}. With no ancilla information
+    we lose temporal resolution, so every round gets S_r = f(D_N) — the net error
+    syndrome at measurement time. The decoder sees N identical rounds, which lets
+    temporal decoders (tesseract) use consensus on a single snapshot. 0 CX.
+    Overrides free_final_round.
 
     For an r×s grid where both are even:
       - Sector (px, py): data at (2p+px, 2q+py) for p=0..r/2-1, q=0..s/2-1
@@ -64,7 +71,10 @@ def build_circuit(r, s, rounds, logical_state="00", bell=False, bell_measure=Fal
         extra_cursor += 1
     total = n_data + n_anc_phys + n_extra
 
-    qec_rounds = rounds - 1 if free_final_round else rounds
+    if every_round_free:
+        qec_rounds = 0
+    else:
+        qec_rounds = rounds - 1 if free_final_round else rounds
 
     qr = QuantumRegister(total, "q")
     cr_syn = [ClassicalRegister(n_anc, f"syn_{c}") for c in range(qec_rounds)]
@@ -188,7 +198,7 @@ def build_circuit(r, s, rounds, logical_state="00", bell=False, bell_measure=Fal
     return qc, data_map, lq0_qubits, lq1_qubits, n_anc
 
 
-def all_syndromes_opt(pub_result, rounds, r, s, n_anc, no_reset=True, free_final_round=False, data_raw=None):
+def all_syndromes_opt(pub_result, rounds, r, s, n_anc, no_reset=True, free_final_round=False, data_raw=None, every_round_free=False):
     """Extract and reconstruct full (shots, rounds, r, s) syndrome.
 
     Measurements are for V(i,j) = data[i][j] ⊕ data[(i+2)%r][j]
@@ -201,8 +211,23 @@ def all_syndromes_opt(pub_result, rounds, r, s, n_anc, no_reset=True, free_final
     When free_final_round=True, the last round's syndrome is computed from
     data_raw (destructive readout) instead of an ancilla measurement.
     Only rounds-1 ancilla registers are expected in pub_result.
+
+    When every_round_free=True, ALL rounds' syndromes are computed from data_raw.
+    CX gates are control-on-data, so data is never touched — D_r = D_0 ⊕ errors.
+    Every round gets the same syndrome S = f(D_N), the net error at measurement
+    time. 0 CX invested. The decoder sees N identical rounds for temporal consensus.
     """
     hr, hs = r // 2, s // 2
+
+    if every_round_free:
+        shots = data_raw.shape[0]
+        V = data_raw.astype(np.uint8) ^ np.roll(data_raw.astype(np.uint8), shift=-2, axis=1)
+        S = V ^ np.roll(V, shift=-2, axis=2)
+        syn = np.zeros((shots, rounds, r, s), dtype=np.uint8)
+        for c in range(rounds):
+            syn[:, c] = S
+        return syn
+
     anc_rounds = rounds - 1 if free_final_round else rounds
 
     if anc_rounds == 0:
