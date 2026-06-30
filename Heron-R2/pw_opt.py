@@ -91,18 +91,11 @@ def build_circuit(r, s, rounds, logical_state="00", bell=False, bell_measure=Fal
         qc.h(b_prep_idx)
         for i in range(r):
             qc.cx(b_prep_idx, data_map[i][0])
-        for j in range(1, s):
+        for j in range(s):
             qc.cx(b_prep_idx, data_map[0][j])
         qc.h(b_prep_idx)
         qc.measure(b_prep_idx, extra_cr["bell"][0])
-    elif bell_measure and not (bell and bell_after_qec):
-        b_prep_idx = extra_idx["bell_m"]
-        qc.h(b_prep_idx)
-        for i in range(r):
-            qc.cx(b_prep_idx, data_map[i][0])
-        for j in range(1, s):
-            qc.cx(b_prep_idx, data_map[0][j])
-        qc.h(b_prep_idx)
+
     else:
         # |+⟩⊗N preparation for X-stabilizer basis (satisfies X_i X_j = +1)
         if stabilizer_basis == 'X':
@@ -161,7 +154,7 @@ def build_circuit(r, s, rounds, logical_state="00", bell=False, bell_measure=Fal
         qc.h(b_idx)
         for i in range(r):
             qc.cx(b_idx, data_map[i][0])
-        for j in range(1, s):
+        for j in range(s):
             qc.cx(b_idx, data_map[0][j])
         qc.h(b_idx)
         qc.measure(b_idx, extra_cr["bell"][0])
@@ -172,7 +165,7 @@ def build_circuit(r, s, rounds, logical_state="00", bell=False, bell_measure=Fal
         qc.h(bm_idx)
         for i in range(r):
             qc.cx(bm_idx, data_map[i][0])
-        for j in range(1, s):
+        for j in range(s):
             qc.cx(bm_idx, data_map[0][j])
         qc.h(bm_idx)
         qc.measure(bm_idx, extra_cr["bell_m"][0])
