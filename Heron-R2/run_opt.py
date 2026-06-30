@@ -251,13 +251,28 @@ def run_test(token, opts):
             print("WARNING: --no-free-final-round forced: partial_x is mixed basis")
             free_final_round = False
 
-    if bell_measure and periodic and opts.rounds > (1 if free_final_round else 0):
-        print("WARNING: --bell-measure with periodic BC and QEC rounds > 0 is "
-              "fundamentally incompatible: X_L1=row 0 anticommutes with V(0,j) "
-              "stabilizers, so the Bell state is outside the code space. "
-              "QEC rounds will project it back, destroying the Bell state. "
-              "Use --open for open BC (X_L1=col 0, X_L2=col 2 commute with "
-              "all stabilizers) or --rounds 1 for 0 QEC rounds.")
+    # Ancilla-mediated measurement only preserves logical coherence when the
+    # measured operator commutes with the logical operators being tracked.
+    # V(i,j) (the default 2-CX half-stabilizer) does NOT commute with the
+    # row-0 logical or the GHZ boundary logical under periodic BC (verified:
+    # 8/32 measured positions anticommute in both cases) -- so under periodic
+    # BC, ancilla-mediated readout of those is NOT equivalent to a coherence-
+    # preserving measurement; it collapses exactly like a direct readout
+    # would. S(i,j) (full_stabilizer=True, 4-CX) commutes with every logical
+    # operator checked (row-0, col-0, the bell_measure col0|col2 witness, and
+    # the GHZ boundary operator) with zero exceptions. Auto-correct instead
+    # of warning-and-proceeding-broken.
+    needs_full_stabilizer = periodic and opts.rounds > (1 if free_final_round else 0) and (bell_measure or ghz_measure)
+    if needs_full_stabilizer and not full_stabilizer:
+        what = "bell_measure" if bell_measure else "ghz_measure"
+        print(f"NOTE: periodic BC + --{what} + QEC rounds > 0 requires the full "
+              f"4-qubit stabilizer S(i,j) to keep ancilla measurement commuting with "
+              f"the logical operators (V(i,j) anticommutes at some positions and "
+              f"would otherwise collapse the state). Auto-enabling --full-stabilizer "
+              f"(4 CX/check instead of 2 -- this is the real cost of coherence-"
+              f"preserving rounds here, not optional). Use --open to avoid this cost "
+              f"if your logical operators are column-based and already commute with V.")
+        full_stabilizer = True
 
     offline_sampler = None
     if opts.dry_run:
