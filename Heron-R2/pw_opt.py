@@ -103,12 +103,17 @@ def build_circuit(r, s, rounds, logical_state="00", bell=False, bell_measure=Fal
                 for jj in range(s):
                     qc.h(data_map[ii][jj])
         if "1" in logical_state:
+            # Logical flip operator. In Z-stab basis the data is in a Z-eigenstate,
+            # so a logical flip is an X-string. In X-stab basis the data is in
+            # |+>^N (an X-eigenstate); X|+>=|+> is a NO-OP, so the flip must be a
+            # logical Z-string (Z|+>=|->). Pick the gate by basis.
+            flip = qc.z if stabilizer_basis == 'X' else qc.x
             if logical_state[1] == "1":
                 for jj in range(s):
-                    qc.x(data_map[0][jj])
+                    flip(data_map[0][jj])
             if logical_state[0] == "1":
                 for ii in range(r):
-                    qc.x(data_map[ii][0])
+                    flip(data_map[ii][0])
 
     # QEC rounds (rounds-1 if free_final_round, else rounds)
     for rnd in range(qec_rounds):
@@ -294,8 +299,8 @@ def verify_no_reset():
     print("\n--- rounds=1 equivalence (ideal sim) ---")
     rounds = 1
     backend = AerSimulator(device='CPU')
-    qc_r, _, _, _, n_anc = build_circuit(r, s, rounds, logical_state="00", reset_free=False)
-    qc_f, *_ = build_circuit(r, s, rounds, logical_state="00", reset_free=True)
+    qc_r, _, _, _, n_anc = build_circuit(r, s, rounds, logical_state="00", no_reset=False)
+    qc_f, *_ = build_circuit(r, s, rounds, logical_state="00", no_reset=True)
     # Same op counts on the ancilla extraction except (rounds-1)=0 resets -> equal here
     eq = qc_r.count_ops().get('reset', 0) == qc_f.count_ops().get('reset', 0)
     print(f"  reset count equal at rounds=1: {eq} "
