@@ -11,7 +11,7 @@ import numpy as np
 from qiskit import QuantumCircuit, QuantumRegister, ClassicalRegister
 
 
-def build_circuit(r, s, rounds, logical_state="00", bell=False, bell_measure=False, measure_x=False, partial_x=False, stabilizer_basis='Z', no_reset=True, ghz=False, ghz_measure=False, free_final_round=False, bell_after_qec=False, full_stabilizer=False, dd=False, periodic=True, no_data_readout=False):
+def build_circuit(r, s, rounds, logical_state="00", bell=False, bell_measure=False, measure_x=False, partial_x=False, stabilizer_basis='Z', no_reset=True, ghz=False, ghz_measure=False, free_final_round=False, bell_after_qec=False, full_stabilizer=False, dd=False, periodic=True):
     """Build optimized share-pair QEC circuit.
 
     periodic=True: periodic vertical boundary conditions — V(i,j) wraps
@@ -67,8 +67,7 @@ def build_circuit(r, s, rounds, logical_state="00", bell=False, bell_measure=Fal
 
     n_anc_phys = cursor - n_data  # total ancilla qubits allocated (= n_anc)
 
-    n_bell_groups = r // 2  # 3 groups of 2 rows each
-    n_extra = (1 if ghz else 0) + (1 if ghz_measure else 0) + (n_bell_groups if bell_measure else 0)
+    n_extra = (1 if ghz else 0) + (1 if ghz_measure else 0) + (2 if bell_measure else 0)
     extra_idx = {}
     extra_cursor = n_data + n_anc_phys
     if ghz:
@@ -78,29 +77,20 @@ def build_circuit(r, s, rounds, logical_state="00", bell=False, bell_measure=Fal
         extra_idx["ghz_m"] = extra_cursor
         extra_cursor += 1
     if bell_measure:
-        for g in range(n_bell_groups):
-            extra_idx[f"bell_g{g}"] = extra_cursor
-            extra_cursor += 1
+        extra_idx["bell_m1"] = extra_cursor
+        extra_cursor += 1
+        extra_idx["bell_m2"] = extra_cursor
+        extra_cursor += 1
     total = n_data + n_anc_phys + n_extra
-    qec_rounds = rounds - 1 if (free_final_round and not no_data_readout) else rounds
-    if no_data_readout and free_final_round:
-        print("  WARNING: no_data_readout forces free_final_round=False (no data for syndrome)")
-        free_final_round = False
+
+    qec_rounds = rounds - 1 if free_final_round else rounds
 
     qr = QuantumRegister(total, "q")
     cr_syn = [ClassicalRegister(n_anc, f"syn_{c}") for c in range(qec_rounds)]
-    cr_data = None if no_data_readout else ClassicalRegister(n_data, "data")
-    cregs = [*cr_syn]
-    if cr_data is not None:
-        cregs.append(cr_data)
-    per_round_bell = bell_measure and not bell_after_qec
-    bell_skip = {f"bell_g{g}" for g in range(n_bell_groups)}
-    cr_bell = [ClassicalRegister(n_bell_groups, f"bell_{c}") for c in range(qec_rounds)] if per_round_bell else []
-    cregs.extend(cr_bell)
+    cr_data = ClassicalRegister(n_data, "data")
+    cregs = [*cr_syn, cr_data]
     extra_cr = {}
     for name in extra_idx:
-        if per_round_bell and name in bell_skip:
-            continue  # replaced by per-round cr_bell registers
         cr = ClassicalRegister(1, name)
         extra_cr[name] = cr
         cregs.append(cr)
@@ -185,19 +175,6 @@ def build_circuit(r, s, rounds, logical_state="00", bell=False, bell_measure=Fal
                                 qc.cx(data_map[row2(i)][j], anc_idx)
                         qc.measure(anc_idx, cr_syn[rnd][slot])
                         slot += 1
-        # Per-round ancilla-based X_L1 and X_L2 measurement
-        # Uses no-reset accumulation: m_r = m_{r-1} ⊕ P_r, recovered as P_r = m_r ⊕ m_{r-1}
-        # The next QEC round corrects data disturbance from CX anc→data
-        # open BC: X_L1 = col 0, X_L2 = col 2 (each 6 CX on one ancilla)
-        if bell_measure and not bell_after_qec:
-            for g in range(n_bell_groups):
-                anc_idx = extra_idx[f"bell_g{g}"]
-                qc.h(anc_idx)
-                for i in range(2 * g, 2 * g + 2):
-                    qc.cx(anc_idx, data_map[i][0])
-                    qc.cx(anc_idx, data_map[i][2])
-                qc.h(anc_idx)
-                qc.measure(anc_idx, cr_bell[rnd][g])
         # Dynamic decoupling: X gates on all idle data qubits between rounds
         if dd and rnd < qec_rounds - 1:
             for ii in range(r):
@@ -211,16 +188,40 @@ def build_circuit(r, s, rounds, logical_state="00", bell=False, bell_measure=Fal
             qc.h(data_map[ii][0])
         for ii in range(r):
             qc.cx(data_map[ii][0], data_map[ii][2])
-        # End-only bell_measure after Bell creation for bell_after_qec
-        if bell_measure:
-            for g in range(n_bell_groups):
-                anc_idx = extra_idx[f"bell_g{g}"]
-                qc.h(anc_idx)
-                for i in range(2 * g, 2 * g + 2):
-                    qc.cx(anc_idx, data_map[i][0])
-                    qc.cx(anc_idx, data_map[i][2])
-                qc.h(anc_idx)
-                qc.measure(anc_idx, extra_cr[f"bell_g{g}"][0])
+
+    # Bell measurement after QEC: measures X_L1 X_L₂ of the (possibly corrupted) state.
+    # open BC (split): col 0 → X_L1 and col 2 → X_L₂ on separate ancillas, XOR'd in software.
+    #   Each chain is 6 CX instead of 12, halving error per ancilla.
+    #   Syndrome is unaffected because V(i,j) uses two qubits from the same column,
+    #   and both get the same projection → XOR cancels.
+    #   ✓ Works with any number of QEC rounds.
+    # periodic BC (single ancilla): all 12 CX on one ancilla (matching original approach).
+    #   ⚠ Only works with 0 QEC rounds (rounds=0 or rounds=1 with free_final_round).
+    #     X_L1 = row 0 anticommutes with V(0,j) for j≠0, so the Bell state is
+    #     outside the code space. QEC rounds project it back, destroying entanglement.
+    if bell_measure:
+        bm1_idx = extra_idx["bell_m1"]
+        bm2_idx = extra_idx["bell_m2"]
+        if periodic:
+            qc.h(bm1_idx)
+            for i in range(r):
+                qc.cx(bm1_idx, data_map[i][0])
+            for j in range(s):
+                qc.cx(bm1_idx, data_map[0][j])
+            qc.h(bm1_idx)
+            qc.measure(bm1_idx, extra_cr["bell_m1"][0])
+            qc.measure(bm2_idx, extra_cr["bell_m2"][0])
+        else:
+            qc.h(bm1_idx)
+            qc.h(bm2_idx)
+            for i in range(r):
+                qc.cx(bm1_idx, data_map[i][0])
+            for i in range(r):
+                qc.cx(bm2_idx, data_map[i][2])
+            qc.h(bm1_idx)
+            qc.h(bm2_idx)
+            qc.measure(bm1_idx, extra_cr["bell_m1"][0])
+            qc.measure(bm2_idx, extra_cr["bell_m2"][0])
 
     # GHZ measurement after QEC: measures X⊗12 on the boundary
     if ghz_measure:
@@ -252,11 +253,10 @@ def build_circuit(r, s, rounds, logical_state="00", bell=False, bell_measure=Fal
                 qc.h(data_map[ii][2])
         qc.barrier()
 
-    # Final data readout (skip in ancilla-only mode — preserves state for infinite rounds)
-    if cr_data is not None:
-        for ii in range(r):
-            for jj in range(s):
-                qc.measure(data_map[ii][jj], cr_data[ii * s + jj])
+    # Final data readout
+    for ii in range(r):
+        for jj in range(s):
+            qc.measure(data_map[ii][jj], cr_data[ii * s + jj])
 
     if periodic:
         lq0_qubits = [data_map[0][jj] for jj in range(s)]
@@ -265,7 +265,7 @@ def build_circuit(r, s, rounds, logical_state="00", bell=False, bell_measure=Fal
         lq0_qubits = [data_map[ii][0] for ii in range(r)]
         lq1_qubits = [data_map[ii][2] for ii in range(r)]
 
-    return qc, data_map, lq0_qubits, lq1_qubits, n_anc, cr_bell
+    return qc, data_map, lq0_qubits, lq1_qubits, n_anc
 
 
 def all_syndromes_opt(pub_result, rounds, r, s, n_anc, no_reset=True, free_final_round=False, data_raw=None, full_stabilizer=False, periodic=True):
@@ -390,7 +390,7 @@ def verify_no_reset():
     print("\n--- rounds=1 equivalence (ideal sim) ---")
     rounds = 1
     backend = AerSimulator(device='CPU')
-    qc_r, _, _, _, n_anc, _ = build_circuit(r, s, rounds, logical_state="00", no_reset=False)
+    qc_r, _, _, _, n_anc = build_circuit(r, s, rounds, logical_state="00", no_reset=False)
     qc_f, *_ = build_circuit(r, s, rounds, logical_state="00", no_reset=True)
     # Same op counts on the ancilla extraction except (rounds-1)=0 resets -> equal here
     eq = qc_r.count_ops().get('reset', 0) == qc_f.count_ops().get('reset', 0)
@@ -410,7 +410,7 @@ def verify_optimized():
 
     # Test |00⟩ circuit (no Bell)
     r, s, rounds = 6, 8, 1
-    qc, dm, lq0, lq1, n_anc, _ = build_circuit(r, s, rounds, logical_state="00")
+    qc, dm, lq0, lq1, n_anc = build_circuit(r, s, rounds, logical_state="00")
     ops = qc.count_ops()
     print(f"Optimized |00⟩ circuit: {qc.num_qubits} qubits ({r*s} data + {n_anc} anc), "
           f"CX={ops.get('cx',0)}")
@@ -424,7 +424,7 @@ def verify_optimized():
     print("  ✓ 0 SWAPs verified")
 
     # Test Bell circuit (prep + measure)
-    qc_b, dm_b, _, _, _, _ = build_circuit(r, s, rounds, bell=True, bell_measure=True)
+    qc_b, dm_b, _, _, _ = build_circuit(r, s, rounds, bell=True, bell_measure=True)
     ops_b = qc_b.count_ops()
     print(f"\nOptimized Bell circuit (prep+measure): {qc_b.num_qubits} qubits, "
           f"CX={ops_b.get('cx',0)}")
@@ -446,7 +446,7 @@ def verify_pipeline(no_reset=False):
     backend = AerSimulator(device='CPU')
     r, s, rounds = 6, 8, 1
 
-    qc, dm, lq0, lq1, n_anc, _ = build_circuit(r, s, rounds, logical_state="00", no_reset=no_reset)
+    qc, dm, lq0, lq1, n_anc = build_circuit(r, s, rounds, logical_state="00", no_reset=no_reset)
     print(f"Circuit: {qc.num_qubits}q, CX={qc.count_ops().get('cx',0)}")
 
     noise_model = NoiseModel()
