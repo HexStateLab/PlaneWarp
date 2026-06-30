@@ -82,6 +82,7 @@ def run_test(token, opts):
     ghz_measure = opts.ghz_measure
     no_reset = not opts.reset_every_round
     free_final_round = not opts.no_free_final_round
+    full_stabilizer = opts.full_stabilizer
 
     if free_final_round:
         readout_is_x = opts.measure_x
@@ -128,6 +129,7 @@ def run_test(token, opts):
         no_reset=no_reset,
         free_final_round=free_final_round,
         bell_after_qec=bell_after_qec,
+        full_stabilizer=full_stabilizer,
     )
     if opts.partial_x:
         basis = "X_partial"
@@ -141,11 +143,12 @@ def run_test(token, opts):
         label = f"|{logical_state}⟩"
     stab = "X" if opts.x_stabilizer else "Z"
     anc_rounds = max(0, rounds - 1) if free_final_round else max(0, rounds)
-    cx_per_round = 8 * (r // 2 - 1) * (s // 2)
+    cx_per_round = 16 * (r // 2 - 1) * (s // 2) if full_stabilizer else 8 * (r // 2 - 1) * (s // 2)
     total_cx = anc_rounds * cx_per_round
     ffr_note = f" (last round free from data)" if free_final_round else ""
+    stab_note = f", full-stab" if full_stabilizer else ""
     print(f"Circuit: {r}×{s} grid, {rounds} rounds, {label}, {shots} shots")
-    print(f"  Data: {r*s}, Ancillas: {n_anc}, {stab}-stab, no_reset={no_reset}")
+    print(f"  Data: {r*s}, Ancillas: {n_anc}, {stab}-stab{stab_note}, no_reset={no_reset}")
     print(f"  {anc_rounds} ancilla round{'s' if anc_rounds != 1 else ''} × {cx_per_round} CX = {total_cx} CX{ffr_note}")
 
     if opts.dry_run:
@@ -190,6 +193,7 @@ def run_test(token, opts):
         "backend": backend.name, "logical_state": logical_state,
         "bell_measure": bell_measure, "ghz_measure": ghz_measure, "no_reset": no_reset,
         "measure_x": opts.measure_x, "partial_x": opts.partial_x,
+        "full_stabilizer": full_stabilizer,
         "submitted": time.time(),
     }
     SAVE_FILE.write_text(json.dumps(jobs, indent=2, default=str))
@@ -211,7 +215,8 @@ def run_test(token, opts):
         all_syn = np.zeros((n_shots, 0, r, s), dtype=np.uint8)
     else:
         all_syn = all_syndromes_opt(pub_result, rounds, r, s, n_anc, no_reset=no_reset,
-                                    free_final_round=free_final_round, data_raw=data_raw)
+                                    free_final_round=free_final_round, data_raw=data_raw,
+                                    full_stabilizer=full_stabilizer)
 
     bell_out = None
     if bell:
@@ -714,6 +719,10 @@ def main():
     ap.add_argument('--bell-after-qec', action='store_true',
                     help='Create Bell state AFTER QEC rounds (avoids mid-circuit collapse). '
                          'QEC runs on |00⟩, then Bell creation at end. Requires --state bell and --bell-measure.')
+    ap.add_argument('--full-stabilizer', action='store_true',
+                    help='Measure full 4-qubit stabilizer S(i,j) instead of 2-qubit V(i,j). '
+                         'Requires 4 CX per ancilla (128/round instead of 64) but preserves Bell '
+                         'state through multi-round QEC by not differentiating |00⟩_L from |11⟩_L.')
     ap.add_argument('--ghz-measure', action='store_true',
                     help='Ancilla-based GHZ boundary X⊗12 measurement (13 CX; prefer --partial-x for final readout)')
     ap.add_argument('--all-logicals', action='store_true',

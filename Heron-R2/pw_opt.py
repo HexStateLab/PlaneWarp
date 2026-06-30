@@ -11,7 +11,7 @@ import numpy as np
 from qiskit import QuantumCircuit, QuantumRegister, ClassicalRegister
 
 
-def build_circuit(r, s, rounds, logical_state="00", bell=False, bell_measure=False, measure_x=False, partial_x=False, stabilizer_basis='Z', no_reset=True, ghz=False, ghz_measure=False, free_final_round=False, bell_after_qec=False):
+def build_circuit(r, s, rounds, logical_state="00", bell=False, bell_measure=False, measure_x=False, partial_x=False, stabilizer_basis='Z', no_reset=True, ghz=False, ghz_measure=False, free_final_round=False, bell_after_qec=False, full_stabilizer=False):
     """Build optimized share-pair QEC circuit.
 
     stabilizer_basis='Z': measure V(i,j) = Z_i Z_{i+2,j} (Z⊗Z stabilizers) via data→anc CX.
@@ -95,7 +95,7 @@ def build_circuit(r, s, rounds, logical_state="00", bell=False, bell_measure=Fal
             qc.cx(b_prep_idx, data_map[0][j])
         qc.h(b_prep_idx)
         qc.measure(b_prep_idx, extra_cr["bell"][0])
-    elif bell_measure:
+    elif bell_measure and not (bell and bell_after_qec):
         b_prep_idx = extra_idx["bell_m"]
         qc.h(b_prep_idx)
         for i in range(r):
@@ -129,14 +129,28 @@ def build_circuit(r, s, rounds, logical_state="00", bell=False, bell_measure=Fal
                         anc_idx = anc_maps[(i, j, 0)]
                         if rnd == 0 or not no_reset:
                             qc.reset(anc_idx)
-                        if stabilizer_basis == 'X':
-                            qc.h(anc_idx)
-                            qc.cx(anc_idx, data_map[i][j])
-                            qc.cx(anc_idx, data_map[(i + 2) % r][j])
-                            qc.h(anc_idx)
+                        if full_stabilizer:
+                            if stabilizer_basis == 'X':
+                                qc.h(anc_idx)
+                                qc.cx(anc_idx, data_map[i][j])
+                                qc.cx(anc_idx, data_map[(i + 2) % r][j])
+                                qc.cx(anc_idx, data_map[i][(j + 2) % s])
+                                qc.cx(anc_idx, data_map[(i + 2) % r][(j + 2) % s])
+                                qc.h(anc_idx)
+                            else:
+                                qc.cx(data_map[i][j], anc_idx)
+                                qc.cx(data_map[(i + 2) % r][j], anc_idx)
+                                qc.cx(data_map[i][(j + 2) % s], anc_idx)
+                                qc.cx(data_map[(i + 2) % r][(j + 2) % s], anc_idx)
                         else:
-                            qc.cx(data_map[i][j], anc_idx)
-                            qc.cx(data_map[(i + 2) % r][j], anc_idx)
+                            if stabilizer_basis == 'X':
+                                qc.h(anc_idx)
+                                qc.cx(anc_idx, data_map[i][j])
+                                qc.cx(anc_idx, data_map[(i + 2) % r][j])
+                                qc.h(anc_idx)
+                            else:
+                                qc.cx(data_map[i][j], anc_idx)
+                                qc.cx(data_map[(i + 2) % r][j], anc_idx)
                         qc.measure(anc_idx, cr_syn[rnd][slot])
                         slot += 1
         qc.barrier()
@@ -199,7 +213,7 @@ def build_circuit(r, s, rounds, logical_state="00", bell=False, bell_measure=Fal
     return qc, data_map, lq0_qubits, lq1_qubits, n_anc
 
 
-def all_syndromes_opt(pub_result, rounds, r, s, n_anc, no_reset=True, free_final_round=False, data_raw=None):
+def all_syndromes_opt(pub_result, rounds, r, s, n_anc, no_reset=True, free_final_round=False, data_raw=None, full_stabilizer=False):
     """Extract and reconstruct full (shots, rounds, r, s) syndrome.
 
     Measurements are for V(i,j) = data[i][j] ⊕ data[(i+2)%r][j]
@@ -250,12 +264,15 @@ def all_syndromes_opt(pub_result, rounds, r, s, n_anc, no_reset=True, free_final
                             V[:, i, j] = m[:, idx]
                             idx += 1
 
-            # Reconstruct V(r-2, j) and V(r-1, j)
+            # Reconstruct V/S(r-2, j) and V/S(r-1, j)
             V[:, r-2, :] = V[:, 0:r-2:2, :].sum(axis=1) % 2
             V[:, r-1, :] = V[:, 1:r-1:2, :].sum(axis=1) % 2
 
-            # Reconstruct full syndrome: S(i,j) = V(i,j) ⊕ V(i,j+2 mod s)
-            syn[:, c] = V ^ np.roll(V, shift=-2, axis=2)
+            if full_stabilizer:
+                syn[:, c] = V  # measurements ARE S directly
+            else:
+                # Reconstruct full syndrome: S(i,j) = V(i,j) ⊕ V(i,j+2 mod s)
+                syn[:, c] = V ^ np.roll(V, shift=-2, axis=2)
 
     # Free final round: compute last syndrome from data readout
     if free_final_round and data_raw is not None:
