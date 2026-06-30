@@ -11,8 +11,15 @@ import numpy as np
 from qiskit import QuantumCircuit, QuantumRegister, ClassicalRegister
 
 
-def build_circuit(r, s, rounds, logical_state="00", bell=False, bell_measure=False, measure_x=False, partial_x=False, stabilizer_basis='Z', no_reset=True, ghz=False, ghz_measure=False, free_final_round=False, bell_after_qec=False, full_stabilizer=False, dd=False):
+def build_circuit(r, s, rounds, logical_state="00", bell=False, bell_measure=False, measure_x=False, partial_x=False, stabilizer_basis='Z', no_reset=True, ghz=False, ghz_measure=False, free_final_round=False, bell_after_qec=False, full_stabilizer=False, dd=False, periodic=True):
     """Build optimized share-pair QEC circuit.
+
+    periodic=True: periodic vertical boundary conditions — V(i,j) wraps
+    i+2 modulo r, and V(r-2,j), V(r-1,j) reconstructed in software.
+    periodic=False: open boundaries — V(i,j) = Z_i Z_{i+2,j} for i=0..r-3
+    only; bottom two rows have no vertical stabilizers. X_L1 = col 0,
+    X_L2 = col 2 (vertical strings) commute with all V(i,j), so Bell
+    state survives multi-round QEC.
 
     stabilizer_basis='Z': measure V(i,j) = Z_i Z_{i+2,j} (Z⊗Z stabilizers) via data→anc CX.
     stabilizer_basis='X': measure V(i,j) = X_i X_{i+2,j} (X⊗X stabilizers) via anc→data CX
@@ -26,7 +33,7 @@ def build_circuit(r, s, rounds, logical_state="00", bell=False, bell_measure=Fal
     at the end supplies the last round's Z-stabilizer syndrome. Only valid when
     readout basis matches stabilizer basis (both Z or both X). Saves 64 CX.
 
-    For an r×s grid where both are even:
+    For periodic r×s where both are even:
       - Sector (px, py): data at (2p+px, 2q+py) for p=0..r/2-1, q=0..s/2-1
       - In sector coords, V(p,q) = data[p][q] ⊕ data[(p+1)%(r/2)][q]
       - Measure V(p,q) for p=0..r/2-2 (all except last row in sector)
@@ -89,10 +96,16 @@ def build_circuit(r, s, rounds, logical_state="00", bell=False, bell_measure=Fal
     elif bell and not bell_after_qec:
         b_prep_idx = extra_idx["bell"]
         qc.h(b_prep_idx)
-        for i in range(r):
-            qc.cx(b_prep_idx, data_map[i][0])
-        for j in range(s):
-            qc.cx(b_prep_idx, data_map[0][j])
+        if periodic:
+            for i in range(r):
+                qc.cx(b_prep_idx, data_map[i][0])
+            for j in range(s):
+                qc.cx(b_prep_idx, data_map[0][j])
+        else:
+            for i in range(r):
+                qc.cx(b_prep_idx, data_map[i][0])
+            for i in range(r):
+                qc.cx(b_prep_idx, data_map[i][2])
         qc.h(b_prep_idx)
         qc.measure(b_prep_idx, extra_cr["bell"][0])
 
@@ -103,19 +116,25 @@ def build_circuit(r, s, rounds, logical_state="00", bell=False, bell_measure=Fal
                 for jj in range(s):
                     qc.h(data_map[ii][jj])
         if "1" in logical_state:
-            # Logical flip operator. In Z-stab basis the data is in a Z-eigenstate,
-            # so a logical flip is an X-string. In X-stab basis the data is in
-            # |+>^N (an X-eigenstate); X|+>=|+> is a NO-OP, so the flip must be a
-            # logical Z-string (Z|+>=|->). Pick the gate by basis.
             flip = qc.z if stabilizer_basis == 'X' else qc.x
-            if logical_state[1] == "1":
-                for jj in range(s):
-                    flip(data_map[0][jj])
-            if logical_state[0] == "1":
-                for ii in range(r):
-                    flip(data_map[ii][0])
+            if periodic:
+                if logical_state[1] == "1":
+                    for jj in range(s):
+                        flip(data_map[0][jj])
+                if logical_state[0] == "1":
+                    for ii in range(r):
+                        flip(data_map[ii][0])
+            else:
+                if logical_state[1] == "1":
+                    for ii in range(r):
+                        flip(data_map[ii][2])
+                if logical_state[0] == "1":
+                    for ii in range(r):
+                        flip(data_map[ii][0])
 
     # QEC rounds (rounds-1 if free_final_round, else rounds)
+    def row2(i):
+        return i + 2 if not periodic else (i + 2) % r
     for rnd in range(qec_rounds):
         slot = 0
         for px in range(2):
@@ -131,24 +150,24 @@ def build_circuit(r, s, rounds, logical_state="00", bell=False, bell_measure=Fal
                             if stabilizer_basis == 'X':
                                 qc.h(anc_idx)
                                 qc.cx(anc_idx, data_map[i][j])
-                                qc.cx(anc_idx, data_map[(i + 2) % r][j])
+                                qc.cx(anc_idx, data_map[row2(i)][j])
                                 qc.cx(anc_idx, data_map[i][(j + 2) % s])
-                                qc.cx(anc_idx, data_map[(i + 2) % r][(j + 2) % s])
+                                qc.cx(anc_idx, data_map[row2(i)][(j + 2) % s])
                                 qc.h(anc_idx)
                             else:
                                 qc.cx(data_map[i][j], anc_idx)
-                                qc.cx(data_map[(i + 2) % r][j], anc_idx)
+                                qc.cx(data_map[row2(i)][j], anc_idx)
                                 qc.cx(data_map[i][(j + 2) % s], anc_idx)
-                                qc.cx(data_map[(i + 2) % r][(j + 2) % s], anc_idx)
+                                qc.cx(data_map[row2(i)][(j + 2) % s], anc_idx)
                         else:
                             if stabilizer_basis == 'X':
                                 qc.h(anc_idx)
                                 qc.cx(anc_idx, data_map[i][j])
-                                qc.cx(anc_idx, data_map[(i + 2) % r][j])
+                                qc.cx(anc_idx, data_map[row2(i)][j])
                                 qc.h(anc_idx)
                             else:
                                 qc.cx(data_map[i][j], anc_idx)
-                                qc.cx(data_map[(i + 2) % r][j], anc_idx)
+                                qc.cx(data_map[row2(i)][j], anc_idx)
                         qc.measure(anc_idx, cr_syn[rnd][slot])
                         slot += 1
         # Dynamic decoupling: X gates on all idle data qubits between rounds
@@ -161,10 +180,16 @@ def build_circuit(r, s, rounds, logical_state="00", bell=False, bell_measure=Fal
     if bell_after_qec:
         b_idx = extra_idx["bell"]
         qc.h(b_idx)
-        for i in range(r):
-            qc.cx(b_idx, data_map[i][0])
-        for j in range(s):
-            qc.cx(b_idx, data_map[0][j])
+        if periodic:
+            for i in range(r):
+                qc.cx(b_idx, data_map[i][0])
+            for j in range(s):
+                qc.cx(b_idx, data_map[0][j])
+        else:
+            for i in range(r):
+                qc.cx(b_idx, data_map[i][0])
+            for i in range(r):
+                qc.cx(b_idx, data_map[i][2])
         qc.h(b_idx)
         qc.measure(b_idx, extra_cr["bell"][0])
 
@@ -172,10 +197,16 @@ def build_circuit(r, s, rounds, logical_state="00", bell=False, bell_measure=Fal
     if bell_measure:
         bm_idx = extra_idx["bell_m"]
         qc.h(bm_idx)
-        for i in range(r):
-            qc.cx(bm_idx, data_map[i][0])
-        for j in range(s):
-            qc.cx(bm_idx, data_map[0][j])
+        if periodic:
+            for i in range(r):
+                qc.cx(bm_idx, data_map[i][0])
+            for j in range(s):
+                qc.cx(bm_idx, data_map[0][j])
+        else:
+            for i in range(r):
+                qc.cx(bm_idx, data_map[i][0])
+            for i in range(r):
+                qc.cx(bm_idx, data_map[i][2])
         qc.h(bm_idx)
         qc.measure(bm_idx, extra_cr["bell_m"][0])
 
@@ -197,11 +228,16 @@ def build_circuit(r, s, rounds, logical_state="00", bell=False, bell_measure=Fal
                 qc.h(data_map[ii][jj])
         qc.barrier()
     elif partial_x:
-        # H on support of X_L1 X_L2 (row 0 ∪ column 0)
-        for jj in range(s):
-            qc.h(data_map[0][jj])
-        for ii in range(1, r):
-            qc.h(data_map[ii][0])
+        if periodic:
+            for jj in range(s):
+                qc.h(data_map[0][jj])
+            for ii in range(1, r):
+                qc.h(data_map[ii][0])
+        else:
+            for ii in range(r):
+                qc.h(data_map[ii][0])
+            for ii in range(r):
+                qc.h(data_map[ii][2])
         qc.barrier()
 
     # Final data readout
@@ -209,18 +245,23 @@ def build_circuit(r, s, rounds, logical_state="00", bell=False, bell_measure=Fal
         for jj in range(s):
             qc.measure(data_map[ii][jj], cr_data[ii * s + jj])
 
-    lq0_qubits = [data_map[0][jj] for jj in range(s)]
-    lq1_qubits = [data_map[ii][0] for ii in range(r)]
+    if periodic:
+        lq0_qubits = [data_map[0][jj] for jj in range(s)]
+        lq1_qubits = [data_map[ii][0] for ii in range(r)]
+    else:
+        lq0_qubits = [data_map[ii][0] for ii in range(r)]
+        lq1_qubits = [data_map[ii][2] for ii in range(r)]
 
     return qc, data_map, lq0_qubits, lq1_qubits, n_anc
 
 
-def all_syndromes_opt(pub_result, rounds, r, s, n_anc, no_reset=True, free_final_round=False, data_raw=None, full_stabilizer=False):
+def all_syndromes_opt(pub_result, rounds, r, s, n_anc, no_reset=True, free_final_round=False, data_raw=None, full_stabilizer=False, periodic=True):
     """Extract and reconstruct full (shots, rounds, r, s) syndrome.
 
     Measurements are for V(i,j) = data[i][j] ⊕ data[(i+2)%r][j]
     for i=0..r-3 (both even and odd, all columns j).
-    The last two rows' V are computed via linear combination.
+    The last two rows' V are computed via linear combination (periodic)
+    or left as zero (open boundaries).
 
     When no_reset=True, ancillas persist between rounds: m_r = m_{r-1} ⊕ P_r.
     The actual parity P_r = m_r ⊕ m_{r-1} (with m_{-1} = 0).
@@ -266,14 +307,13 @@ def all_syndromes_opt(pub_result, rounds, r, s, n_anc, no_reset=True, free_final
                             V[:, i, j] = m[:, idx]
                             idx += 1
 
-            # Reconstruct V/S(r-2, j) and V/S(r-1, j)
-            V[:, r-2, :] = V[:, 0:r-2:2, :].sum(axis=1) % 2
-            V[:, r-1, :] = V[:, 1:r-1:2, :].sum(axis=1) % 2
+            if periodic:
+                V[:, r-2, :] = V[:, 0:r-2:2, :].sum(axis=1) % 2
+                V[:, r-1, :] = V[:, 1:r-1:2, :].sum(axis=1) % 2
 
             if full_stabilizer:
                 syn[:, c] = V  # measurements ARE S directly
             else:
-                # Reconstruct full syndrome: S(i,j) = V(i,j) ⊕ V(i,j+2 mod s)
                 syn[:, c] = V ^ np.roll(V, shift=-2, axis=2)
 
     # Free final round: compute last syndrome from data readout

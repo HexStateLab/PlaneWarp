@@ -21,25 +21,37 @@ def get_token():
     import getpass
     return getpass.getpass("IBM Quantum token: ")
 
-def logical_measure(corrected_data, r, s):
-    lz1 = corrected_data[:, 0, :].sum(axis=1) % 2
-    lz2 = corrected_data[:, :, 0].sum(axis=1) % 2
+def logical_measure(corrected_data, r, s, periodic=True):
+    if periodic:
+        lz1 = corrected_data[:, 0, :].sum(axis=1) % 2
+        lz2 = corrected_data[:, :, 0].sum(axis=1) % 2
+    else:
+        lz1 = corrected_data[:, :, 0].sum(axis=1) % 2
+        lz2 = corrected_data[:, :, 2].sum(axis=1) % 2
     return lz1, lz2
 
-def all_logicals_measure(corrected_data, r, s, basis='Z'):
+def all_logicals_measure(corrected_data, r, s, basis='Z', periodic=True):
     logicals = {}
     if basis == 'Z':
-        for i in range(r - 1):
-            logicals[f'Z_row_{i}'] = corrected_data[:, i, :].sum(axis=1) % 2
-        for j in range(s - 1):
-            logicals[f'Z_col_{j}'] = corrected_data[:, :, j].sum(axis=1) % 2
+        if periodic:
+            for i in range(r - 1):
+                logicals[f'Z_row_{i}'] = corrected_data[:, i, :].sum(axis=1) % 2
+            for j in range(s - 1):
+                logicals[f'Z_col_{j}'] = corrected_data[:, :, j].sum(axis=1) % 2
+        else:
+            for j in range(s - 1):
+                logicals[f'Z_col_{j}'] = corrected_data[:, :, j].sum(axis=1) % 2
     elif basis == 'X':
         corrected_X = corrected_data.copy()
         corrected_X ^= 1
-        for i in range(r - 1):
-            logicals[f'X_row_{i}'] = corrected_X[:, i, :].sum(axis=1) % 2
-        for j in range(s - 1):
-            logicals[f'X_col_{j}'] = corrected_X[:, :, j].sum(axis=1) % 2
+        if periodic:
+            for i in range(r - 1):
+                logicals[f'X_row_{i}'] = corrected_X[:, i, :].sum(axis=1) % 2
+            for j in range(s - 1):
+                logicals[f'X_col_{j}'] = corrected_X[:, :, j].sum(axis=1) % 2
+        else:
+            for j in range(s - 1):
+                logicals[f'X_col_{j}'] = corrected_X[:, :, j].sum(axis=1) % 2
     return logicals
 
 def compute_fidelity(lz1, lz2, z1, z2):
@@ -83,6 +95,7 @@ def run_test(token, opts):
     no_reset = not opts.reset_every_round
     free_final_round = not opts.no_free_final_round
     full_stabilizer = opts.full_stabilizer
+    periodic = not opts.open
 
     if free_final_round:
         readout_is_x = opts.measure_x
@@ -131,6 +144,7 @@ def run_test(token, opts):
         bell_after_qec=bell_after_qec,
         full_stabilizer=full_stabilizer,
         dd=opts.dd,
+        periodic=periodic,
     )
     if opts.partial_x:
         basis = "X_partial"
@@ -148,7 +162,8 @@ def run_test(token, opts):
     total_cx = anc_rounds * cx_per_round
     ffr_note = f" (last round free from data)" if free_final_round else ""
     stab_note = f", full-stab" if full_stabilizer else ""
-    print(f"Circuit: {r}×{s} grid, {rounds} rounds, {label}, {shots} shots")
+    bc_str = "open" if not periodic else "periodic"
+    print(f"Circuit: {r}×{s} grid ({bc_str} BC), {rounds} rounds, {label}, {shots} shots")
     print(f"  Data: {r*s}, Ancillas: {n_anc}, {stab}-stab{stab_note}, no_reset={no_reset}")
     print(f"  {anc_rounds} ancilla round{'s' if anc_rounds != 1 else ''} × {cx_per_round} CX = {total_cx} CX{ffr_note}")
 
@@ -194,7 +209,7 @@ def run_test(token, opts):
         "backend": backend.name, "logical_state": logical_state,
         "bell_measure": bell_measure, "ghz_measure": ghz_measure, "no_reset": no_reset,
         "measure_x": opts.measure_x, "partial_x": opts.partial_x,
-        "full_stabilizer": full_stabilizer,
+        "full_stabilizer": full_stabilizer, "periodic": periodic,
         "submitted": time.time(),
     }
     SAVE_FILE.write_text(json.dumps(jobs, indent=2, default=str))
@@ -217,7 +232,7 @@ def run_test(token, opts):
     else:
         all_syn = all_syndromes_opt(pub_result, rounds, r, s, n_anc, no_reset=no_reset,
                                     free_final_round=free_final_round, data_raw=data_raw,
-                                    full_stabilizer=full_stabilizer)
+                                    full_stabilizer=full_stabilizer, periodic=periodic)
 
     # Consistency check: compare last ancilla round vs data-readout syndrome
     if free_final_round and rounds >= 2:
@@ -256,7 +271,7 @@ def run_test(token, opts):
                   logical_state=logical_state, measure_x=opts.measure_x,
                   partial_x=opts.partial_x,
                   bell_measure=bell_measure, ghz_measure=ghz_measure, no_reset=no_reset,
-                  free_final_round=free_final_round)
+                  free_final_round=free_final_round, periodic=periodic)
     if bell_out is not None:
         kwargs["bell_out"] = bell_out
     if ghz_out is not None:
@@ -271,9 +286,12 @@ def run_test(token, opts):
 
     # For bell-after-qec: compute witness from raw data without decoder
     if bell and bell_after_qec:
-        # Compute ⟨ZZ⟩ from data_raw (even r,s → bell-flip cancels)
-        lz1_raw = data_raw[:, 0, :].sum(axis=1) % 2
-        lz2_raw = data_raw[:, :, 0].sum(axis=1) % 2
+        if periodic:
+            lz1_raw = data_raw[:, 0, :].sum(axis=1) % 2
+            lz2_raw = data_raw[:, :, 0].sum(axis=1) % 2
+        else:
+            lz1_raw = data_raw[:, :, 0].sum(axis=1) % 2
+            lz2_raw = data_raw[:, :, 2].sum(axis=1) % 2
         agree_z = (lz1_raw == lz2_raw).astype(np.uint8)
         z_vals = np.where(agree_z, 1, -1)
         z_corr = float(z_vals.mean())
@@ -305,11 +323,14 @@ def run_test(token, opts):
         corrs = decode(dec_name, all_syn, r, s)
         dt = time.time() - t0
         corrected = data_raw ^ corrs
-        lz1, lz2 = logical_measure(corrected, r, s)
+        lz1, lz2 = logical_measure(corrected, r, s, periodic=periodic)
 
         if bell:
             if opts.partial_x:
-                x_flat = [0 * s + j for j in range(s)] + [i * s + 0 for i in range(1, r)]
+                if periodic:
+                    x_flat = [0 * s + j for j in range(s)] + [i * s + 0 for i in range(1, r)]
+                else:
+                    x_flat = [i * s + 0 for i in range(r)] + [i * s + 2 for i in range(r)]
                 x_partial = corrected.reshape(n_shots, -1)[:, x_flat]
                 x_prod_vals = x_partial.sum(axis=1) % 2
                 x_corr = float(2 * int((x_prod_vals == 0).sum()) - n_shots) / n_shots
@@ -339,19 +360,23 @@ def run_test(token, opts):
                         "basis": "bell", "time_s": round(dt, 2)}
                 jobs[job_id][dec_name] = info
             else:
-                # Z-only bell run: compute Z_L1 Z_L₂ from data, post-selected on bell=0
+                # Bell run (Z or X basis): compute correlation from data, post-selected on bell=0
                 agree_z = (lz1 == lz2).astype(np.uint8)
                 z_vals = np.where(agree_z, 1, -1)
                 z_all = z_vals.mean()
                 sel = (bell_out == 0)
                 n_sel = sel.sum()
                 z_post = z_vals[sel].mean() if n_sel > 0 else 0
+                if opts.measure_x:
+                    corr_key = "X_corr"; post_key = "X_post_sel"; basis_label = "X"
+                else:
+                    corr_key = "Z_corr"; post_key = "Z_post_sel"; basis_label = "Z"
                 print(f"  {dec_name} ({dt:.1f}s):")
                 print(f"    Bell prep: |0⟩={(bell_out==0).sum()} |1⟩={(bell_out==1).sum()}")
-                print(f"    ⟨Z_L1⊗Z_L2⟩ = {z_all:.3f}  (all shots)")
-                print(f"    Post-selected bell=0 ({n_sel}/{n_shots}): ⟨Z Z⟩_0 = {z_post:.3f}")
-                info = {"Z_corr": float(z_all), "Z_post_sel": float(z_post),
-                        "n_sel": int(n_sel), "basis": "Z", "time_s": round(dt, 2)}
+                print(f"    ⟨{basis_label}_L1⊗{basis_label}_L2⟩ = {z_all:.3f}  (all shots)")
+                print(f"    Post-selected bell=0 ({n_sel}/{n_shots}): ⟨{basis_label}{basis_label}⟩_0 = {z_post:.3f}")
+                info = {corr_key: float(z_all), post_key: float(z_post),
+                        "n_sel": int(n_sel), "basis": basis_label, "time_s": round(dt, 2)}
                 jobs[job_id][dec_name] = info
         elif ghz:
             bnd = np.zeros((n_shots, s - 1 + r - 1), dtype=np.uint8)
@@ -461,9 +486,14 @@ def run_test(token, opts):
                 print(f"\n  {'✓ ENTANGLED!' if w > 1 else '~ Below threshold' if w > 0.5 else '✗ Separable'} "
                       f"W = {z:.3f} + {x:.3f} = {w:.3f}")
             else:
-                zn = best.get("Z_post_sel", best.get("Z_corr", 0))
+                if opts.measure_x:
+                    bl = "X"
+                    val = best.get("X_post_sel", best.get("X_corr", 0))
+                else:
+                    bl = "Z"
+                    val = best.get("Z_post_sel", best.get("Z_corr", 0))
                 n = best.get("n_sel", 0)
-                print(f"\n  Z-only bell run: ⟨Z Z⟩_0 = {zn:.3f} ({n} bell=0 shots)")
+                print(f"\n  {bl}-basis bell run: ⟨{bl}{bl}⟩_0 = {val:.3f} ({n} bell=0 shots)")
         elif opts.all_logicals:
             basis_label = "X" if opts.measure_x else "Z"
             f = best.get("fidelity", 0)
@@ -523,19 +553,25 @@ def decode_last_job():
     ghz_m = data.get("ghz_m", None) if "ghz_m" in data else None
 
     free_final_round = bool(data.get("free_final_round", False))
+    periodic = bool(data.get("periodic", True))
     if partial_x:
         basis = "X_partial"
     else:
         basis = "X" if measure_x else "Z"
+    bc_label = "open" if not periodic else "periodic"
     ffr = " free-final" if free_final_round else ""
     print(f"Re-decoding job {job_id}")
-    print(f"  {r}×{s} grid, {rounds} rounds, {n_shots} shots, {basis}-basis{ffr}")
+    print(f"  {r}×{s} grid, {rounds} rounds, {n_shots} shots, {basis}-basis{ffr}, {bc_label} BC")
     print(f"  Logical state: {logical_state}\n")
 
     if rounds == 0:
         print("  No QEC rounds — decoding skipped (raw data only)\n")
-        lz1 = data_raw[:, 0, :].sum(axis=1) % 2
-        lz2 = data_raw[:, :, 0].sum(axis=1) % 2
+        if periodic:
+            lz1 = data_raw[:, 0, :].sum(axis=1) % 2
+            lz2 = data_raw[:, :, 0].sum(axis=1) % 2
+        else:
+            lz1 = data_raw[:, :, 0].sum(axis=1) % 2
+            lz2 = data_raw[:, :, 2].sum(axis=1) % 2
         if logical_state == "bell":
             agree = (lz1 == lz2).astype(np.uint8)
             z_all = float(2 * int(agree.sum()) - n_shots) / n_shots
@@ -561,7 +597,10 @@ def decode_last_job():
 
             if logical_state == "bell":
                 if partial_x:
-                    x_flat = [0 * s + j for j in range(s)] + [i * s + 0 for i in range(1, r)]
+                    if periodic:
+                        x_flat = [0 * s + j for j in range(s)] + [i * s + 0 for i in range(1, r)]
+                    else:
+                        x_flat = [i * s + 0 for i in range(r)] + [i * s + 2 for i in range(r)]
                     x_partial = corrected.reshape(n_shots, -1)[:, x_flat]
                     x_prod_vals = x_partial.sum(axis=1) % 2
                     x_corr = float(2 * int((x_prod_vals == 0).sum()) - n_shots) / n_shots
@@ -573,7 +612,7 @@ def decode_last_job():
                     sel = (bell_out == 0)
                     n_sel = sel.sum()
                     if n_sel > 0:
-                        lz1, lz2 = logical_measure(corrected[sel], r, s)
+                        lz1, lz2 = logical_measure(corrected[sel], r, s, periodic=periodic)
                         agree_z = (lz1 == lz2).astype(np.uint8)
                         z_sel = float(2 * int(agree_z.sum()) - n_sel) / n_sel
                         x_sel = float(2 * int((bell_m[sel] == 0).sum()) - n_sel) / n_sel
@@ -590,20 +629,24 @@ def decode_last_job():
                                       "witness_sel": float(w_sel), "n_sel": int(n_sel),
                                       "basis": "bell"}
                 else:
-                    # Z-only bell run
-                    lz1, lz2 = logical_measure(corrected, r, s)
+                    # Bell run (Z or X basis)
+                    lz1, lz2 = logical_measure(corrected, r, s, periodic=periodic)
                     agree_z = (lz1 == lz2).astype(np.uint8)
                     z_vals = np.where(agree_z, 1, -1)
                     z_all = z_vals.mean()
                     sel = (bell_out == 0)
                     n_sel = sel.sum()
                     z_post = z_vals[sel].mean() if n_sel > 0 else 0
+                    if measure_x:
+                        corr_key = "X_corr"; post_key = "X_post_sel"; basis_label = "X"
+                    else:
+                        corr_key = "Z_corr"; post_key = "Z_post_sel"; basis_label = "Z"
                     print(f"  {dec_name} ({dt:.1f}s):")
                     print(f"    Bell prep: |0⟩={(bell_out==0).sum()} |1⟩={(bell_out==1).sum()}")
-                    print(f"    ⟨Z_L1⊗Z_L2⟩ = {z_all:.3f}  (all shots)")
-                    print(f"    Post-selected bell=0 ({n_sel}/{n_shots}): ⟨Z Z⟩_0 = {z_post:.3f}")
-                    info[dec_name] = {"Z_corr": float(z_all), "Z_post_sel": float(z_post),
-                                      "n_sel": int(n_sel), "basis": "Z"}
+                    print(f"    ⟨{basis_label}_L1⊗{basis_label}_L2⟩ = {z_all:.3f}  (all shots)")
+                    print(f"    Post-selected bell=0 ({n_sel}/{n_shots}): ⟨{basis_label}{basis_label}⟩_0 = {z_post:.3f}")
+                    info[dec_name] = {corr_key: float(z_all), post_key: float(z_post),
+                                      "n_sel": int(n_sel), "basis": basis_label}
             elif logical_state == "ghz":
                 bnd = np.zeros((n_shots, s - 1 + r - 1), dtype=np.uint8)
                 for j in range(s - 1):
@@ -623,7 +666,7 @@ def decode_last_job():
                     info[dec_name]["X_cond"] = float(x_cond)
                     info[dec_name]["witness_ghz"] = float(w)
             else:
-                lz1, lz2 = logical_measure(corrected, r, s)
+                lz1, lz2 = logical_measure(corrected, r, s, periodic=periodic)
                 expected_z1 = int(logical_state[0])
                 expected_z2 = int(logical_state[1])
                 fidelity = compute_fidelity(lz1, lz2, expected_z1, expected_z2)
@@ -674,7 +717,7 @@ def decode_last_job():
                and get_corr(j, 'Z_corr') is not None]
     x_cands = [(jid, j) for jid, j in jobs.items()
                if j.get("logical_state") == "bell"
-               and j.get("bell_measure")
+               and (j.get("bell_measure") or j.get("measure_x") or j.get("partial_x"))
                and j.get("rounds", -1) >= 0
                and get_corr(j, 'X_corr') is not None]
 
@@ -774,6 +817,10 @@ def main():
                     help='Offline: RNG seed for reproducible sampling')
     ap.add_argument('--dd', action='store_true',
                     help='Dynamic decoupling: X gates on all data qubits between rounds')
+    ap.add_argument('--open', action='store_true',
+                    help='Open boundary conditions (no vertical wrapping). '
+                         'X_L1=col0, X_L2=col2 — both commute with all V(i,j), '
+                         'so Bell state survives multi-round QEC.')
     opts = ap.parse_args()
     if opts.redecode:
         decode_last_job()
