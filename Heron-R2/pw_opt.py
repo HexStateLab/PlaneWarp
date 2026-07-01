@@ -30,6 +30,13 @@ Optimizations in this revision (all output-format compatible):
     and 2 layers of ancilla depth per Bell operation.
   - all_syndromes_opt and verify_pipeline are fully vectorized
     (precomputed fancy-index unpacking, unique-syndrome decoding).
+  - stabilizer_basis accepts repeating sequences ('ZX'/'XZ'): per-round
+    alternating extraction of both stabilizer types, required to protect
+    both correlators of a logical Bell state. Use with full_stabilizer=True
+    (weight-4 S commute with both logicals; weight-2 V_Z gauge checks
+    anticommute with X_L1X_L2 and dephase the Bell state in one round).
+    Helpers round_bases / split_by_basis / detection_events handle the
+    per-basis syndrome bookkeeping for decoding.
 """
 import numpy as np
 from qiskit import QuantumCircuit, QuantumRegister, ClassicalRegister
@@ -64,6 +71,25 @@ def build_circuit(r, s, rounds, logical_state="00", bell=False, bell_measure=Fal
     stabilizer_basis='Z': measure V(i,j) = Z_i Z_{i+2,j} (Z⊗Z stabilizers) via data→anc CX.
     stabilizer_basis='X': measure V(i,j) = X_i X_{i+2,j} (X⊗X stabilizers) via anc→data CX
     with ancilla in |+⟩ (cleaner: 2 H per check on anc, not 4 on data).
+    stabilizer_basis may also be a repeating sequence, e.g. 'ZX' or 'XZ':
+    round t is measured in basis stabilizer_basis[t % len]. This is required
+    to protect BOTH logical correlators of a Bell state simultaneously —
+    Z-type checks alone leave dephasing uncorrected (X_L1X_L2 decays at the
+    physical T2), and X-type alone leave bit flips uncorrected. Notes:
+      - Use full_stabilizer=True with alternating bases for Bell states.
+        The weight-4 S operators of both types commute with each other and
+        with X_L1X_L2 and Z_L1Z_L2. The weight-2 V gauge operators do NOT:
+        V_Z checks anticommute with X_L1X_L2 (periodic) and dephase the
+        Bell state in one round even on perfect hardware.
+      - no_reset differencing is basis-agnostic (the ancilla accumulates
+        m_t = m_{t-1} ⊕ P_t whatever P_t is), so all_syndromes_opt needs
+        no change; interpret even/odd rounds via round_bases() and form
+        detection events with detection_events(), which differences
+        consecutive SAME-basis rounds (a first-of-basis round is a random
+        gauge-fixing reference unless the initial state is a deterministic
+        eigenstate, e.g. |0…0⟩ for Z-type).
+      - For logical_state prep (non-Bell), the |+⟩^N prep and flip operator
+        follow the FIRST basis in the sequence.
 
     no_reset=True: skip ancilla resets on rounds > 0. Ancilla persists in |m_{r-1}⟩;
     CX flips by the new parity, so m_r = m_{r-1} ⊕ P_r. Recover P_r = m_r ⊕ m_{r-1}
@@ -134,6 +160,17 @@ def build_circuit(r, s, rounds, logical_state="00", bell=False, bell_measure=Fal
 
     qec_rounds = rounds - 1 if free_final_round else rounds
 
+    basis_seq = stabilizer_basis.upper()
+    first_basis = basis_seq[0]
+    if free_final_round and len(basis_seq) > 1 and rounds > 0:
+        _readout_b = 'X' if measure_x else 'Z'
+        _final_b = basis_seq[(rounds - 1) % len(basis_seq)]
+        assert _final_b == _readout_b, (
+            f"free_final_round: data readout basis '{_readout_b}' must match "
+            f"the basis of the final (software) round '{_final_b}' — pick the "
+            f"sequence phase accordingly (e.g. 'XZ' for Z readout, 'ZX' for "
+            f"X readout, with an even number of rounds)")
+
     qr = QuantumRegister(total, "q")
     cr_syn = [ClassicalRegister(n_anc, f"syn_{c}") for c in range(qec_rounds)]
     cr_data = ClassicalRegister(n_data, "data")
@@ -181,12 +218,12 @@ def build_circuit(r, s, rounds, logical_state="00", bell=False, bell_measure=Fal
             qc.h(_dq(0, 0))
     else:
         # |+⟩⊗N preparation for X-stabilizer basis (satisfies X_i X_j = +1)
-        if stabilizer_basis == 'X':
+        if first_basis == 'X':
             for ii in range(r):
                 for jj in range(s):
                     qc.h(_dq(ii, jj))
         if "1" in logical_state:
-            flip = qc.z if stabilizer_basis == 'X' else qc.x
+            flip = qc.z if first_basis == 'X' else qc.x
             if periodic:
                 if logical_state[1] == "1":
                     for jj in range(s):
@@ -216,21 +253,22 @@ def build_circuit(r, s, rounds, logical_state="00", bell=False, bell_measure=Fal
                else [(0, 0), (2, 0)])
 
     for rnd in range(qec_rounds):
+        rb = basis_seq[rnd % len(basis_seq)]
         if (rnd == 0 and initial_reset) or (rnd > 0 and not no_reset):
             for a in anc_list:
                 qc.reset(a)
-        if stabilizer_basis == 'X':
+        if rb == 'X':
             for a in anc_list:
                 qc.h(a)
         for (di, dj) in offsets:
             for (i, j), a in zip(checks, anc_list):
                 ti = row2(i) if di else i
                 tj = (j + dj) % s
-                if stabilizer_basis == 'X':
+                if rb == 'X':
                     qc.cx(a, _dq(ti, tj))
                 else:
                     qc.cx(_dq(ti, tj), a)
-        if stabilizer_basis == 'X':
+        if rb == 'X':
             for a in anc_list:
                 qc.h(a)
         for slot, a in enumerate(anc_list):
@@ -347,6 +385,52 @@ def all_syndromes_opt(pub_result, rounds, r, s, n_anc, no_reset=True, free_final
         syn[:, -1] = V_last ^ np.roll(V_last, shift=-2, axis=2)
 
     return syn
+
+
+def round_bases(rounds, stabilizer_basis):
+    """Per-round basis list for a (possibly repeating) stabilizer_basis string."""
+    seq = stabilizer_basis.upper()
+    return [seq[t % len(seq)] for t in range(rounds)]
+
+
+def split_by_basis(all_syn, stabilizer_basis):
+    """Split (shots, rounds, r, s) syndromes into per-basis subsequences.
+
+    Returns {basis: (round_indices, all_syn[:, round_indices])}.
+    With alternating extraction, the S_Z history (X-error syndromes for the
+    Z-readout logicals) and the S_X history (Z-error syndromes for the
+    X-readout logicals) are decoded independently.
+    """
+    bases = round_bases(all_syn.shape[1], stabilizer_basis)
+    out = {}
+    for b in dict.fromkeys(bases):
+        idx = [t for t, bb in enumerate(bases) if bb == b]
+        out[b] = (idx, all_syn[:, idx])
+    return out
+
+
+def detection_events(all_syn, stabilizer_basis, deterministic_first=('Z',)):
+    """Same-basis consecutive differencing → detection events.
+
+    For each basis subsequence, event[k] = S[t_k] ^ S[t_{k-1}].  The first
+    round of a basis is a valid event only if the initial state is a
+    deterministic +1 eigenstate of that basis's stabilizers (|0…0⟩ prep for
+    Z-type, |+…+⟩ prep for X-type); otherwise it is a random gauge-fixing
+    reference and its event row is zeroed.  Interleaved rounds of the other
+    basis commute with these S operators, so same-basis differencing across
+    them is valid.
+
+    Returns {basis: (round_indices, events)} with events shaped like the
+    subsequence.
+    """
+    out = {}
+    for b, (idx, sub) in split_by_basis(all_syn, stabilizer_basis).items():
+        ev = sub.copy()
+        ev[:, 1:] ^= sub[:, :-1]
+        if b not in deterministic_first:
+            ev[:, 0] = 0
+        out[b] = (idx, ev)
+    return out
 
 
 def check_consistency(all_syn, data_raw, r, s):
