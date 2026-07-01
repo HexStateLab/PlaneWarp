@@ -165,6 +165,49 @@ def gauss_elim(A_b):
     return E, True
 
 
+def build_nullspace_H(r, s, k):
+    """Build nullspace basis of H_k as (N, nullity) matrix.
+    The nullspace corresponds to code Z-stabilizers in shear-k frame.
+    For the (1+x²)(1+y²) code, the nullspace has dimension 4.
+    Returns list of (r, s) basis vectors.
+    """
+    # The Z-stabilizer generators in shear-k frame are the 4-qubit
+    # products Z(i,j)Z(i+2,j+2k)Z(i,j+2)Z(i+2,j+2+2k).
+    # For k=0, these are the standard 4-qubit stabilizers.
+    # The nullspace basis has 4 elements from the 4 sectors.
+    basis = []
+    for px in range(2):
+        for py in range(2):
+            n = np.zeros((r, s), dtype=np.uint8)
+            n[px, py] = 1
+            n[(px + 2) % r, (py + 2 * k) % s] = 1
+            n[px, (py + 2) % s] = 1
+            n[(px + 2) % r, (py + 2 + 2 * k) % s] = 1
+            basis.append(n)
+    return basis
+
+
+def min_weight_shear(E_in, r, s, k):
+    """Find minimum-weight equivalent of E_in in the nullspace of H_k.
+    
+    The nullspace has dim 4 (16 elements). Enumerate all to find
+    the minimum-weight correction that preserves V = H_k · E.
+    """
+    basis = build_nullspace_H(r, s, k)
+    best = E_in.copy()
+    best_wt = best.sum()
+    for mask in range(1 << len(basis)):
+        cur = E_in.copy()
+        for i in range(len(basis)):
+            if mask & (1 << i):
+                cur ^= basis[i]
+        wt = cur.sum()
+        if wt < best_wt:
+            best_wt = wt
+            best = cur.copy()
+    return best
+
+
 def solve_shear(V, r, s, k):
     """Solve V_k = H_k · E for E via Gaussian elimination.
     
@@ -177,7 +220,7 @@ def solve_shear(V, r, s, k):
     aug = np.hstack([H, V.reshape(-1, 1)])
     E, ok = gauss_elim(aug)
     if ok and E is not None:
-        return min_weight_kernel_fast(E.reshape(r, s), r, s)
+        return min_weight_shear(E.reshape(r, s), r, s, k)
     return np.zeros((r, s), dtype=np.uint8)
 
 
@@ -209,17 +252,22 @@ def decode_shear(syndromes, r, s, k):
     return solve_shear(V, r, s, k)
 
 
+def V_shear_of(E, r, s, k):
+    """Compute V_k pair measurements from error E.
+    V_k(i,j) = E(i,j) ⊕ E(i+2, j+2k).
+    E: (..., r, s) array.
+    """
+    E_rolled = np.roll(E, shift=(-2, -2*k), axis=(-2, -1))
+    return E ^ E_rolled
+
+
 def syndrome_in_frame(E, r, s, k):
     """Compute 4-qubit syndrome in shear-k frame.
     S_k(i,j) = V_k(i,j) + V_k(i, j+2) where V_k is the sheared pair.
+    E: (..., r, s) array.
     """
-    V = np.zeros((r, s), dtype=np.uint8)
-    for i in range(r):
-        for j in range(s):
-            if E[i, j]:
-                V[i, j] ^= 1
-                V[(i + 2) % r, (j + 2 * k) % s] ^= 1
-    return V ^ np.roll(V, shift=-2, axis=1)
+    V = V_shear_of(E, r, s, k)
+    return V ^ np.roll(V, shift=-2, axis=-1)
 
 
 def decode_shear_combined(syndromes_by_k, r, s):
