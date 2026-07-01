@@ -52,6 +52,25 @@ _lib.rot_4d_inv.restype = None
 # Best fixed rotations found at weight 3000 on 100×100
 ROTS = [(0,0,0), (50,50,1), (0,50,2), (33,33,3)]
 
+# Auto-rotation: if True, every decode path applies the best single rotation.
+# Heuristic: shift by ~r/4 along j to move the black hole off the antipode.
+USE_ROTATION = True
+
+def default_rot(r, s):
+    """Best single-rotation params for given grid size."""
+    return (0, max(1, r // 4), 0)
+
+def _decode_with_rot(syn, r, s, rot=None):
+    """Decode with optional rotation. If rot=None and USE_ROTATION, applies default."""
+    if USE_ROTATION and rot is None:
+        rot = default_rot(r, s)
+    if rot:
+        dx, dy, mi = rot
+        syn_r = rotate_syn(syn, dx, dy, mi)
+        corr_r = solve(syn_r, r, s)
+        return unrotate_corr(corr_r, dx, dy, mi)
+    return solve(syn, r, s)
+
 def rotate_syn(syn, dx, dy, mi):
     """C-backed 4D rotation: syndrome → rotated syndrome."""
     out = np.zeros_like(syn)
@@ -69,9 +88,6 @@ def unrotate_corr(corr, dx, dy, mi):
         corr.ctypes.data_as(_ct.POINTER(_ct.c_uint8)),
         out.ctypes.data_as(_ct.POINTER(_ct.c_uint8)), dx, dy, mi)
     return out
-
-# Best fixed rotations found at weight 3000 on 100×100
-ROTS = [(0,0,0), (50,50,1), (0,50,2), (33,33,3)]
 
 # Cache for min-weight kernel LUT per grid size
 _lut_cache = {}
@@ -166,22 +182,15 @@ def check_logical(corr, r, s):
 
 
 def tesseract_decode_ffinal(syndromes, r, s):
-    """Decode ffinal: use LAST ROUND syndrome directly (skip AND-vote)."""
+    """Decode ffinal: last-round syndrome, auto-rotation applied by default."""
     syn = syndromes[-1].copy().astype(np.uint8)
-    prep(syn, r, s)
-    return solve(syn, r, s)
+    return _decode_with_rot(syn, r, s)
 
 
 def tesseract_decode_rot(syndromes, r, s, mi=3, dx=33, dy=33):
-    """ffinal decoder with best fixed 4D rotation (dx=33,dy=33,mi=3).
-    Rotates syndrome before decode, unrotates correction.
-    At weight 3000 on 100×100: ~76% vs ~72% identity (—rot).
-    """
+    """ffinal decoder with explicit 4D rotation (bypasses auto-rotation default)."""
     syn = syndromes[-1].copy().astype(np.uint8)
-    syn_r = rotate_syn(syn, dx, dy, mi)
-    prep(syn_r, r, s)
-    corr_r = solve(syn_r, r, s)
-    return unrotate_corr(corr_r, dx, dy, mi)
+    return _decode_with_rot(syn, r, s, rot=(dx, dy, mi))
 
 
 def tesseract_decode_rot4(syndromes, r, s):
@@ -199,11 +208,9 @@ def tesseract_decode_rot4(syndromes, r, s):
 
 
 def tesseract_decode_np(syndromes, r, s, timeout=30):
-    """Subprocess --decode-np: matches run_80pct.py exactly (~72% baseline).
-    Takes last-round syndrome, decodes via subprocess (no prep).
-    """
+    """Subprocess decoder with auto-rotation."""
     syn = syndromes[-1].copy().astype(np.uint8)
-    return decode_np(syn, r, s, timeout)
+    return _decode_with_rot(syn, r, s)
 
 
 def tesseract_decode_np_rot4(syndromes, r, s, timeout=30):
@@ -221,7 +228,7 @@ def tesseract_decode_np_rot4(syndromes, r, s, timeout=30):
 
 
 def tesseract_decode(syndromes, r, s):
-    """AND-vote + viability + solve decoder."""
+    """AND-vote + viability + solve + auto-rotation."""
     rr, hr, hs = syndromes.shape[0], r // 2, s // 2
     syn_and = np.ones((r, s), dtype=np.uint8)
     for t in range(rr):
@@ -242,10 +249,5 @@ def tesseract_decode(syndromes, r, s):
         if not viable:
             break
 
-    if viable:
-        syn = syn_and.copy()
-    else:
-        syn = syndromes[-1].copy()
-
-    prep(syn, r, s)
-    return solve(syn, r, s)
+    syn = syn_and.copy() if viable else syndromes[-1].copy()
+    return _decode_with_rot(syn, r, s)
