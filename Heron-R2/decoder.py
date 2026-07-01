@@ -166,23 +166,36 @@ def gauss_elim(A_b):
 
 
 def build_nullspace_H(r, s, k):
-    """Build nullspace basis of H_k as (N, nullity) matrix.
-    The nullspace corresponds to code Z-stabilizers in shear-k frame.
-    For the (1+x²)(1+y²) code, the nullspace has dimension 4.
-    Returns list of (r, s) basis vectors.
+    """Build nullspace basis of H_k.
+    
+    Nullspace = {E | V_k = 0} where V_k(i,j) = E(i,j) + E(i+2, j+2k).
+    V_k = 0 means E(i+2, j+2k) = E(i,j) for all i,j — E is constant
+    along chains (i,j) → (i+2, j+2k) → (i+4, j+4k) → ...
+    
+    For k=0: chains are column-wise (same j, every 2 rows).
+      16 independent chains (2 per column × s columns).
+    For k=1 on 6×8: chains cycle every 12 steps (LCM(6/2, 8/2)=12).
+      48/12 = 4 independent chains.
+    
+    Returns list of (r, s) basis vectors, one per chain.
     """
-    # The Z-stabilizer generators in shear-k frame are the 4-qubit
-    # products Z(i,j)Z(i+2,j+2k)Z(i,j+2)Z(i+2,j+2+2k).
-    # For k=0, these are the standard 4-qubit stabilizers.
-    # The nullspace basis has 4 elements from the 4 sectors.
     basis = []
-    for px in range(2):
-        for py in range(2):
+    visited = np.zeros((r, s), dtype=bool)
+    for start_i in range(r):
+        for start_j in range(s):
+            if visited[start_i, start_j]:
+                continue
+            # Trace out the chain
+            chain_positions = []
+            i, j = start_i, start_j
+            while not visited[i, j]:
+                visited[i, j] = True
+                chain_positions.append((i, j))
+                i = (i + 2) % r
+                j = (j + 2 * k) % s
             n = np.zeros((r, s), dtype=np.uint8)
-            n[px, py] = 1
-            n[(px + 2) % r, (py + 2 * k) % s] = 1
-            n[px, (py + 2) % s] = 1
-            n[(px + 2) % r, (py + 2 + 2 * k) % s] = 1
+            for ci, cj in chain_positions:
+                n[ci, cj] = 1
             basis.append(n)
     return basis
 
