@@ -51,7 +51,7 @@ def _unpack_indices(r, s):
     return ii, jj
 
 
-def build_circuit(r, s, rounds, logical_state="00", bell=False, bell_measure=False, measure_x=False, partial_x=False, stabilizer_basis='Z', no_reset=True, ghz=False, ghz_measure=False, free_final_round=False, bell_after_qec=False, full_stabilizer=False, dd=False, periodic=True, compact=True, initial_reset=False, share_extra_ancilla=False, parity_mode='cat', cat_detect=False, cat_spacing=2):
+def build_circuit(r, s, rounds, logical_state="00", bell=False, bell_measure=False, measure_x=False, partial_x=False, stabilizer_basis='Z', no_reset=True, ghz=False, ghz_measure=False, free_final_round=False, bell_after_qec=False, full_stabilizer=False, dd=False, periodic=True, compact=True, initial_reset=False, share_extra_ancilla=False, parity_mode='cat', cat_detect=False):
     """Build optimized share-pair QEC circuit.
 
     periodic=True: periodic vertical boundary conditions — V(i,j) wraps
@@ -174,7 +174,7 @@ def build_circuit(r, s, rounds, logical_state="00", bell=False, bell_measure=Fal
     if parity_mode == 'cat' and extra_flags:
         n_extra = 0
         extra_idx = {}
-        n_cat = max(cat_spacing * (len(c) - 1) + 1 for c in op_coords.values())
+        n_cat = max(3 * len(c) - 1 for c in op_coords.values())
         if compact:
             _shared_cat = [base + k for k in range(n_cat)]
         else:
@@ -211,8 +211,7 @@ def build_circuit(r, s, rounds, logical_state="00", bell=False, bell_measure=Fal
         extra_cr[name] = cr
         cregs.append(cr)
         if parity_mode == 'cat' and cat_detect and len(op_coords[name]) > 1:
-            _m = cat_spacing * (len(op_coords[name]) - 1) + 1
-            ccr = ClassicalRegister(_m - 1, f"{name}_cat")
+            ccr = ClassicalRegister(3 * len(op_coords[name]) - 2, f"{name}_cat")
             cat_cr[name] = ccr
             cregs.append(ccr)
     qc = QuantumCircuit(qr, *cregs)
@@ -238,46 +237,58 @@ def build_circuit(r, s, rounds, logical_state="00", bell=False, bell_measure=Fal
         qc.measure(anc, cbit)
 
     def _parity_measure_cat(name, qubits, cbit):
-        """Measure X⊗n on `qubits` via a cat chain.
+        """Measure X⊗n on `qubits` via a (3n-1)-qubit ladder cat state.
 
-        Cat state (|0…0>+|1…1>)/√2 grown outward from the chain centre,
-        one parallel CX layer onto the data (= controlled-X⊗n), exact
-        uncompute, then H + measure of the centre qubit yields the parity.
+        Heavy hex is bipartite with max degree 3: corner qubits (degree 3)
+        are only adjacent to edge qubits (degree 2). A data qubit is a
+        corner, so the cat qubit that couples to it must be an edge qubit
+        — which then has room for exactly one link into the cat. The only
+        cat topology that embeds natively is therefore a ladder:
 
-        With cat_spacing=2 (default) the chain has 2n-1 qubits and only
-        every other one couples to a data qubit. Heavy hex is bipartite
-        (ancillas are never adjacent to ancillas), so a dense chain would
-        need routing on every link; the spaced chain is a native
-        corner–edge–corner path with pendant data edges.
+            backbone:  c1 - b1 - c2 - b2 - ... - cn   (corners c, edges b)
+            leaves:    l_k attached to c_k             (edge qubits)
+            coupling:  CX(l_k -> d_k), one parallel layer
+
+        Sequence: grow the cat outward from the backbone centre, one
+        parallel layer onto the leaves, one parallel layer onto the data
+        (= controlled-X⊗n with the cat as control), exact uncompute, then
+        H + measure of the centre qubit yields the parity. Identical
+        measurement statistics to parity_mode='single'.
         """
         n = len(qubits)
-        m = cat_spacing * (n - 1) + 1
-        a = _cat_anc(m)
+        a = _cat_anc(3 * n - 1)
         for x in a:
             if x in _used_anc:
                 qc.reset(x)
             _used_anc.add(x)
-        root = m // 2
-        qc.h(a[root])
-        # grow the cat outward from the centre (path-local, depth ~m/2)
-        up = [(a[k], a[k + 1]) for k in range(root, m - 1)]
-        down = [(a[k], a[k - 1]) for k in range(root, 0, -1)]
+        P = a[:2 * n - 1]          # backbone: c_k = P[2k], b_k = P[2k+1]
+        L = a[2 * n - 1:]          # leaves, one per data qubit
+        root = (2 * n - 1) // 2
+        qc.h(P[root])
+        # grow the cat outward from the centre (path-local, depth ~n)
+        up = [(P[k], P[k + 1]) for k in range(root, 2 * n - 2)]
+        down = [(P[k], P[k - 1]) for k in range(root, 0, -1)]
         for c, t in up:
             qc.cx(c, t)
         for c, t in down:
             qc.cx(c, t)
+        # one parallel layer onto the leaves
+        for k in range(n):
+            qc.cx(P[2 * k], L[k])
         # one parallel coupling layer: controlled-(X…X) with the cat as control
         for k, dqb in enumerate(qubits):
-            qc.cx(a[cat_spacing * k], dqb)
+            qc.cx(L[k], dqb)
         # uncompute the cat (exact reverse)
+        for k in range(n):
+            qc.cx(P[2 * k], L[k])
         for c, t in reversed(down):
             qc.cx(c, t)
         for c, t in reversed(up):
             qc.cx(c, t)
-        qc.h(a[root])
-        qc.measure(a[root], cbit)
+        qc.h(P[root])
+        qc.measure(P[root], cbit)
         if name in cat_cr:
-            others = [x for k, x in enumerate(a) if k != root]
+            others = [x for x in a if x != P[root]]
             for b, x in enumerate(others):
                 qc.measure(x, cat_cr[name][b])
 
