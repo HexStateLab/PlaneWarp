@@ -113,91 +113,126 @@ def check_logical(corr, r, s):
     return corr[0, :].sum() % 2, corr[:, 0].sum() % 2
 
 
-def un_shear_syndrome(S, r, s, k):
-    """Un-shear a 4-qubit syndrome: S'_0(i,j) = S_k(i, j + k*i mod s).
+def build_H_shear(r, s, k):
+    """Build the V_k check matrix: V_k(i,j) = E(i,j) ⊕ E(i+2, j+2k mod s).
     
-    The Dehn twist with shear k maps qubit (i,j) → (i, j - k*i mod s).
-    V_k measures pairs (i,j)↔(i+2, j+2k). 
-    Un-shearing recovers the standard syndrome S'_0 of the transformed
-    error E'(i,j) = E(i, j + k*i mod s).
-    
-    S'_0(i,j) = S_k(i, j + k*i) requires np.roll with shift=-k*i
-    (positive np.roll shift moves right; we need S_k at index j+ki,
-    which is S_k rolled LEFT by ki).
+    Returns (N, N) array over GF(2), where N = r*s.
+    The row for qubit (i,j) is at index i*s + j.
     """
-    shift_factor = -k
-    if S.ndim == 3:
-        out = np.zeros_like(S)
-        for shot in range(S.shape[0]):
-            for i in range(r):
-                out[shot, i] = np.roll(S[shot, i], shift=shift_factor * i, axis=0)
-        return out
-    else:
-        out = np.zeros_like(S)
-        for i in range(r):
-            out[i] = np.roll(S[i], shift=shift_factor * i, axis=0)
-        return out
+    N = r * s
+    H = np.zeros((N, N), dtype=np.uint8)
+    for qi in range(r):
+        for qj in range(s):
+            col = qi * s + qj
+            H[qi * s + qj, col] = 1                     # first qubit
+            H[((qi + 2) % r) * s + ((qj + 2 * k) % s), col] = 1  # second qubit
+    return H
 
 
-def re_shear_correction(C, r, s, k):
-    """Re-shear a correction: C(i,j) = C'(i, j - k*i mod s).
-    
-    Inverse of un_shear_syndrome. The standard decoder produces correction
-    C' in the E' frame. E'(i,j) = E(i, j + k*i) means E(i,j) = E'(i, j - k*i).
-    So re-shear uses shift = +k*i.
+def gauss_elim(A_b):
+    """Gaussian elimination over GF(2). Returns (E, consistent) where
+    E is the solution vector or None if inconsistent.
+    A_b: (rows, cols) augmented matrix where last column is RHS.
     """
-    shift_factor = k
-    if C.ndim == 3:
-        out = np.zeros_like(C)
-        for shot in range(C.shape[0]):
-            for i in range(r):
-                out[shot, i] = np.roll(C[shot, i], shift=shift_factor * i, axis=0)
-        return out
-    else:
-        out = np.zeros_like(C)
-        for i in range(r):
-            out[i] = np.roll(C[i], shift=shift_factor * i, axis=0)
-        return out
+    aug = A_b.copy()
+    n_rows, n_cols = aug.shape
+    pivot_row = 0
+    pivot_cols = []
+    
+    for col in range(n_cols - 1):
+        row = -1
+        for r2 in range(pivot_row, n_rows):
+            if aug[r2, col]:
+                row = r2
+                break
+        if row < 0:
+            continue
+        if row != pivot_row:
+            aug[[row, pivot_row]] = aug[[pivot_row, row]]
+        pivot_cols.append(col)
+        for r2 in range(n_rows):
+            if r2 != pivot_row and aug[r2, col]:
+                aug[r2] ^= aug[pivot_row]
+        pivot_row += 1
+    
+    for r2 in range(pivot_row, n_rows):
+        if aug[r2, -1] and not aug[r2, :-1].any():
+            return None, False
+    
+    E = np.zeros(n_cols - 1, dtype=np.uint8)
+    for pi, col in enumerate(pivot_cols):
+        E[col] = aug[pi, -1]
+    return E, True
+
+
+def solve_shear(V, r, s, k):
+    """Solve V_k = H_k · E for E via Gaussian elimination.
+    
+    V: (r, s) array of pair measurements in shear-k frame.
+    k: shear parameter.
+    Returns (r, s) correction array, or zeros if inconsistent.
+    """
+    N = r * s
+    H = build_H_shear(r, s, k)
+    aug = np.hstack([H, V.reshape(-1, 1)])
+    E, ok = gauss_elim(aug)
+    if ok and E is not None:
+        return min_weight_kernel_fast(E.reshape(r, s), r, s)
+    return np.zeros((r, s), dtype=np.uint8)
 
 
 def decode_shear(syndromes, r, s, k):
-    """Decode a sheared syndrome using the standard C decoder.
+    """Decode 4-qubit syndrome in shear-k frame.
     
-    Steps:
-    1. Un-shear the 4-qubit syndrome: S'_0(i,j) = S_k(i, j + k*i)
-    2. Standard decode → C'
-    3. Re-shear correction: C(i,j) = C'(i, j - k*i)
+    Converts S_k to V_k, then solves via Gaussian elimination.
+    syndromes: (1, r, s) or (r, s) array.
     """
-    S = un_shear_syndrome(syndromes, r, s, k)
-    prep(S, r, s)
-    C_prime = solve(S, r, s)
-    return re_shear_correction(C_prime, r, s, k)
+    if syndromes.ndim == 3:
+        S = syndromes[0].copy()
+    else:
+        S = syndromes.copy()
+    # Recover V_k from S_k: need to invert S = V ^ roll(V, -2, cols)
+    # This is a 1D problem per row: V'(t) + V'(t+2) = S'(t) for t=0..s-1
+    # Solve via: V(0) = 0, V(2) = S(0), V(4) = S(2), ... 
+    # V(1) = 0, V(3) = S(1), ...
+    # Then for periodic: V(j) = V(j mod s) + partial sum of S
+    V = np.zeros((r, s), dtype=np.uint8)
+    for i in range(r):
+        row = S[i]
+        for parity in (0, 1):
+            acc = 0
+            for t in range(parity, s, 2):
+                V[i, t] = acc
+                acc ^= row[t]
+            # Check consistency
+            V[i, parity] ^= acc  # periodic closure
+    return solve_shear(V, r, s, k)
 
 
 def syndrome_in_frame(E, r, s, k):
-    """Compute the 4-qubit syndrome of E in the shear-k frame.
-    
-    The syndrome S_k(i,j) is the 4-qubit stabilizer measured via
-    V_k pairs (i,j)↔(i+2, j+2k). S_k(i,j) = V_k(i,j) + V_k(i, j+2)
-    where V_k(i,j) = E(i,j) + E(i+2, j+2k).
+    """Compute 4-qubit syndrome in shear-k frame.
+    S_k(i,j) = V_k(i,j) + V_k(i, j+2) where V_k is the sheared pair.
     """
-    V = E.copy() ^ np.roll(E, shift=(-2, -2*k), axis=(0, 1))
+    V = np.zeros((r, s), dtype=np.uint8)
+    for i in range(r):
+        for j in range(s):
+            if E[i, j]:
+                V[i, j] ^= 1
+                V[(i + 2) % r, (j + 2 * k) % s] ^= 1
     return V ^ np.roll(V, shift=-2, axis=1)
 
 
 def decode_shear_combined(syndromes_by_k, r, s):
-    """Iterative refinement across multiple shear parameters.
+    """Decode using multiple shear parameters via iterative refinement.
     
-    syndromes_by_k: dict {k: S_k_array}, where each S_k_array is
-    (shots, r, s) — the 4-qubit syndrome in shear-k frame.
+    syndromes_by_k: dict {k: S_k_array}, each S_k_array is (shots, r, s)
+    in the shear-k 4-qubit syndrome frame.
     
-    Algorithm:
-    1. Sort shears by descending |k| (largest shear first)
-    2. For first shear: decode → correction
-    3. For subsequent shears: compute residual syndrome,
-       decode residual, add to correction
+    1. Decode first shear → correction
+    2. Compute residual for next shear → refine
+    3. Repeat
     
-    Returns (shots, r, s) correction array.
+    Returns (shots, r, s) correction.
     """
     shears = sorted(syndromes_by_k.keys(), key=lambda k: -abs(k))
     n = next(iter(syndromes_by_k.values())).shape[0]
@@ -206,14 +241,13 @@ def decode_shear_combined(syndromes_by_k, r, s):
     for idx, k in enumerate(shears):
         S_k = syndromes_by_k[k].copy()
         if idx > 0:
-            # Compute residual syndrome: remove syndrome of current correction
             S_resid = S_k ^ syndrome_in_frame(C, r, s, k)
         else:
             S_resid = S_k
         
-        # Decode residual in shear-k frame
-        C_k = decode_shear(S_resid, r, s, k)
-        C ^= C_k
+        for i in range(n):
+            C_k = decode_shear(S_resid[i], r, s, k)
+            C[i] ^= C_k
     
     return C
 
