@@ -117,15 +117,20 @@ def build_H_shear(r, s, k):
     """Build the V_k check matrix: V_k(i,j) = E(i,j) ⊕ E(i+2, j+2k mod s).
     
     Returns (N, N) array over GF(2), where N = r*s.
-    The row for qubit (i,j) is at index i*s + j.
+    Row = V_k(i,j) at index i*s + j.
+    Column = E(i,j) at index i*s + j.
+    
+    E(i,j) is the FIRST qubit of V_k(i,j) and the SECOND qubit of V_k(i-2, j-2k).
     """
     N = r * s
     H = np.zeros((N, N), dtype=np.uint8)
     for qi in range(r):
         for qj in range(s):
             col = qi * s + qj
-            H[qi * s + qj, col] = 1                     # first qubit
-            H[((qi + 2) % r) * s + ((qj + 2 * k) % s), col] = 1  # second qubit
+            # E(i,j) is first qubit of V_k(i,j): row (qi, qj)
+            H[qi * s + qj, col] = 1
+            # E(i,j) is second qubit of V_k(i-2, j-2k): row ((qi-2)%r, (qj-2*k)%s)
+            H[((qi - 2) % r) * s + ((qj - 2 * k) % s), col] = 1
     return H
 
 
