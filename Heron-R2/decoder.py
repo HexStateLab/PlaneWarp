@@ -25,6 +25,9 @@ _lib.preprocess_syndrome.restype = None
 _lib.syndrome_of.argtypes = [_ct.c_int, _ct.c_int,
     _ct.POINTER(_ct.c_uint8), _ct.POINTER(_ct.c_uint8)]
 _lib.syndrome_of.restype = None
+_lib.is_stabilizer.argtypes = [_ct.c_int, _ct.c_int,
+    _ct.POINTER(_ct.c_uint8)]
+_lib.is_stabilizer.restype = _ct.c_int
 
 # Subprocess decode — uses the working Heron-R2/plane_warp binary (Jun 27),
 # NOT the rebuilt .so which has a broken solve_plane.
@@ -156,7 +159,10 @@ def S_of(E, r, s):
 
 
 def check_logical(corr, r, s):
-    return corr[0, :].sum() % 2, corr[:, 0].sum() % 2
+    """Returns True if corr is a stabilizer (no logical error).
+    Checks all 4 parity sectors, not just row0/col0."""
+    return bool(_lib.is_stabilizer(r, s,
+        corr.ctypes.data_as(_ct.POINTER(_ct.c_uint8))))
 
 
 def tesseract_decode_ffinal(syndromes, r, s):
