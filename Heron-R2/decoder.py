@@ -200,10 +200,9 @@ def solve_shear(V, r, s, k):
     
     V_k(i,j) = E(i,j) + E(i+2, j+2k).
     
-    Within each chain: V[element_t] = E[element_t] + E[element_{t+1}].
-    This is solved by setting E[0] = 0 and propagating: E[t+1] = E[t] ′ V[t].
-    Then find the global nullspace flip (add 1 to all elements of the chain)
-    that minimizes the correction weight.
+    For each chain (size L), tries both E[0]=0 and E[0]=1, propagates
+    WITHOUT enforcing cycle closure (noise-robust). Chooses the
+    lower-weight correction.
     
     Returns (r, s) correction array.
     """
@@ -212,27 +211,29 @@ def solve_shear(V, r, s, k):
 
     for chain in chains:
         L = len(chain)
-        # Solve with E[chain[0]] = 0 → propagate
-        vals = np.zeros(L, dtype=np.uint8)
-        for t in range(L):
-            ci, cj = chain[t]
-            ni, nj = chain[(t + 1) % L]
-            vals[(t + 1) % L] = vals[t] ^ V[ci, cj]
+        best_vals = None
 
-        # Check consistency: the cycle must close
-        if vals[0] != 0:
-            # Inconsistent cycle — this happens with noisy measurements
-            # Ignore this chain's contribution
-            continue
+        for start_bit in (0, 1):
+            vals = np.zeros(L, dtype=np.uint8)
+            vals[0] = start_bit
+            for t in range(L - 1):
+                ci, cj = chain[t]
+                vals[t + 1] = vals[t] ^ V[ci, cj]
 
-        # Find min-weight nullspace flip
-        wt0 = vals.sum()
-        wt1 = (L - vals.sum())  # flip: 1 - vals
-        if wt1 < wt0:
-            vals ^= 1  # flip entire chain
+            # Option 1: use vals as-is (may violate last equation)
+            # Option 2: flip the whole chain
+            wt0 = vals.sum()
+            wt1 = (L - wt0)
+            if wt0 <= wt1:
+                this_vals = vals.copy()
+            else:
+                this_vals = vals ^ 1
+
+            if best_vals is None or this_vals.sum() < best_vals.sum():
+                best_vals = this_vals.copy()
 
         for t, (ci, cj) in enumerate(chain):
-            E[ci, cj] = vals[t]
+            E[ci, cj] = best_vals[t]
 
     return E
 
