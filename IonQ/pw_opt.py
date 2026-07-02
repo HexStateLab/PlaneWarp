@@ -74,8 +74,8 @@ def build_circuit(r, s, rounds, logical_state="00", bell=False,
         n_extra = len(extra_flags)
 
     total = base + n_extra
-    assert total <= 36, f"Circuit needs {total} qubits, Forte has 36.  "
-    f"Reduce r,s or use share_extra_ancilla=True."
+    assert total <= 36, (f"Circuit needs {total} qubits, Forte has 36. "
+                         f"Reduce r,s or use share_extra_ancilla=True.")
 
     qec_rounds = rounds - 1 if free_final_round else rounds
     basis_seq = stabilizer_basis.upper()
@@ -157,6 +157,14 @@ def build_circuit(r, s, rounds, logical_state="00", bell=False,
                 qc.h(a)
         for slot, a in enumerate(anc_list):
             qc.measure(a, cr_syn[rnd][slot])
+
+    # Second joint-X parity measurement (coherence probe).
+    # NOTE: register "bell_m" was previously created but never measured — bug.
+    if bell_measure:
+        sup = [_dq(i, j) for (i, j) in _bell_support(r, s, periodic)]
+        _parity_measure(extra_idx["bell_m"], sup, extra_cr["bell_m"][0])
+        # If share_extra_ancilla=True the ancilla starts in |m1>, not |0>:
+        # XOR-correct the outcome with the first bell bit during analysis.
 
     # X-basis rotation
     if measure_x:
