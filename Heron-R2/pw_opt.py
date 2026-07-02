@@ -521,6 +521,31 @@ def detection_events(all_syn, stabilizer_basis, deterministic_first=('Z',)):
     return out
 
 
+def accumulated_syndromes(all_syn, stabilizer_basis,
+                           deterministic_first=('Z',)):
+    """Per-basis RAW accumulated-syndrome streams, decoder-ready.
+
+    The AND-vote / multi-pass decoders expect raw per-round S values, where
+    a persistent data error stays flipped in every later round — NOT
+    detection events. For a basis whose first round is a random gauge fix
+    (X-type after |0…0> prep), every round is re-referenced to the first
+    (S(t) ^ S(first)) and the reference round is dropped; for a
+    deterministic basis the raw stream is already the accumulated error.
+
+    Returns {basis: (round_indices, stream)}; a stream can be empty
+    (e.g. a single X sample carries no error information).
+    """
+    out = {}
+    for b, (idx, sub) in split_by_basis(all_syn, stabilizer_basis).items():
+        if b in deterministic_first:
+            out[b] = (idx, sub)
+        elif sub.shape[1] <= 1:
+            out[b] = (idx[1:], sub[:, 1:])
+        else:
+            out[b] = (idx[1:], sub[:, 1:] ^ sub[:, :1])
+    return out
+
+
 def check_consistency(all_syn, data_raw, r, s):
     """Diagnostic: compare final-round ancilla syndrome vs data-readout syndrome.
 
@@ -726,8 +751,188 @@ def _steiner_connect(G, free, terminals):
     return tree
 
 
+def _constructive_placement(G, r, s, coords, checks, anc_index, seed,
+                            max_anchors=120, max_paths=150):
+    """Greedy constructive placement of the QEC interaction graph.
+
+    The graph is a forest of 2s independent chains (per column: the even-row
+    and odd-row data qubits alternating with their check ancillas), which is
+    why generic subgraph search (VF2) is slow — nothing prunes. Instead:
+    pack the chains one by one in scanline order from a graph CORNER
+    (max-eccentricity vertex) — corner packing keeps the unused remainder
+    in one piece, unlike center packing which builds enclosing walls —
+    placing unconstrained chains first and support-carrying chains last,
+    facing the open region,
+    rejecting any placement that breaks the CONNECTIVITY INVARIANT:
+    every support qubit placed so far must keep a neighbor in the
+    LARGEST UNUSED component. All leaves are then placed inside that
+    component, so the strict (free-qubits-only) Steiner pass succeeds
+    by construction. Returns the `phys` list (pattern logical -> physical,
+    leaves appended after the QEC block) or None.
+    """
+    import random
+    rng = random.Random(seed)
+    n_data = r * s
+    support_set = set(map(tuple, coords))
+
+    # component specs: per (column, parity) chain, slots = d,a,d,a,...,d
+    comps = []
+    for j in range(s):
+        for par in (0, 1):
+            rr = list(range(par, r, 2))
+            slots = []
+            for t, i in enumerate(rr):
+                slots.append(("d", i, j))
+                if t < len(rr) - 1:
+                    slots.append(("a", i, j))
+            nsup = sum(1 for (k, i, jj) in slots
+                       if k == "d" and (i, jj) in support_set)
+            comps.append((slots, nsup))
+    comps.sort(key=lambda c: c[1])   # support chains LAST
+
+    # graph center (min eccentricity) for compact BFS packing
+    import collections
+    def bfs_dist(src):
+        d = {src: 0}
+        q = collections.deque([src])
+        while q:
+            v = q.popleft()
+            for w in G[v]:
+                if w not in d:
+                    d[w] = d[v] + 1
+                    q.append(w)
+        return d
+    ecc = {v: max(bfs_dist(v).values()) for v in G}
+    corner = max(G, key=lambda v: (ecc[v], rng.random()))
+    dist0 = bfs_dist(corner)
+    order = sorted(G, key=lambda v: (dist0[v], rng.random()))
+
+    used = set()
+    data_used = set()
+    assign = {}
+    placed_support = []
+
+    def unused_components(pset):
+        """Components of the unused region after tentatively using pset."""
+        blocked = used | pset
+        comp = {}
+        sizes = {}
+        cid = 0
+        for v in G:
+            if v in blocked or v in comp:
+                continue
+            cid += 1
+            comp[v] = cid
+            sizes[cid] = 1
+            stack = [v]
+            while stack:
+                u = stack.pop()
+                for w in G[u]:
+                    if w not in blocked and w not in comp:
+                        comp[w] = cid
+                        sizes[cid] += 1
+                        stack.append(w)
+        return comp, sizes
+
+    def main_ok(pset, path_supports):
+        """Invariant: every support qubit placed so far (including the
+        tentative chain's) must keep a neighbor in the LARGEST unused
+        component — that component hosts every leaf and the Steiner tree,
+        so the strict tree pass succeeds by construction."""
+        comp, sizes = unused_components(pset)
+        if not sizes:
+            return False
+        main = max(sizes, key=sizes.get)
+        for sp in placed_support + path_supports:
+            if not any(comp.get(w) == main for w in G[sp]):
+                return False
+        return True
+
+    for slots, nsup in comps:
+        L = len(slots)
+        done = False
+        conn_budget = 500
+        anchors = [v for v in order if v not in used][:max_anchors]
+
+        def leaf_possible(so, p, pset):
+            # cheap necessary condition: every support slot must keep an
+            # unused off-path neighbor (a straight chain middle can't)
+            for (kind, i, j), v in zip(so, p):
+                if kind == "d" and (i, j) in support_set:
+                    if not any(w not in used and w not in pset
+                               for w in G[v]):
+                        return False
+            for sp in placed_support:
+                nbs = [w for w in G[sp] if w not in used]
+                if not nbs or all(w in pset for w in nbs):
+                    return False
+            return True
+
+        for anchor in anchors:
+            tried = 0
+            stack = [(anchor, [anchor])]
+            while stack and not done and tried < max_paths:
+                u, p = stack.pop()
+                if len(p) == L:
+                    tried += 1
+                    pset = set(p)
+                    for so in (slots, slots[::-1]):
+                        psup = [v for (k, i, j), v in zip(so, p)
+                                if k == "d" and (i, j) in support_set]
+                        if not leaf_possible(so, p, pset):
+                            continue
+                        if conn_budget <= 0:
+                            continue
+                        conn_budget -= 1
+                        if not main_ok(pset, psup):
+                            continue
+                        for (kind, i, j), v in zip(so, p):
+                            if kind == "d":
+                                assign[i * s + j] = v
+                                data_used.add(v)
+                                if (i, j) in support_set:
+                                    placed_support.append(v)
+                            else:
+                                assign[anc_index[(i, j)]] = v
+                        used.update(p)
+                        done = True
+                        break
+                    continue
+                nbrs = [w for w in G[u] if w not in used and w not in p]
+                rng.shuffle(nbrs)
+                for w in nbrs:
+                    stack.append((w, p + [w]))
+            if done:
+                break
+        if not done:
+            return None
+
+    base = n_data + len(checks)
+    phys = [assign[q] for q in range(n_data)] + \
+           [assign[n_data + k] for k in range(len(checks))]
+    anc_set = set(phys[n_data:base])
+
+    # every leaf lives in the largest unused component (the invariant
+    # guarantees each support has a neighbor there) — the strict Steiner
+    # pass then succeeds by construction, no ancilla-sharing needed
+    comp, sizes = unused_components(set())
+    if not sizes:
+        return None
+    main = max(sizes, key=sizes.get)
+    for (i, j) in coords:
+        v = assign[i * s + j]
+        cands = [w for w in G[v] if comp.get(w) == main]
+        if not cands:
+            return None
+        phys.append(max(
+            cands,
+            key=lambda w: (sum(1 for x in G[w] if x not in used),
+                           rng.random())))
+    return phys
+
+
 def synthesize_parity_layout(backend, r, s, op="bell", periodic=True,
-                             vf2_time=180, seeds=(3, 1, 7, 42, 123),
+                             vf2_time=180, seeds=tuple(range(32)),
                              verbose=True):
     """Synthesize a zero-SWAP layout plan for the ancilla parity measurement.
 
@@ -739,11 +944,15 @@ def synthesize_parity_layout(backend, r, s, op="bell", periodic=True,
     read off the device itself: a cat state grown over a TREE that is a
     literal subgraph of the coupling map.
 
-    Method: (1) VF2-embed the QEC block plus one pendant 'leaf' qubit per
-    support data qubit (pendants add no cycles, so this pattern is
-    girth-safe); (2) connect the leaf positions through remaining free
-    physical qubits with a greedy Steiner tree; (3) return the tree
-    structure and the full initial_layout.
+    Method: (1) constructively place the QEC block — a forest of
+    independent chains, packed greedily in BFS order from the graph center
+    (milliseconds; generic VF2 search took minutes here because a floppy
+    forest gives it nothing to prune on) — while guaranteeing every support
+    data qubit keeps a free neighbor for its 'leaf'; (2) connect the leaves
+    through remaining free qubits with a greedy Steiner tree, falling back
+    to routing the tree through the check ancillas if the strict free
+    region is fragmented; (3) return the tree structure and the full
+    initial_layout.
 
     Usage:
         plan = synthesize_parity_layout(backend, 6, 8, op="bell",
@@ -765,13 +974,10 @@ def synthesize_parity_layout(backend, r, s, op="bell", periodic=True,
     embed on heavy hex at all — its layout is routed by the transpiler,
     and this plan does not apply there.
 
-    Returns the plan dict, or None if no embedding/tree was found (try more
-    seeds or a longer vf2_time).
+    Returns the plan dict, or None if no placement/tree was found (try
+    more seeds). vf2_time is kept for API compatibility and ignored.
     """
     import collections
-    from qiskit import QuantumCircuit
-    from qiskit.transpiler.passes import VF2Layout
-    from qiskit.converters import circuit_to_dag
 
     coords = (_ghz_support_coords(r, s) if op == "ghz"
               else _bell_support_coords(r, s, periodic))
@@ -782,36 +988,18 @@ def synthesize_parity_layout(backend, r, s, op="bell", periodic=True,
     base = n_data + n_anc
     n_sup = len(coords)
 
-    def row2(i):
-        return i + 2 if not periodic else (i + 2) % r
-
-    # interaction-graph pattern: QEC CX edges + one pendant leaf per support
-    patt = QuantumCircuit(base + n_sup)
-    for (i, j) in checks:
-        a = anc_index[(i, j)]
-        patt.cx(i * s + j, a)
-        patt.cx(row2(i) * s + j, a)
-    for k, (i, j) in enumerate(coords):
-        patt.cx(base + k, i * s + j)
-    dag = circuit_to_dag(patt)
-
     cm = backend.coupling_map if hasattr(backend, "coupling_map") else backend
     G = collections.defaultdict(set)
     for a, c in cm.get_edges():
         G[a].add(c)
         G[c].add(a)
 
+    best_plan = None
     for seed in seeds:
-        v = VF2Layout(coupling_map=cm, seed=seed, call_limit=None,
-                      max_trials=-1, time_limit=vf2_time)
-        v.run(dag)
-        lay = v.property_set.get("layout")
-        if lay is None:
-            if verbose:
-                print(f"  seed {seed}: no QEC+leaves embedding "
-                      f"({v.property_set.get('VF2Layout_stop_reason')})")
+        phys = _constructive_placement(G, r, s, coords, checks, anc_index,
+                                       seed)
+        if phys is None:
             continue
-        phys = [lay[patt.qubits[i]] for i in range(patt.num_qubits)]
         leaves = phys[base:]
         data_phys = set(phys[:n_data])
         anc_phys = set(phys[n_data:base])
@@ -832,6 +1020,18 @@ def synthesize_parity_layout(backend, r, s, op="bell", periodic=True,
                 print(f"  seed {seed}: embedding found but leaves not "
                       f"connectable even through check ancillas; retrying")
             continue
+
+        # prune: iteratively drop non-terminal vertices with tree-degree 1
+        term = set(leaves)
+        changed = True
+        while changed:
+            changed = False
+            for v in list(tree_set):
+                if v in term:
+                    continue
+                if sum(1 for w in G[v] if w in tree_set) <= 1:
+                    tree_set.discard(v)
+                    changed = True
 
         tnodes = sorted(tree_set)
         tidx = {p: t for t, p in enumerate(tnodes)}
@@ -879,14 +1079,17 @@ def synthesize_parity_layout(backend, r, s, op="bell", periodic=True,
             "n_qubits": base + len(fresh),
             "seed": seed,
         }
-        if verbose:
-            n_cx = 2 * (len(tnodes) - 1) + n_sup
-            print(f"  seed {seed}: plan found — tree of {len(tnodes)} qubits "
-                  f"({sum(plan['node_is_anc'])} shared with check ancillas), "
-                  f"depth {ecc}, gadget CX = {n_cx} (all nearest-neighbor), "
-                  f"total {plan['n_qubits']} qubits")
-        return plan
-    return None
+        if best_plan is None or len(tnodes) < len(best_plan["tree_nodes"]):
+            best_plan = plan
+    if best_plan is not None and verbose:
+        tn = best_plan["tree_nodes"]
+        n_cx = 2 * (len(tn) - 1) + n_sup
+        print(f"  best of {len(seeds)} seeds (seed {best_plan['seed']}): "
+              f"tree of {len(tn)} qubits "
+              f"({sum(best_plan['node_is_anc'])} shared with check "
+              f"ancillas), gadget CX = {n_cx} (all nearest-neighbor), "
+              f"total {best_plan['n_qubits']} qubits")
+    return best_plan
 
 
 def verify_tree_parity():
