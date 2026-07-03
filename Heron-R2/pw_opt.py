@@ -365,6 +365,17 @@ def build_circuit(r, s, rounds, logical_state="00", bell=False, bell_measure=Fal
                 for jj in range(s):
                     qc.x(_dq(ii, jj))
 
+    # Pauli-frame fix: the inter-round DD applies (qec_rounds-1) X's per data
+    # qubit. When that count is odd the physical frame is globally flipped
+    # and the final data readout (and both logicals) comes back inverted —
+    # all_syndromes_opt does not frame-track. Emit one compensating X layer
+    # so the total is always even; syndromes are unaffected either way
+    # (paired flips cancel inside every Z⊗Z / X⊗X check).
+    if dd and qec_rounds >= 2 and (qec_rounds - 1) % 2 == 1:
+        for ii in range(r):
+            for jj in range(s):
+                qc.x(_dq(ii, jj))
+
     _after_rounds[0] = True
 
     # Bell creation after QEC (fresh Bell state from QEC-cleaned |00⟩)
@@ -713,6 +724,121 @@ def verify_pipeline(no_reset=False):
     print("✓ Pipeline verified")
 
 
+def schedule_with_dd(qc_transpiled, backend, sequence="XX", skip_qubits=()):
+    """Timing-aware dynamical decoupling on a *transpiled* circuit.
+
+    Why this beats dd=True: on Heron R2 the readout takes ~1.56 us while a CZ
+    takes ~84 ns, so >85% of each round's wall time is the ancilla measurement
+    window during which every data qubit idles. Over 8 rounds that is ~12.5 us
+    of idle against a median T2 of ~88 us. The instruction-level dd=True flag
+    inserts one X per round wherever the scheduler happens to put it; this
+    helper instead schedules the circuit (ASAP) and pads every real delay
+    window with a symmetric, frame-neutral X-X (or XY4) echo centered in the
+    idle — the textbook placement that actually refocuses low-frequency
+    dephasing during readout. Use INSTEAD of dd=True (leave dd=False), after
+    transpilation:
+
+        qc_t = pm.run(qc)
+        qc_dd = schedule_with_dd(qc_t, backend)
+
+    sequence: 'XX' (2 X gates, frame neutral, cheapest) or 'XY4'.
+    skip_qubits: physical qubits to leave unpadded (rarely needed).
+    Falls back to returning the input unchanged if the target lacks timing.
+    """
+    from qiskit.transpiler import PassManager
+    from qiskit.transpiler.passes import (ALAPScheduleAnalysis,
+                                          PadDynamicalDecoupling)
+    from qiskit.circuit.library import XGate, YGate
+
+    target = backend.target
+    if sequence.upper() == "XY4":
+        dd_seq = [XGate(), YGate(), XGate(), YGate()]
+    else:
+        dd_seq = [XGate(), XGate()]
+    try:
+        pm = PassManager([
+            ALAPScheduleAnalysis(target=target),
+            PadDynamicalDecoupling(dd_sequence=dd_seq, target=target,
+                                   skip_reset_qubits=True,
+                                   qubits=None if not skip_qubits else [
+                                       q for q in range(target.num_qubits)
+                                       if q not in set(skip_qubits)]),
+        ])
+        return pm.run(qc_transpiled)
+    except Exception as e:  # no timing info (e.g. plain Aer)
+        print(f"  schedule_with_dd: skipped ({type(e).__name__}: {e})")
+        return qc_transpiled
+
+
+def _target_error_maps(backend):
+    """(edge -> 2q error, qubit -> readout error) from the backend target."""
+    t = backend.target
+    cz_err, ro_err = {}, {}
+    for name in ("cz", "ecr", "cx"):
+        if name in t.operation_names:
+            for qargs, props in t[name].items():
+                e = getattr(props, "error", None)
+                if e is not None:
+                    cz_err[frozenset(qargs)] = e
+            break
+    if "measure" in t.operation_names:
+        for qargs, props in t["measure"].items():
+            e = getattr(props, "error", None)
+            if e is not None:
+                ro_err[qargs[0]] = e
+    return cz_err, ro_err
+
+
+def estimate_success(qc_transpiled, backend):
+    """Crude product-fidelity estimate of a transpiled circuit: multiplies
+    (1 - error) over every 2q gate and measurement using target calibration.
+    Good enough as a *ranking* metric between candidate layouts/seeds."""
+    import math
+    cz_err, ro_err = _target_error_maps(backend)
+
+    def _c(e):
+        return min(max(e, 0.0), 0.999) if e == e else 0.999
+    log_f = 0.0
+    for inst in qc_transpiled.data:
+        n = inst.operation.name
+        if n in ("cz", "ecr", "cx"):
+            q = frozenset(qc_transpiled.find_bit(x).index for x in inst.qubits)
+            log_f += math.log1p(-_c(cz_err.get(q, 0.0)))
+        elif n == "measure":
+            q = qc_transpiled.find_bit(inst.qubits[0]).index
+            log_f += math.log1p(-_c(ro_err.get(q, 0.0)))
+    return math.exp(log_f)
+
+
+def pick_best_transpilation(qc, backend, seeds=tuple(range(8)),
+                            optimization_level=3, initial_layout=None,
+                            verbose=True):
+    """Transpile with several seeds and keep the layout with the best
+    calibration-estimated success probability.
+
+    O3's VF2 layout is noise-aware but stops at the first 'good enough'
+    embedding for a given seed; on a 156q Heron there are many disjoint
+    places the 80q block can sit and their aggregate CZ/readout error can
+    differ by several percent in product fidelity. Costs only transpile time.
+    Returns (best_circuit, best_score).
+    """
+    from qiskit.transpiler.preset_passmanagers import \
+        generate_preset_pass_manager
+    best = (None, -1.0, None)
+    for sd in seeds:
+        pm = generate_preset_pass_manager(
+            backend=backend, optimization_level=optimization_level,
+            seed_transpiler=sd, initial_layout=initial_layout)
+        t = pm.run(qc)
+        sc = estimate_success(t, backend)
+        if sc > best[1]:
+            best = (t, sc, sd)
+    if verbose:
+        print(f"  pick_best_transpilation: seed {best[2]} "
+              f"est. success {best[1]:.4f}")
+    return best[0], best[1]
+
+
 def _steiner_connect(G, free, terminals):
     """Greedy Steiner: connect `terminals` through vertices in `free`.
 
@@ -931,8 +1057,43 @@ def _constructive_placement(G, r, s, coords, checks, anc_index, seed,
     return phys
 
 
+def _score_plan(plan, phys, G_unused, backend, r, s, checks, rounds_weight=8):
+    """Calibration-aware log-fidelity score for a candidate placement.
+
+    QEC chain edges and ancilla readouts recur every round (weighted by
+    rounds_weight); tree edges, leaf couplings and the root readout count
+    once. Higher is better. Returns 0.0 if the target has no calibration."""
+    import math
+    cz_err, ro_err = _target_error_maps(backend)
+    if not cz_err and not ro_err:
+        return 0.0
+
+    def _c(e):  # clamp faulty-edge/NaN calibration (error=1) to a finite penalty
+        return min(max(e, 0.0), 0.999) if e == e else 0.999
+    n_data = r * s
+    score = 0.0
+    for k, (i, j) in enumerate(checks):
+        a = phys[n_data + k]
+        d0 = phys[i * s + j]
+        d1 = phys[((i + 2) % r) * s + j]
+        for e in (frozenset((d0, a)), frozenset((a, d1))):
+            score += rounds_weight * math.log1p(-_c(cz_err.get(e, 0.0)))
+        score += rounds_weight * math.log1p(-_c(ro_err.get(a, 0.0)))
+    tn = plan["tree_nodes"]
+    for t, p in enumerate(plan["tree_parent"]):
+        if p >= 0:
+            score += 2 * math.log1p(-_c(cz_err.get(frozenset((tn[t], tn[p])), 0.0)))
+    for k, leaf_t in enumerate(plan["leaf_of"]):
+        i, j = plan["support"][k]
+        e = frozenset((tn[leaf_t], phys[i * s + j]))
+        score += math.log1p(-_c(cz_err.get(e, 0.0)))
+    score += math.log1p(-_c(ro_err.get(tn[plan["bfs_order"][0]], 0.0)))
+    return score
+
+
 def synthesize_parity_layout(backend, r, s, op="bell", periodic=True,
                              vf2_time=180, seeds=tuple(range(32)),
+                             noise_aware=True, rounds_weight=8,
                              verbose=True):
     """Synthesize a zero-SWAP layout plan for the ancilla parity measurement.
 
@@ -1079,7 +1240,13 @@ def synthesize_parity_layout(backend, r, s, op="bell", periodic=True,
             "n_qubits": base + len(fresh),
             "seed": seed,
         }
-        if best_plan is None or len(tnodes) < len(best_plan["tree_nodes"]):
+        if noise_aware:
+            plan["score"] = _score_plan(plan, phys, G, backend, r, s,
+                                        checks, rounds_weight)
+            if best_plan is None or plan["score"] > best_plan.get(
+                    "score", float("-inf")):
+                best_plan = plan
+        elif best_plan is None or len(tnodes) < len(best_plan["tree_nodes"]):
             best_plan = plan
     if best_plan is not None and verbose:
         tn = best_plan["tree_nodes"]
@@ -1088,7 +1255,9 @@ def synthesize_parity_layout(backend, r, s, op="bell", periodic=True,
               f"tree of {len(tn)} qubits "
               f"({sum(best_plan['node_is_anc'])} shared with check "
               f"ancillas), gadget CX = {n_cx} (all nearest-neighbor), "
-              f"total {best_plan['n_qubits']} qubits")
+              f"total {best_plan['n_qubits']} qubits"
+              + (f", est. log-fid score {best_plan['score']:.3f}"
+                 if "score" in best_plan else ""))
     return best_plan
 
 
