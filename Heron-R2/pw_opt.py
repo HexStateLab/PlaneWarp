@@ -996,7 +996,8 @@ def _steiner_connect(G, free, terminals):
 
 
 def _constructive_placement(G, r, s, coords, checks, anc_index, seed,
-                            max_anchors=120, max_paths=150):
+                            max_anchors=120, max_paths=150,
+                            keep_anc_access=False):
     """Greedy constructive placement of the QEC interaction graph.
 
     The graph is a forest of 2s independent chains (per column: the even-row
@@ -1030,7 +1031,8 @@ def _constructive_placement(G, r, s, coords, checks, anc_index, seed,
                 if t < len(rr) - 1:
                     slots.append(("a", i, j))
             nsup = sum(1 for (k, i, jj) in slots
-                       if k == "d" and (i, jj) in support_set)
+                       if (k == "d" and (i, jj) in support_set)
+                       or (k == "a" and keep_anc_access))
             comps.append((slots, nsup))
     comps.sort(key=lambda c: c[1])   # support chains LAST
 
@@ -1098,11 +1100,15 @@ def _constructive_placement(G, r, s, coords, checks, anc_index, seed,
         conn_budget = 500
         anchors = [v for v in order if v not in used][:max_anchors]
 
+        def _needs_access(kind, i, j):
+            return ((kind == "d" and (i, j) in support_set)
+                    or (kind == "a" and keep_anc_access))
+
         def leaf_possible(so, p, pset):
-            # cheap necessary condition: every support slot must keep an
-            # unused off-path neighbor (a straight chain middle can't)
+            # cheap necessary condition: every access-requiring slot must
+            # keep an unused off-path neighbor (a straight chain middle can't)
             for (kind, i, j), v in zip(so, p):
-                if kind == "d" and (i, j) in support_set:
+                if _needs_access(kind, i, j):
                     if not any(w not in used and w not in pset
                                for w in G[v]):
                         return False
@@ -1122,7 +1128,7 @@ def _constructive_placement(G, r, s, coords, checks, anc_index, seed,
                     pset = set(p)
                     for so in (slots, slots[::-1]):
                         psup = [v for (k, i, j), v in zip(so, p)
-                                if k == "d" and (i, j) in support_set]
+                                if _needs_access(k, i, j)]
                         if not leaf_possible(so, p, pset):
                             continue
                         if conn_budget <= 0:
@@ -1138,6 +1144,8 @@ def _constructive_placement(G, r, s, coords, checks, anc_index, seed,
                                     placed_support.append(v)
                             else:
                                 assign[anc_index[(i, j)]] = v
+                                if keep_anc_access:
+                                    placed_support.append(v)
                         used.update(p)
                         done = True
                         break
@@ -1450,37 +1458,141 @@ def synthesize_paired_layout(backend, r, s, seeds=tuple(range(24)),
                 q.append(w)
         return None
 
+    def _heavyhex_sites():
+        """Vertical 5-chain sites: spacer v between two degree-3 row vertices
+        u, w, each of which keeps >=2 row neighbors (one becomes chain data,
+        one stays free as the ancilla's rung port)."""
+        deg = {x: len(G[x]) for x in G}
+        sites = []
+        for v in sorted(G):
+            if deg[v] != 2:
+                continue
+            u, w = sorted(G[v])
+            if deg[u] == 3 and deg[w] == 3 and u not in G[w] \
+                    and len(G[u] - {v}) >= 2 and len(G[w] - {v}) >= 2:
+                sites.append((u, v, w))
+        return sites
+
+    def _heavyhex_placement(seed):
+        """Place each (column, row-parity) chain as u-v-w vertically:
+        a0 = u (deg-3), d2 = v (spacer), a2 = w (deg-3), d0/d4 = one row
+        neighbor of u/w, the other row neighbor reserved free for the rung
+        cascades. Chains of the same rung cycle are assigned to physically
+        consecutive sites (IBM indices are row-major) so rung paths are
+        short. Returns phys list or None.  r=6 only (5‑qubit chains)."""
+        assert r == 6, "heavyhex_placement currently only supports r=6"
+        import random
+        rng = random.Random(seed)
+        sites = _heavyhex_sites()
+        if len(sites) < 2 * s:
+            return None
+        if seed:
+            k = rng.randrange(len(sites))
+            sites = sites[k:] + sites[:k]     # rotate the site pool per seed
+        # rung cycles: fixed (px, py); columns j = py, py+2, ... same parity
+        cycles = [[(py + 2 * t, px) for t in range(s // 2)]
+                  for px in range(2) for py in range(2)]
+        assign, usedq = {}, set()
+        si = 0
+        for cyc in cycles:
+            for (j, px) in cyc:
+                placed = False
+                while si < len(sites) and not placed:
+                    u, v, w = sites[si]
+                    si += 1
+                    if {u, v, w} & usedq:
+                        continue
+                    du = [x for x in G[u] - {v} if x not in usedq]
+                    dw = [x for x in G[w] - {v} if x not in usedq]
+                    if len(du) < 2 or len(dw) < 2:
+                        continue
+                    d0, d4 = du[0], dw[0]     # du[1]/dw[1] stay free ports
+                    assign[(px) * s + j] = d0
+                    assign[anc_index[(px, j)]] = u
+                    assign[(px + 2) * s + j] = v
+                    assign[anc_index[(px + 2, j)]] = w
+                    assign[(px + 4) * s + j] = d4
+                    usedq.update((d0, u, v, w, d4))
+                    placed = True
+                if not placed:
+                    return None
+        # every ancilla must still have a free neighbor (ports can collide
+        # with a later chain's data pick — verify globally)
+        for c in checks:
+            if not any(x not in usedq for x in G[assign[anc_index[c]]]):
+                return None
+        return [assign[q] for q in range(n_data)] + \
+               [assign[n_data + k] for k in range(n_anc)]
+
+    def weighted_path(pa, pb, used, load):
+        """Dijkstra pa->pb through free vertices; reusing a vertex already
+        serving other bridges is allowed (each cascade uncomputes it to |0>
+        and program order serializes the overlap) but penalized so parallel
+        depth stays low. Returns the interior vertex list or None."""
+        import heapq
+        if pb in G[pa]:
+            return []
+        dist = {pa: 0.0}
+        par = {}
+        h = [(0.0, pa)]
+        while h:
+            d, v = heapq.heappop(h)
+            if d > dist.get(v, float("inf")):
+                continue
+            for w in G[v]:
+                if w == pb:
+                    path = []
+                    while v != pa:
+                        path.append(v)
+                        v = par[v]
+                    return path[::-1]
+                if w in used:
+                    continue
+                nd = d + 1.0 + 3.0 * load.get(w, 0)
+                if nd < dist.get(w, float("inf")):
+                    dist[w] = nd
+                    par[w] = v
+                    heapq.heappush(h, (nd, w))
+        return None
+
     best = None
     for seed in seeds:
-        phys = _constructive_placement(G, r, s, [], checks, anc_index, seed)
+        # Prefer the heavy-hex-native vertical-chain placer when r==6
+        # (ancillas sit on degree‑3 vertices, spacers on degree‑2).
+        # Falls back to generic constructive placement for other sizes
+        # or if the graph is not heavy‑hex.
+        phys = _heavyhex_placement(seed) if r == 6 else None
+        if phys is None:
+            # keep_anc_access guarantees every check ancilla borders the main
+            # free component, so a free rung path always exists
+            phys = _constructive_placement(G, r, s, [], checks, anc_index,
+                                           seed, keep_anc_access=True)
         if phys is None:
             continue
         used = set(phys)
         bridges_by_slot = {}
+        load = {}   # per-phase reuse counter for the depth penalty
         ok = True
         for ph in (0, 1):
-            claimed = set()
-            remaining = [(k, c) for k, c in enumerate(checks)
-                         if (c[1] // 2) % 2 == ph]
-            # greedy shortest-first with re-evaluation after each claim
-            while remaining and ok:
-                cand = None
-                for k, (i, j) in remaining:
-                    pa = phys[anc_index[(i, (j + 2) % s)]]
-                    pb = phys[anc_index[(i, j)]]
-                    p = free_path(pa, pb, used | claimed)
-                    if p is not None and (cand is None or len(p) < len(cand[2])):
-                        cand = (k, (i, j), p)
-                if cand is None:
+            load.clear()
+            rungs = sorted(((k, c) for k, c in enumerate(checks)
+                            if (c[1] // 2) % 2 == ph),
+                           key=lambda kc: kc[0])
+            for k, (i, j) in rungs:
+                pa = phys[anc_index[(i, (j + 2) % s)]]
+                pb = phys[anc_index[(i, j)]]
+                p = weighted_path(pa, pb, used, load)
+                if p is None:
                     ok = False
                     break
-                k, _, p = cand
                 bridges_by_slot[k] = p
-                claimed.update(p)
-                remaining = [rc for rc in remaining if rc[0] != k]
+                for v in p:
+                    load[v] = load.get(v, 0) + 1
+            if not ok:
+                break
         if not ok:
             if verbose:
-                print(f"  seed {seed}: no disjoint rung paths; retrying")
+                print(f"  seed {seed}: some rung not reachable; retrying")
             continue
 
         bridge_phys = sorted({p for br in bridges_by_slot.values() for p in br})
