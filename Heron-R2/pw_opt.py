@@ -69,7 +69,7 @@ def _ghz_support_coords(r, s):
     return [(r - 1, j) for j in range(s - 1)] + [(i, s - 1) for i in range(r - 1)]
 
 
-def build_circuit(r, s, rounds, logical_state="00", bell=False, bell_measure=False, measure_x=False, partial_x=False, stabilizer_basis='Z', no_reset=True, ghz=False, ghz_measure=False, free_final_round=False, bell_after_qec=False, full_stabilizer=False, dd=False, periodic=True, compact=True, initial_reset=False, share_extra_ancilla=False, bell_ancilla=True, parity_tree=None):
+def build_circuit(r, s, rounds, logical_state="00", bell=False, bell_measure=False, measure_x=False, partial_x=False, stabilizer_basis='Z', no_reset=True, ghz=False, ghz_measure=False, free_final_round=False, bell_after_qec=False, full_stabilizer=False, dd=False, periodic=True, compact=True, initial_reset=False, share_extra_ancilla=False, bell_ancilla=True, parity_tree=None, rung_plan=None):
     """Build optimized share-pair QEC circuit.
 
     periodic=True: periodic vertical boundary conditions — V(i,j) wraps
@@ -176,6 +176,15 @@ def build_circuit(r, s, rounds, logical_state="00", bell=False, bell_measure=Fal
         def _aq(i, j):
             return anc_maps[(i, j, 0)]
         base = n_data + 2 * r * s
+
+    if rung_plan is not None:
+        assert full_stabilizer == "paired", \
+            "rung_plan only applies to full_stabilizer='paired'"
+        assert compact, "rung_plan requires compact=True (dense indices)"
+        assert parity_tree is None, \
+            "combining rung_plan with parity_tree is not supported yet"
+        _bridge_base = base
+        base = base + rung_plan["n_fresh"]   # extras go after the bridges
 
     if parity_tree is not None and extra_flags:
         assert compact, ("parity_tree requires compact=True: logical indices "
@@ -330,35 +339,130 @@ def build_circuit(r, s, rounds, logical_state="00", bell=False, bell_measure=Fal
         return i + 2 if not periodic else (i + 2) % r
 
     anc_list = [_aq(i, j) for (i, j) in checks]
+    paired = (full_stabilizer == "paired")
+    if paired:
+        assert s % 4 == 0, ("paired full_stabilizer needs s % 4 == 0: the "
+                            "column cycle must 2-color so every ancilla is "
+                            "primary in one phase and helper in the other")
+        assert no_reset, ("paired mode's software correction assumes the "
+                          "no_reset accumulation semantics")
+        assert periodic, "paired mode implemented for periodic boundaries"
+        _slot = {c: k for k, c in enumerate(checks)}
+        _kpar = lambda j: (j // 2) % 2
+        _phase_anchors = {ph: [c for c in checks if _kpar(c[1]) == ph]
+                          for ph in (0, 1)}
     # Direction-major CX schedule: each offset layer touches every data qubit
     # and every ancilla at most once, so the round is exactly len(offsets)
     # CX layers deep. All CXs in a round pairwise commute (data qubits only
     # ever on the control side in Z basis / target side in X basis), so the
     # unitary matches the original per-ancilla emission order.
-    offsets = ([(0, 0), (2, 0), (0, 2), (2, 2)] if full_stabilizer
+    offsets = ([(0, 0), (2, 0), (0, 2), (2, 2)]
+               if (full_stabilizer and not paired)
                else [(0, 0), (2, 0)])
+
+    def _load(anchor, rb, invert=False):
+        """CX pair coupling the weight-2 V at `anchor` onto its own ancilla."""
+        (i, j) = anchor
+        a = _aq(i, j)
+        for di in (0, 2):
+            d = _dq(row2(i) if di else i, j)
+            if rb == 'X':
+                qc.cx(a, d)
+            else:
+                qc.cx(d, a)
+
+    def _paired_round(rnd, rb):
+        """Weight-4 S = V(i,j)·V(i,j+2) via coherent helper fan-in.
+
+        Per phase: primaries load their own V (2 CX), their helpers (the
+        (j+2) ancillas, always opposite phase) load V(i,j+2) (2 CX), one
+        fan CX merges the helper's full state into the primary, the helper
+        unloads (2 CX, exact classical uncompute — no commutation needed),
+        and only the primary is measured.  The helper's prior content leaks
+        into the fan but is a *measured* bit, removed in software by
+        all_syndromes_opt(full_stabilizer="paired"):
+            S_a(t) = m_a(t) ^ m_a(t-1) ^ m_h(t-1)   [phase-0 primaries]
+            S_a(t) = m_a(t) ^ m_a(t-1) ^ m_h(t)     [phase-1 primaries]
+        Individual V values are never exposed to measurement, so the
+        weight-2 gauge is never collapsed — safe for alternating-basis
+        Bell-state protection.  7 logical CX per S, max interaction degree
+        3 vs the degree-4 star of the legacy mode.
+        """
+        if rb == 'X':
+            for a in anc_list:
+                qc.h(a)
+        for ph in (0, 1):
+            prim = _phase_anchors[ph]
+            helpers = [(i, (j + 2) % s) for (i, j) in prim]
+            for anc in prim:
+                _load(anc, rb)
+            for h in helpers:
+                _load(h, rb)
+            for (i, j), (hi, hj) in zip(prim, helpers):
+                A, H = _aq(i, j), _aq(hi, hj)
+                br = ([] if rung_plan is None
+                      else [_bridge_base + t
+                            for t in rung_plan["bridges"][str(_slot[(i, j)])]])
+                if not br:
+                    qc.cx(A, H) if rb == 'X' else qc.cx(H, A)
+                    continue
+                # NN parity cascade H -> t1 -> ... -> tb -> A; bridges start
+                # and end in |0>, exact uncompute, so cross-phase reuse and
+                # both-basis operation are safe.  In the X frame the sign
+                # flows target->control, so every CX direction flips and the
+                # bridges are framed with H into |+> (sign 0) and back.
+                chain = [H] + br + [A]
+                if rb == 'X':
+                    for t in br:
+                        qc.h(t)
+                    for k in range(len(chain) - 1):
+                        qc.cx(chain[k + 1], chain[k])
+                    for k in range(len(chain) - 3, -1, -1):
+                        qc.cx(chain[k + 1], chain[k])
+                    for t in br:
+                        qc.h(t)
+                else:
+                    for k in range(len(chain) - 1):
+                        qc.cx(chain[k], chain[k + 1])
+                    for k in range(len(chain) - 3, -1, -1):
+                        qc.cx(chain[k], chain[k + 1])
+            for h in helpers:
+                _load(h, rb)          # exact uncompute of the helper load
+            for anc in prim:
+                a = _aq(*anc)
+                if rb == 'X':
+                    qc.h(a)
+                qc.measure(a, cr_syn[rnd][_slot[anc]])
+                if rb == 'X' and ph == 0:
+                    qc.h(a)           # reopen frame: helper duty in phase 1
+        if rb == 'X':
+            for anc in _phase_anchors[0]:
+                qc.h(_aq(*anc))       # close phase-0 frames
 
     for rnd in range(qec_rounds):
         rb = basis_seq[rnd % len(basis_seq)]
         if (rnd == 0 and initial_reset) or (rnd > 0 and not no_reset):
             for a in anc_list:
                 qc.reset(a)
-        if rb == 'X':
-            for a in anc_list:
-                qc.h(a)
-        for (di, dj) in offsets:
-            for (i, j), a in zip(checks, anc_list):
-                ti = row2(i) if di else i
-                tj = (j + dj) % s
-                if rb == 'X':
-                    qc.cx(a, _dq(ti, tj))
-                else:
-                    qc.cx(_dq(ti, tj), a)
-        if rb == 'X':
-            for a in anc_list:
-                qc.h(a)
-        for slot, a in enumerate(anc_list):
-            qc.measure(a, cr_syn[rnd][slot])
+        if paired:
+            _paired_round(rnd, rb)
+        else:
+            if rb == 'X':
+                for a in anc_list:
+                    qc.h(a)
+            for (di, dj) in offsets:
+                for (i, j), a in zip(checks, anc_list):
+                    ti = row2(i) if di else i
+                    tj = (j + dj) % s
+                    if rb == 'X':
+                        qc.cx(a, _dq(ti, tj))
+                    else:
+                        qc.cx(_dq(ti, tj), a)
+            if rb == 'X':
+                for a in anc_list:
+                    qc.h(a)
+            for slot, a in enumerate(anc_list):
+                qc.measure(a, cr_syn[rnd][slot])
         # Dynamic decoupling: X gates on all idle data qubits between rounds
         if dd and rnd < qec_rounds - 1:
             for ii in range(r):
@@ -457,7 +561,21 @@ def all_syndromes_opt(pub_result, rounds, r, s, n_anc, no_reset=True, free_final
             bits = getattr(pub_result.data, f"syn_{c}").to_bool_array(order='little')
             m_raw[:, c] = bits[:, :n_anc].astype(np.uint8)
 
-        if no_reset:
+        if full_stabilizer == "paired":
+            # S_a(t) = m_a(t) ^ m_a(t-1) ^ m_h(t - [phase==0]) with m(-1)=0:
+            # differencing removes the primary's accumulation, and the raw
+            # helper measurement removes the helper-state leak of the fan CX.
+            anchors = _check_anchors(r, s)
+            slot = {c: k for k, c in enumerate(anchors)}
+            hidx = np.array([slot[(i, (j + 2) % s)] for (i, j) in anchors])
+            kap = np.array([(j // 2) % 2 for (_, j) in anchors])
+            m_parity = m_raw.copy()
+            m_parity[:, 1:] ^= m_raw[:, :-1]
+            i0 = np.where(kap == 0)[0]
+            i1 = np.where(kap == 1)[0]
+            m_parity[:, 1:, i0] ^= m_raw[:, :-1][:, :, hidx[i0]]
+            m_parity[:, :, i1] ^= m_raw[:, :, hidx[i1]]
+        elif no_reset:
             m_parity = m_raw.copy()
             m_parity[:, 1:] ^= m_raw[:, :-1]
         else:
@@ -1259,6 +1377,151 @@ def synthesize_parity_layout(backend, r, s, op="bell", periodic=True,
               + (f", est. log-fid score {best_plan['score']:.3f}"
                  if "score" in best_plan else ""))
     return best_plan
+
+
+def synthesize_paired_layout(backend, r, s, seeds=tuple(range(24)),
+                             n_extra=0, rounds_weight=8, noise_aware=True,
+                             verbose=True):
+    """Zero-SWAP layout plan for full_stabilizer='paired' extraction.
+
+    Why: the legacy weight-4 star cannot embed on degree-3 heavy hex, so the
+    transpiler routes it (~6x 2q overhead, SWAPs on data). The paired scheme
+    reduces the interaction graph to the embeddable weight-2 chain skeleton
+    plus one 'rung' per S check between the two ancillas whose V's compose
+    it. This synthesizer (1) places the chains with _constructive_placement,
+    (2) for each of the two fan phases finds vertex-disjoint paths through
+    FREE device qubits connecting every rung's ancilla pair (bridges may be
+    reused across phases — the cascade uncomputes them to |0>), and
+    (3) returns bridges + initial_layout so the whole circuit maps with zero
+    SWAPs and every 2q gate nearest-neighbor.
+
+    Usage:
+        plan = synthesize_paired_layout(backend, 6, 8, n_extra=1)
+        qc, ... = build_circuit(6, 8, rounds, full_stabilizer="paired",
+                                rung_plan=plan, ...)
+        pm = generate_preset_pass_manager(backend=backend,
+            optimization_level=3, initial_layout=plan["initial_layout"])
+
+    n_extra reserves free qubits at the end of the layout for the bell/ghz
+    gadget ancillas (the star gadget itself still routes; use the parity
+    tree for gadget-heavy runs). Returns None if no seed yields a complete
+    disjoint-path assignment.
+    """
+    import collections
+    import math
+    assert s % 4 == 0, "paired mode needs s % 4 == 0"
+    n_data, hr, hs = r * s, r // 2, s // 2
+    n_anc = 4 * (hr - 1) * hs
+    checks = _check_anchors(r, s)
+    anc_index = {c: n_data + k for k, c in enumerate(checks)}
+    base = n_data + n_anc
+
+    cm = backend.coupling_map if hasattr(backend, "coupling_map") else backend
+    G = collections.defaultdict(set)
+    for a, c in cm.get_edges():
+        G[a].add(c)
+        G[c].add(a)
+    cz_err, ro_err = _target_error_maps(backend)
+
+    def _c(e):
+        return min(max(e, 0.0), 0.999) if e == e else 0.999
+
+    def free_path(pa, pb, blocked):
+        """Shortest path pa->pb whose interior avoids `blocked`; returns the
+        interior vertex list ([] if adjacent) or None."""
+        if pb in G[pa]:
+            return []
+        par = {pa: None}
+        q = collections.deque([pa])
+        while q:
+            v = q.popleft()
+            for w in G[v]:
+                if w in par:
+                    continue
+                if w == pb:
+                    path = []
+                    while v != pa:
+                        path.append(v)
+                        v = par[v]
+                    return path[::-1]
+                if w in blocked:
+                    continue
+                par[w] = v
+                q.append(w)
+        return None
+
+    best = None
+    for seed in seeds:
+        phys = _constructive_placement(G, r, s, [], checks, anc_index, seed)
+        if phys is None:
+            continue
+        used = set(phys)
+        bridges_by_slot = {}
+        ok = True
+        for ph in (0, 1):
+            claimed = set()
+            remaining = [(k, c) for k, c in enumerate(checks)
+                         if (c[1] // 2) % 2 == ph]
+            # greedy shortest-first with re-evaluation after each claim
+            while remaining and ok:
+                cand = None
+                for k, (i, j) in remaining:
+                    pa = phys[anc_index[(i, (j + 2) % s)]]
+                    pb = phys[anc_index[(i, j)]]
+                    p = free_path(pa, pb, used | claimed)
+                    if p is not None and (cand is None or len(p) < len(cand[2])):
+                        cand = (k, (i, j), p)
+                if cand is None:
+                    ok = False
+                    break
+                k, _, p = cand
+                bridges_by_slot[k] = p
+                claimed.update(p)
+                remaining = [rc for rc in remaining if rc[0] != k]
+        if not ok:
+            if verbose:
+                print(f"  seed {seed}: no disjoint rung paths; retrying")
+            continue
+
+        bridge_phys = sorted({p for br in bridges_by_slot.values() for p in br})
+        pidx = {p: t for t, p in enumerate(bridge_phys)}
+        total_cx_round = 6 * n_anc + sum(
+            2 * len(br) + 1 for br in bridges_by_slot.values())
+        if noise_aware and (cz_err or ro_err):
+            score = 0.0
+            for k, (i, j) in enumerate(checks):
+                a = phys[anc_index[(i, j)]]
+                d0, d1 = phys[i * s + j], phys[((i + 2) % r) * s + j]
+                for e in (frozenset((d0, a)), frozenset((a, d1))):
+                    score += 3 * rounds_weight * math.log1p(-_c(cz_err.get(e, 0.0)))
+                score += rounds_weight * math.log1p(-_c(ro_err.get(a, 0.0)))
+                chain = ([phys[anc_index[(i, (j + 2) % s)]]]
+                         + bridges_by_slot[k] + [a])
+                for u, v in zip(chain, chain[1:]):
+                    score += 2 * rounds_weight * math.log1p(
+                        -_c(cz_err.get(frozenset((u, v)), 0.0)))
+        else:
+            score = -float(total_cx_round)
+        if best is None or score > best["score"]:
+            extras = []
+            if n_extra:
+                blocked = used | set(bridge_phys)
+                extras = sorted((q for q in G if q not in blocked),
+                                key=lambda q: -len(G[q]))[:n_extra]
+            best = {
+                "r": r, "s": s, "seed": seed, "score": score,
+                "bridges": {str(k): [pidx[p] for p in bridges_by_slot[k]]
+                            for k in bridges_by_slot},
+                "n_fresh": len(bridge_phys),
+                "initial_layout": phys + bridge_phys + extras,
+                "n_qubits": base + len(bridge_phys) + n_extra,
+                "cx_per_round": total_cx_round,
+            }
+    if best is not None and verbose:
+        print(f"  paired layout (seed {best['seed']}): {best['n_fresh']} "
+              f"bridge qubits, {best['cx_per_round']} NN CX/round, "
+              f"total {best['n_qubits']} qubits, score {best['score']:.2f}")
+    return best
 
 
 def verify_tree_parity():
