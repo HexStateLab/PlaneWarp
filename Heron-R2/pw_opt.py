@@ -97,7 +97,7 @@ def _ghz_support_coords(r, s):
     return [(r - 1, j) for j in range(s - 1)] + [(i, s - 1) for i in range(r - 1)]
 
 
-def build_circuit(r, s, rounds, logical_state="00", bell=False, bell_measure=False, measure_x=False, partial_x=False, stabilizer_basis='Z', no_reset=True, ghz=False, ghz_measure=False, free_final_round=False, bell_after_qec=False, full_stabilizer=False, dd=False, periodic=True, compact=True, initial_reset=False, share_extra_ancilla=False, bell_ancilla=True, parity_tree=None, rung_plan=None):
+def build_circuit(r, s, rounds, logical_state="00", bell=False, bell_measure=False, measure_x=False, partial_x=False, stabilizer_basis='Z', no_reset=True, ghz=False, ghz_measure=False, free_final_round=False, bell_after_qec=False, full_stabilizer=False, dd=False, periodic=True, compact=True, initial_reset=False, share_extra_ancilla=False, bell_ancilla=True, parity_tree=None, rung_plan=None, steane=False):
     """Build optimized share-pair QEC circuit.
 
     periodic=True: periodic vertical boundary conditions — V(i,j) wraps
@@ -197,6 +197,17 @@ def build_circuit(r, s, rounds, logical_state="00", bell=False, bell_measure=Fal
         def _aq(i, j):
             return _anc_index[(i, j)]
         base = n_data + n_anc
+
+    if steane:
+        assert compact, "steane requires compact=True"
+        # Steane does not need the n_anc per-check ancillas — reset base so
+        # the ancilla block sits right after the data qubits.
+        base = n_data
+        _steane_base = base
+        base += n_data   # ancilla block = full r×s copy of the data grid
+
+        def _sa(i, j):
+            return _steane_base + i * s + j
     else:
         def _dq(i, j):
             return data_map[i][j]
@@ -253,7 +264,8 @@ def build_circuit(r, s, rounds, logical_state="00", bell=False, bell_measure=Fal
             f"X readout, with an even number of rounds)")
 
     qr = QuantumRegister(total, "q")
-    cr_syn = [ClassicalRegister(n_anc, f"syn_{c}") for c in range(qec_rounds)]
+    cr_syn = [ClassicalRegister(n_data if steane else n_anc, f"syn_{c}")
+              for c in range(qec_rounds)]
     cr_data = ClassicalRegister(n_data, "data")
     cregs = [*cr_syn, cr_data]
     extra_cr = {}
@@ -469,28 +481,55 @@ def build_circuit(r, s, rounds, logical_state="00", bell=False, bell_measure=Fal
 
     for rnd in range(qec_rounds):
         rb = basis_seq[rnd % len(basis_seq)]
-        if (rnd == 0 and initial_reset) or (rnd > 0 and not no_reset):
-            for a in anc_list:
-                qc.reset(a)
-        if paired:
-            _paired_round(rnd, rb)
+        if steane:
+            # Steane EC: encoded-ancilla-block extraction.
+            #   rb='Z' → anc block in |0⟩_L, CX(data→anc), measure anc.
+            #             Anc measurement = data Z-values → data_syndrome().
+            #   rb='X' → anc block in |+⟩_L (H on every qubit),
+            #             CX(anc→data), H on anc, measure anc.
+            for ii in range(r):
+                for jj in range(s):
+                    qc.reset(_sa(ii, jj))
+            if rb == 'X':
+                for ii in range(r):
+                    for jj in range(s):
+                        qc.h(_sa(ii, jj))
+                for ii in range(r):
+                    for jj in range(s):
+                        qc.cx(_sa(ii, jj), _dq(ii, jj))
+                for ii in range(r):
+                    for jj in range(s):
+                        qc.h(_sa(ii, jj))
+            else:  # rb == 'Z'
+                for ii in range(r):
+                    for jj in range(s):
+                        qc.cx(_dq(ii, jj), _sa(ii, jj))
+            for ii in range(r):
+                for jj in range(s):
+                    qc.measure(_sa(ii, jj), cr_syn[rnd][ii * s + jj])
         else:
-            if rb == 'X':
+            if (rnd == 0 and initial_reset) or (rnd > 0 and not no_reset):
                 for a in anc_list:
-                    qc.h(a)
-            for (di, dj) in offsets:
-                for (i, j), a in zip(checks, anc_list):
-                    ti = row2(i) if di else i
-                    tj = (j + dj) % s
-                    if rb == 'X':
-                        qc.cx(a, _dq(ti, tj))
-                    else:
-                        qc.cx(_dq(ti, tj), a)
-            if rb == 'X':
-                for a in anc_list:
-                    qc.h(a)
-            for slot, a in enumerate(anc_list):
-                qc.measure(a, cr_syn[rnd][slot])
+                    qc.reset(a)
+            if paired:
+                _paired_round(rnd, rb)
+            else:
+                if rb == 'X':
+                    for a in anc_list:
+                        qc.h(a)
+                for (di, dj) in offsets:
+                    for (i, j), a in zip(checks, anc_list):
+                        ti = row2(i) if di else i
+                        tj = (j + dj) % s
+                        if rb == 'X':
+                            qc.cx(a, _dq(ti, tj))
+                        else:
+                            qc.cx(_dq(ti, tj), a)
+                if rb == 'X':
+                    for a in anc_list:
+                        qc.h(a)
+                for slot, a in enumerate(anc_list):
+                    qc.measure(a, cr_syn[rnd][slot])
         # Dynamic decoupling: X gates on all idle data qubits between rounds
         if dd and rnd < qec_rounds - 1:
             for ii in range(r):
@@ -557,7 +596,7 @@ def build_circuit(r, s, rounds, logical_state="00", bell=False, bell_measure=Fal
     return qc, eff_data_map, lq0_qubits, lq1_qubits, n_anc
 
 
-def all_syndromes_opt(pub_result, rounds, r, s, n_anc, no_reset=True, free_final_round=False, data_raw=None, full_stabilizer=False, periodic=True):
+def all_syndromes_opt(pub_result, rounds, r, s, n_anc, no_reset=True, free_final_round=False, data_raw=None, full_stabilizer=False, periodic=True, steane=False):
     """Extract and reconstruct full (shots, rounds, r, s) syndrome.
 
     Measurements are for V(i,j) = data[i][j] ⊕ data[(i+2)%r][j]
@@ -575,6 +614,22 @@ def all_syndromes_opt(pub_result, rounds, r, s, n_anc, no_reset=True, free_final
     Fully vectorized: measurements are scattered into the (r, s) grid with
     precomputed fancy indices in one shot across all rounds.
     """
+    if steane:
+        # syn_c registers hold full r×s ancilla-block Z readouts — run
+        # data_syndrome() on each to reconstruct the S_Z grid.
+        first = getattr(pub_result.data, "syn_0")
+        shots = first.num_shots
+        anc_data = np.zeros((shots, rounds, r, s), dtype=np.uint8)
+        for c in range(rounds):
+            bits = getattr(pub_result.data, f"syn_{c}").to_bool_array(
+                order='little')
+            anc_data[:, c] = bits[:, :r * s].reshape(shots, r, s)
+        syn = np.zeros((shots, rounds, r, s), dtype=np.uint8)
+        for c in range(rounds):
+            V = anc_data[:, c] ^ np.roll(anc_data[:, c], -2, axis=1)
+            syn[:, c] = V ^ np.roll(V, -2, axis=2)
+        return syn
+
     anc_rounds = rounds - 1 if free_final_round else rounds
 
     if anc_rounds == 0:
