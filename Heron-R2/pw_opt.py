@@ -97,7 +97,7 @@ def _ghz_support_coords(r, s):
     return [(r - 1, j) for j in range(s - 1)] + [(i, s - 1) for i in range(r - 1)]
 
 
-def build_circuit(r, s, rounds, logical_state="00", bell=False, bell_measure=False, measure_x=False, partial_x=False, stabilizer_basis='Z', no_reset=True, ghz=False, ghz_measure=False, free_final_round=False, bell_after_qec=False, full_stabilizer=False, dd=False, periodic=True, compact=True, initial_reset=False, share_extra_ancilla=False, bell_ancilla=True, parity_tree=None, rung_plan=None, steane=False):
+def build_circuit(r, s, rounds, logical_state="00", bell=False, bell_measure=False, measure_x=False, partial_x=False, stabilizer_basis='Z', no_reset=True, ghz=False, ghz_measure=False, free_final_round=False, bell_after_qec=False, full_stabilizer=False, dd=False, periodic=True, compact=True, initial_reset=False, share_extra_ancilla=False, bell_ancilla=True, parity_tree=None, rung_plan=None, steane=False, steane_dynamic=False):
     """Build optimized share-pair QEC circuit.
 
     periodic=True: periodic vertical boundary conditions — V(i,j) wraps
@@ -287,6 +287,12 @@ def build_circuit(r, s, rounds, logical_state="00", bell=False, bell_measure=Fal
             f"the basis of the final (software) round '{_final_b}' — pick the "
             f"sequence phase accordingly (e.g. 'XZ' for Z readout, 'ZX' for "
             f"X readout, with an even number of rounds)")
+
+    if steane_dynamic:
+        _steane_q_acc = total
+        _steane_q_fz  = total + 1
+        _steane_q_fx  = total + 2
+        total += 3
 
     qr = QuantumRegister(total, "q")
     cr_syn = [ClassicalRegister(n_data if steane else n_anc, f"syn_{c}")
@@ -537,10 +543,27 @@ def build_circuit(r, s, rounds, logical_state="00", bell=False, bell_measure=Fal
             for j in range(s):
                 qc.measure(_sa(i, j), cr_syn[rnd][i * s + j])
 
+    if steane_dynamic:
+
+        def _steane_dynamic_correct(rnd, rb):
+            _syn = cr_syn[rnd]
+            _acc = _steane_q_acc
+            _frame = _steane_q_fz if rb == "Z" else _steane_q_fx
+            qc.reset(_acc)
+            for k in range(r * s):
+                with qc.if_test((_syn[k], 1)):
+                    qc.x(_acc)
+            qc.cx(_acc, _frame)   # toggle frame if any anc bit was 1
+
+    else:
+        _steane_dynamic_correct = lambda rnd, rb: None
+
     for rnd in range(qec_rounds):
         rb = basis_seq[rnd % len(basis_seq)]
         if steane:
             _steane_round(rnd, rb)
+            if steane_dynamic:
+                _steane_dynamic_correct(rnd, rb)
             if dd and rnd < qec_rounds - 1:
                 for ii in range(r):
                     for jj in range(s):
@@ -617,6 +640,13 @@ def build_circuit(r, s, rounds, logical_state="00", bell=False, bell_measure=Fal
             for ii in range(r):
                 qc.h(_dq(ii, 2))
         qc.barrier()
+
+    # Dynamic feedforward: CNOT frame qubits → data to flip logical outcome
+    if steane and steane_dynamic:
+        if partial_x:
+            qc.cx(_steane_q_fx, _dq(0, 1))
+        else:
+            qc.cx(_steane_q_fz, _dq(0, 0))
 
     # Final data readout
     for ii in range(r):
