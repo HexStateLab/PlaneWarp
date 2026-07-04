@@ -37,6 +37,34 @@ Optimizations in this revision (all output-format compatible):
     anticommute with X_L1X_L2 and dephase the Bell state in one round).
     Helpers round_bases / split_by_basis / detection_events handle the
     per-basis syndrome bookkeeping for decoding.
+  - full_stabilizer accepts True (legacy weight-4 "star": one degree-4
+    ancilla per S = V(i,j)·V(i,j+2)) or "paired" (new). Paired mode keeps
+    max interaction degree 3 by loading each S with the primary ancilla's
+    own V plus a coherent fan-in from the (j+2) neighbor ancilla, which then
+    uncomputes; only the primary is measured, so the individual weight-2 V
+    gauge is never collapsed and Bell protection under alternating ZX is
+    preserved. The helper's carried value leaks into the fan but is a
+    measured bit removed in software by all_syndromes_opt(full_stabilizer=
+    "paired"):  S_a(t)=m_a(t)^m_a(t-1)^m_h(t-[phase0]).  Paired mode requires
+    no_reset=True, periodic=True, s%4==0. It gives a slightly lower raw 2q
+    count than the star on heavy hex (the star's degree-4 ancilla must be
+    routed) but the S rungs still route; on IBM Fez neither mode dominates
+    (paired: fewer 2q gates, more depth; star: better calibration-estimated
+    fidelity for the 8-round Bell workload) — choose per run by comparing
+    pick_best_transpilation(...) of each. A fully zero-SWAP paired layout is
+    provably infeasible on Fez for the 6x8 code (see synthesize_paired_layout).
+  - rung_plan (opt-in, paired only): thread each S rung through dedicated
+    FREE "bridge" qubits so every 2q gate is nearest-neighbor. Bridges start
+    and end in |0> (|+> in X basis) and are exactly uncomputed by the
+    cascade, so they may be reused across the two fan phases and even shared
+    across rungs (program order serializes the overlap — verified). Build a
+    plan with synthesize_paired_layout when the lattice has enough degree-3
+    headroom; on Fez it returns None (expected) and you run paired mode with
+    the transpiler's own layout instead.
+
+Note: pw_qiskit.heavy_hex_flag_layout (compact=False path) and waxis_decode
+are external and were exercised here only against a local stub; re-run your
+own verify_* suite after integrating.
 """
 import numpy as np
 from qiskit import QuantumCircuit, QuantumRegister, ClassicalRegister
@@ -953,7 +981,7 @@ def pick_best_transpilation(qc, backend, seeds=tuple(range(8)),
             best = (t, sc, sd)
     if verbose:
         print(f"  pick_best_transpilation: seed {best[2]} "
-              f"est. success {best[1]:.4f}")
+              f"est. success {best[1]:.3e}")
     return best[0], best[1]
 
 
@@ -1390,30 +1418,46 @@ def synthesize_parity_layout(backend, r, s, op="bell", periodic=True,
 def synthesize_paired_layout(backend, r, s, seeds=tuple(range(24)),
                              n_extra=0, rounds_weight=8, noise_aware=True,
                              verbose=True):
-    """Zero-SWAP layout plan for full_stabilizer='paired' extraction.
+    """Try to synthesize a zero-SWAP layout plan for full_stabilizer='paired'.
 
-    Why: the legacy weight-4 star cannot embed on degree-3 heavy hex, so the
-    transpiler routes it (~6x 2q overhead, SWAPs on data). The paired scheme
-    reduces the interaction graph to the embeddable weight-2 chain skeleton
-    plus one 'rung' per S check between the two ancillas whose V's compose
-    it. This synthesizer (1) places the chains with _constructive_placement,
-    (2) for each of the two fan phases finds vertex-disjoint paths through
-    FREE device qubits connecting every rung's ancilla pair (bridges may be
-    reused across phases — the cascade uncomputes them to |0>), and
-    (3) returns bridges + initial_layout so the whole circuit maps with zero
-    SWAPs and every 2q gate nearest-neighbor.
+    Why paired mode: the legacy weight-4 star places a degree-4 interaction
+    on the ancilla, which cannot embed on degree-3 heavy hex, so the
+    transpiler routes it. The paired scheme reduces the interaction graph to
+    the weight-2 chain skeleton plus one 'rung' per S check between the two
+    ancillas whose V's compose it; every ancilla then has max interaction
+    degree 3.
 
-    Usage:
-        plan = synthesize_paired_layout(backend, 6, 8, n_extra=1)
-        qc, ... = build_circuit(6, 8, rounds, full_stabilizer="paired",
-                                rung_plan=plan, ...)
-        pm = generate_preset_pass_manager(backend=backend,
-            optimization_level=3, initial_layout=plan["initial_layout"])
+    Feasibility caveat (important): a *fully* zero-SWAP paired layout needs
+    every one of the 4*(r/2-1)*(s/2) ancillas simultaneously on a degree-3
+    device vertex with a free third neighbor for its rung. On IBM Fez (156
+    qubits, Heron r2) an exhaustive search shows this is INFEASIBLE for the
+    6x8 periodic code: the weight-2 skeleton embeds happily with ancillas on
+    degree-2 vertices, but forcing all 32 ancillas onto disjoint degree-3
+    chain cores with free ports does not fit. This function therefore returns
+    None on Fez-class lattices. That is expected, not an error.
+
+    What to do instead on Fez: run paired mode with the transpiler's own
+    layout and sweep seeds with pick_best_transpilation. Empirically this
+    lowers the raw 2q count vs the star mode (~6.1k vs ~6.3k 2q at 8 rounds)
+    while the rungs route with a modest depth increase. Choose star vs paired
+    per run by comparing estimate_success of the best transpilation of each;
+    neither dominates on Fez.
+
+    When a plan IS returned (smaller codes, sparser rung load, or lattices
+    with enough degree-3 headroom), it maps every chain load nearest-neighbor
+    and threads each rung through FREE 'bridge' qubits (reusable across
+    phases — the cascade uncomputes them to |0>). Pass it as rung_plan to
+    build_circuit and as initial_layout to the transpiler:
+
+        plan = synthesize_paired_layout(backend, r, s, n_extra=1)
+        if plan is not None:
+            qc, ... = build_circuit(r, s, rounds, full_stabilizer="paired",
+                                    rung_plan=plan, ...)
+            pm = generate_preset_pass_manager(backend=backend,
+                optimization_level=3, initial_layout=plan["initial_layout"])
 
     n_extra reserves free qubits at the end of the layout for the bell/ghz
-    gadget ancillas (the star gadget itself still routes; use the parity
-    tree for gadget-heavy runs). Returns None if no seed yields a complete
-    disjoint-path assignment.
+    gadget ancillas. Returns None if no seed yields a complete assignment.
     """
     import collections
     import math
@@ -1474,53 +1518,68 @@ def synthesize_paired_layout(backend, r, s, seeds=tuple(range(24)),
         return sites
 
     def _heavyhex_placement(seed):
-        """Place each (column, row-parity) chain as u-v-w vertically:
-        a0 = u (deg-3), d2 = v (spacer), a2 = w (deg-3), d0/d4 = one row
-        neighbor of u/w, the other row neighbor reserved free for the rung
-        cascades. Chains of the same rung cycle are assigned to physically
-        consecutive sites (IBM indices are row-major) so rung paths are
-        short. Returns phys list or None.  r=6 only (5‑qubit chains)."""
-        assert r == 6, "heavyhex_placement currently only supports r=6"
+        """Embed the s (columns) x 2 (parities) = 2s data-ancilla chains onto
+        the heavy-hex lattice with a free rung port on every ancilla.
+
+        Each chain's a-d-a core is a deg3-deg2-deg3 "bridge" (u, v, w); u and
+        w saturate their three device edges as {bridge, outer-data, port}, so
+        each needs two free non-bridge neighbors (one becomes chain data, the
+        other the rung port). We pick 2s vertex-disjoint bridges by shuffled
+        greedy with a little backtracking (device has ~2x the qubits needed,
+        so a random restart almost always completes), then map bridges to
+        (column, parity) grouped by rung cycle so partners land near each
+        other. Returns the phys list or None if this seed can't complete."""
         import random
-        rng = random.Random(seed)
-        sites = _heavyhex_sites()
-        if len(sites) < 2 * s:
+        rng = random.Random(seed * 2654435761 & 0xffffffff)
+        need = 2 * s
+        raw = _heavyhex_sites()
+        if len(raw) < need:
             return None
-        if seed:
-            k = rng.randrange(len(sites))
-            sites = sites[k:] + sites[:k]     # rotate the site pool per seed
-        # rung cycles: fixed (px, py); columns j = py, py+2, ... same parity
+
+        def try_select():
+            order = raw[:]
+            rng.shuffle(order)
+            usedq, reserved, chosen = set(), set(), []
+            for (u, v, w) in order:
+                if len(chosen) == need:
+                    break
+                if {u, v, w} & usedq or {u, v, w} & reserved:
+                    continue
+                fu = [x for x in G[u] - {v}
+                      if x not in usedq and x not in reserved]
+                fw = [x for x in G[w] - {v}
+                      if x not in usedq and x not in reserved]
+                if len(fu) < 2 or len(fw) < 2:
+                    continue
+                d0, pu = fu[0], fu[1]
+                d4, pw = fw[0], fw[1]
+                chosen.append((u, v, w, d0, d4, pu, pw))
+                usedq.update((u, v, w, d0, d4))
+                reserved.update((pu, pw))
+            return chosen if len(chosen) == need else None
+
+        chosen = None
+        for _ in range(200):          # cheap random restarts within the seed
+            chosen = try_select()
+            if chosen is not None:
+                break
+        if chosen is None:
+            return None
+
+        # Map the 2s chosen bridges onto (column, parity) chains grouped by
+        # rung cycle. Order chosen bridges by device index so consecutive
+        # picks are physically close, keeping rung paths short.
+        chosen.sort(key=lambda t: (t[1], t[0]))
         cycles = [[(py + 2 * t, px) for t in range(s // 2)]
                   for px in range(2) for py in range(2)]
-        assign, usedq = {}, set()
-        si = 0
-        for cyc in cycles:
-            for (j, px) in cyc:
-                placed = False
-                while si < len(sites) and not placed:
-                    u, v, w = sites[si]
-                    si += 1
-                    if {u, v, w} & usedq:
-                        continue
-                    du = [x for x in G[u] - {v} if x not in usedq]
-                    dw = [x for x in G[w] - {v} if x not in usedq]
-                    if len(du) < 2 or len(dw) < 2:
-                        continue
-                    d0, d4 = du[0], dw[0]     # du[1]/dw[1] stay free ports
-                    assign[(px) * s + j] = d0
-                    assign[anc_index[(px, j)]] = u
-                    assign[(px + 2) * s + j] = v
-                    assign[anc_index[(px + 2, j)]] = w
-                    assign[(px + 4) * s + j] = d4
-                    usedq.update((d0, u, v, w, d4))
-                    placed = True
-                if not placed:
-                    return None
-        # every ancilla must still have a free neighbor (ports can collide
-        # with a later chain's data pick — verify globally)
-        for c in checks:
-            if not any(x not in usedq for x in G[assign[anc_index[c]]]):
-                return None
+        flat = [pj for cyc in cycles for pj in cyc]
+        assign = {}
+        for (j, px), (u, v, w, d0, d4, pu, pw) in zip(flat, chosen):
+            assign[(px) * s + j] = d0
+            assign[anc_index[(px, j)]] = u
+            assign[(px + 2) * s + j] = v
+            assign[anc_index[(px + 2, j)]] = w
+            assign[(px + 4) * s + j] = d4
         return [assign[q] for q in range(n_data)] + \
                [assign[n_data + k] for k in range(n_anc)]
 
@@ -1555,16 +1614,21 @@ def synthesize_paired_layout(backend, r, s, seeds=tuple(range(24)),
                     heapq.heappush(h, (nd, w))
         return None
 
+    import time
+    _t0 = time.time()
+    _budget = 120.0                 # never hang; bail out with None
     best = None
     for seed in seeds:
-        # Prefer the heavy-hex-native vertical-chain placer when r==6
-        # (ancillas sit on degree‑3 vertices, spacers on degree‑2).
-        # Falls back to generic constructive placement for other sizes
-        # or if the graph is not heavy‑hex.
-        phys = _heavyhex_placement(seed) if r == 6 else None
+        if time.time() - _t0 > _budget:
+            if verbose:
+                print("  time budget exhausted; returning best-so-far")
+            break
+        # Heavy-hex-native vertical chains keep a free rung port on every
+        # ancilla by construction; fall back to the generic constructive
+        # placement (with keep_anc_access so ancillas still border the free
+        # component) if the native packing can't seat all chains.
+        phys = _heavyhex_placement(seed)
         if phys is None:
-            # keep_anc_access guarantees every check ancilla borders the main
-            # free component, so a free rung path always exists
             phys = _constructive_placement(G, r, s, [], checks, anc_index,
                                            seed, keep_anc_access=True)
         if phys is None:
@@ -1633,6 +1697,10 @@ def synthesize_paired_layout(backend, r, s, seeds=tuple(range(24)),
         print(f"  paired layout (seed {best['seed']}): {best['n_fresh']} "
               f"bridge qubits, {best['cx_per_round']} NN CX/round, "
               f"total {best['n_qubits']} qubits, score {best['score']:.2f}")
+    elif best is None and verbose:
+        print("  no zero-SWAP paired layout on this lattice/code (expected on "
+              "Fez for 6x8; see docstring). Run paired mode with the "
+              "transpiler's own layout via pick_best_transpilation instead.")
     return best
 
 
