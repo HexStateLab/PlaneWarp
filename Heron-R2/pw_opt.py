@@ -482,28 +482,26 @@ def build_circuit(r, s, rounds, logical_state="00", bell=False, bell_measure=Fal
     for rnd in range(qec_rounds):
         rb = basis_seq[rnd % len(basis_seq)]
         if steane:
-            # Steane EC: encoded-ancilla-block extraction.
-            #   rb='Z' → anc block in |0⟩_L, CX(data→anc), measure anc.
-            #             Anc measurement = data Z-values → data_syndrome().
-            #   rb='X' → anc block in |+⟩_L (H on every qubit),
-            #             CX(anc→data), H on anc, measure anc.
+            # Steane EC — protocol from steane.py:
+            #   X-syndrome (rb='Z'): anc in |+⟩_L, CX(data→anc), Z‑measure anc
+            #   Z-syndrome (rb='X'): anc in |0⟩_L, CX(anc→data), H(anc), Z‑measure
             for ii in range(r):
                 for jj in range(s):
                     qc.reset(_sa(ii, jj))
-            if rb == 'X':
+            if rb == 'Z':
                 for ii in range(r):
                     for jj in range(s):
                         qc.h(_sa(ii, jj))
+                for ii in range(r):
+                    for jj in range(s):
+                        qc.cx(_dq(ii, jj), _sa(ii, jj))
+            else:  # rb == 'X'
                 for ii in range(r):
                     for jj in range(s):
                         qc.cx(_sa(ii, jj), _dq(ii, jj))
                 for ii in range(r):
                     for jj in range(s):
                         qc.h(_sa(ii, jj))
-            else:  # rb == 'Z'
-                for ii in range(r):
-                    for jj in range(s):
-                        qc.cx(_dq(ii, jj), _sa(ii, jj))
             for ii in range(r):
                 for jj in range(s):
                     qc.measure(_sa(ii, jj), cr_syn[rnd][ii * s + jj])
