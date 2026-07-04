@@ -521,7 +521,7 @@ def build_circuit(r, s, rounds, logical_state="00", bell=False, bell_measure=Fal
         if rnd > 0 or initial_reset:
             for a in ablk:
                 qc.reset(a)
-        qc.compose(_steane_prep["plus" if rb == 'Z' else "zero"],
+        qc.compose(_steane_anc_prep("plus" if rb == 'Z' else "zero"),
                    ablk, inplace=True)
         if rb == 'Z':
             for i in range(r):
