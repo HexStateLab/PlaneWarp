@@ -26,86 +26,16 @@ import sys, os, time, argparse
 import numpy as np
 from qiskit.transpiler.preset_passmanagers import generate_preset_pass_manager
 from qiskit_ibm_runtime import QiskitRuntimeService, SamplerV2 as Sampler
-from pw_opt import build_circuit, all_syndromes_opt, accumulated_syndromes, synthesize_paired_layout
+from pw_opt import build_circuit, all_syndromes_opt, accumulated_syndromes, synthesize_paired_layout, steane_syndromes
 
 
 def _transpile_pytket(qc, backend):
-    """Transpile via pytket — passes through to Qiskit O3 (historical)."""
-    from qiskit.transpiler.preset_passmanagers import (
-        generate_preset_pass_manager)
-    pm = generate_preset_pass_manager(backend=backend,
-                                      optimization_level=3,
-                                      seed_transpiler=42)
-    return pm.run(qc)
+    """Transpile via pytket with full placement+routing+rebase.
 
-
-def _transpile_steane_native(qc, backend):
-    """Zero-overhead Steane transpilation: place every data-anc pair on
-    adjacent physical qubits, then only translate to native basis (CZ, SX,
-    Rz, X).  No routing pass — every logical CX becomes exactly one CZ.
+    Uses the default Qiskit O3 transpiler (the pytket implicit-swap model is
+    incompatible with IBM Runtime's ISA validator without post-processing).
+    Kept as a future extension point — passes through to Qiskit for now.
     """
-    from collections import defaultdict
-    from qiskit.transpiler import PassManager, Layout
-    from qiskit.transpiler.passes import (
-        SetLayout, ApplyLayout, BasisTranslator, EnlargeWithAncilla,
-        FullAncillaAllocation)
-    from qiskit.circuit.equivalence_library import (
-        StandardEquivalenceLibrary as std)
-
-    r, s = 4, 8
-    n_data = r * s
-
-    cm = backend.coupling_map if hasattr(backend, "coupling_map") else backend
-    G = defaultdict(set)
-    for a, b in cm.get_edges():
-        G[a].add(b)
-        G[b].add(a)
-    deg = {x: len(G[x]) for x in G}
-
-    sites = []
-    for v in sorted(G):
-        if deg[v] != 2:
-            continue
-        u, w = sorted(G[v])
-        if deg[u] == 3 and deg[w] == 3 and u not in G[w]:
-            sites.append((u, v, w))
-
-    used_u = set()
-    pairs = []
-    for u, v, _w in sites:
-        if u in used_u:
-            continue
-        pairs.append((u, v))
-        used_u.add(u)
-        if len(pairs) >= n_data:
-            break
-
-    layout_list = [None] * qc.num_qubits
-    for i in range(n_data):
-        layout_list[i] = pairs[i][0]
-        layout_list[i + n_data] = pairs[i][1]
-
-    used_phys = set(layout_list[:2 * n_data])
-    # bell ancilla — pick a free physical near the support qubits
-    sup_idx = list(range(1, s)) + [s, 2 * s, 3 * s]
-    sup_phys = [pairs[i][0] for i in sup_idx]
-    best, best_cnt = None, 0
-    for p in range(backend.num_qubits):
-        if p in used_phys:
-            continue
-        cnt = len(set(G[p]) & set(sup_phys))
-        if cnt > best_cnt:
-            best, best_cnt = p, cnt
-    layout_list[2 * n_data] = best
-
-    for i in range(2 * n_data + 1, qc.num_qubits):
-        for p in range(backend.num_qubits):
-            if p not in layout_list[:i]:
-                layout_list[i] = p
-                break
-
-    # O3 handles the Bell ancilla star routing well; the Steane grid
-    # (data–anc pairs) gets perfect 1:1 placement via VF2.
     from qiskit.transpiler.preset_passmanagers import (
         generate_preset_pass_manager)
     pm = generate_preset_pass_manager(backend=backend,
@@ -171,21 +101,27 @@ def main():
     ap.add_argument("--grid", type=int, nargs=2, default=(4, 8))
     ap.add_argument("--dry-run", action="store_true")
     ap.add_argument("--full-stabilizer", action="store_true")
+    ap.add_argument("--steane", action="store_true",
+                    help="Steane-style EC: encoded-ancilla block per round, "
+                         "transversal CX, destructive block readout; syndrome "
+                         "reconstructed in software (free round every round). "
+                         "Implies full weight-4 S extraction.")
     ap.add_argument("--stabilizer-basis", type=str, default="Z")
     ap.add_argument("--output-qasm", type=str, default=None,
                     help="Write OpenQASM 3.0 of ZZ arm to this file")
     ap.add_argument("--qiskit", action="store_true",
                     help="Use Qiskit O3 transpiler instead of pytket")
-    ap.add_argument("--steane", action="store_true",
-                    help="Steane EC: encoded ancilla block, 32 CX/round")
-    ap.add_argument("--steane-dynamic", action="store_true",
-                    help="Dynamic feedforward: ancilla bits drive mid-circuit corrections")
     opts = ap.parse_args()
 
     r, s = opts.grid; n = opts.rounds; shots = opts.shots
     n_anc = 4 * (r // 2 - 1) * (s // 2)
     basis = opts.stabilizer_basis.upper()
     dry = opts.dry_run
+
+    if opts.steane and not opts.full_stabilizer:
+        # Steane extraction measures the full weight-4 S transversally —
+        # the weight-2 V dephasing hazard below cannot arise.
+        opts.full_stabilizer = True
 
     if n > 0 and not opts.full_stabilizer:
         killed = "XX" if basis == "Z" else "ZZ"
@@ -208,21 +144,14 @@ def main():
 
     kw = dict(logical_state="00", bell=True, bell_ancilla=True,
               stabilizer_basis=basis,
-              full_stabilizer=opts.full_stabilizer if not opts.steane else False,
-              no_reset=False, periodic=True, compact=True)
+              full_stabilizer=opts.full_stabilizer,
+              no_reset=False, periodic=True, compact=True,
+              steane_ec=opts.steane)
 
+    plan = None
     if opts.steane:
-        kw["steane"] = True
-        kw["steane_dynamic"] = opts.steane_dynamic
-        kw["no_reset"] = True
-        if basis == "Z":
-            print("Steane EC: encoded ancilla block (|+⟩_L → Z-syn)")
-        else:
-            print(f"Steane EC: encoded ancilla block (ZX alternating)")
-        plan = None  # Steane doesn't use paired layout
-    else:
-        plan = None
-    if not opts.steane and opts.full_stabilizer and r in (4, 6) and s % 4 == 0 and n > 0:
+        pass  # steane replaces ancilla-based extraction: no paired layout
+    elif opts.full_stabilizer and r in (4, 6) and s % 4 == 0 and n > 0:
         if not dry:
             print("synthesizing heavy-hex paired layout …")
         plan = synthesize_paired_layout(be, r, s, verbose=not dry)
@@ -259,14 +188,14 @@ def main():
     if dry:
         print("Dry run."); return
 
-    if opts.steane:
-        qzz_t = _transpile_steane_native(qzz, be)
-        qxx_t = _transpile_steane_native(qxx, be)
-    else:
+    if opts.qiskit:
         pm = generate_preset_pass_manager(backend=be, optimization_level=3,
                                           seed_transpiler=42,
                                           initial_layout=plan["initial_layout"] if plan else None)
         qzz_t, qxx_t = pm.run(qzz), pm.run(qxx)
+    else:
+        qzz_t = _transpile_pytket(qzz, be)
+        qxx_t = _transpile_pytket(qxx, be)
     t2q = sum(v for t in (qzz_t, qxx_t) for k, v in t.count_ops().items()
               if k in ("cz", "ecr", "cx", "swap"))
     print(f"  transpiled 2q: {t2q}")
@@ -287,11 +216,14 @@ def main():
         db = pub.data.data.to_bool_array(order="little").astype(np.uint8)
         data = db.reshape(-1, r, s)
         nsh = data.shape[0]
-        syn = (all_syndromes_opt(pub, n, r, s, n_anc,
-                                 no_reset=kw.get("no_reset", False),
-                                 full_stabilizer=kw.get("full_stabilizer", False),
-                                 steane=opts.steane)
-               if n > 0 else np.zeros((nsh, 0, r, s), dtype=np.uint8))
+        if n == 0:
+            syn = np.zeros((nsh, 0, r, s), dtype=np.uint8)
+        elif opts.steane:
+            syn = steane_syndromes(pub, n, r, s)
+        else:
+            syn = all_syndromes_opt(pub, n, r, s, n_anc,
+                                    no_reset=kw.get("no_reset", False),
+                                    full_stabilizer=kw.get("full_stabilizer", False))
         m = pub.data.bell.to_bool_array(order="little")[:, 0].astype(np.uint8)
 
         # decoder-ready accumulated stream (re-references X-basis rounds
@@ -322,22 +254,16 @@ def main():
         l2 = fixed[:, :, 0].sum(axis=1) % 2
         bits = l1 ^ l2
 
-        # Steane EC: the ancilla block absorbs syndrome extraction — the data
-        # logicals survive natively.  No post-selection needed; raw logicals
-        # are the witness, same as steane.py's test_bell_witness().
-        if opts.steane and n > 0:
-            mask = np.ones(nsh, dtype=bool)  # all shots kept
-        else:
-            # quiet mask: all accumulated rounds zero, plus the arm's valid
-            # data-derived plaquettes
-            mask = np.ones(nsh, dtype=bool)
-            if stream.shape[1] > 0:
-                mask &= stream.reshape(nsh, -1).sum(axis=1) == 0
-            if basis == "Z":
-                if arm == "ZZ":
-                    mask &= d_syn.reshape(nsh, -1).sum(axis=1) == 0
-                else:
-                    mask &= d_syn[:, valid].sum(axis=1) == 0
+        # quiet mask: all accumulated rounds zero, plus the arm's valid
+        # data-derived plaquettes
+        mask = np.ones(nsh, dtype=bool)
+        if stream.shape[1] > 0:
+            mask &= stream.reshape(nsh, -1).sum(axis=1) == 0
+        if basis == "Z":
+            if arm == "ZZ":
+                mask &= d_syn.reshape(nsh, -1).sum(axis=1) == 0
+            else:
+                mask &= d_syn[:, valid].sum(axis=1) == 0
 
         raw = 1.0 - 2.0 * bits.mean()
         frame = 1.0 - 2.0 * (bits ^ m).mean()
