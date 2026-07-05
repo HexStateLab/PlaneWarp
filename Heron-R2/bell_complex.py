@@ -130,14 +130,30 @@ def main():
                          "conditional X to data — no post-hoc decode. "
                          "Best with --steane (where syndrome registers "
                          "carry full r*s bits).")
-    ap.add_argument("--dynamic-mode", choices=("expr", "coherent"),
+    ap.add_argument("--dynamic-mode", choices=("expr", "coherent", "inplace"),
                     default="expr",
                     help="expr: classical-expression if_tests (measured "
                          "stall cost ~0.27 of raw <ZZ> on Heron). "
                          "coherent: deferred-measurement CX network — "
                          "zero classical branches, zero stall; prefix-XOR "
                          "particular solution only; +2n qubits; correction "
-                         "recorded in dc_corr_m for audit.")
+                         "recorded in dc_corr_m for audit. "
+                         "inplace: coherent stage on the BLOCK qubits — "
+                         "zero fresh qubits, near-native routing, kernel "
+                         "fixup included; block readout stays raw (prefix "
+                         "uncomputed); audit from steane_t + dc_row_m.")
+    ap.add_argument("--dynamic-confirm", type=int, choices=(1, 2, 3),
+                    default=1,
+                    help="Temporal defect confirmation for --dynamic "
+                         "(expr mode only).  1: raw last-round syndrome "
+                         "(current behaviour).  2: AND of last two Z "
+                         "rounds — correct only PERSISTENT defects, "
+                         "vetoing measurement/ancilla-prep (syndrome) "
+                         "errors that gate errors survive.  3: majority "
+                         "vote over last three Z rounds (two-sided; "
+                         "tolerates one bad round anywhere).  Requires "
+                         "that many Z-type rounds in the schedule; "
+                         "expression size grows ~2.3x / ~7x.")
     opts = ap.parse_args()
 
     r, s = opts.grid; n = opts.rounds; shots = opts.shots
@@ -206,7 +222,8 @@ def main():
 
     # --- dynamic correction injection (Stage 5: dc_decode.py) ---
     if opts.dynamic:
-        from dc_decode import inject_dynamic_stage, steane_bit_fn
+        from dc_decode import (inject_dynamic_stage, steane_bit_fn,
+                               confirmed_bit_fn)
         if not opts.steane:
             print("!! --dynamic requires --steane (full r*s syndrome "
                   "registers); non-Steane syndrome is share-pair "
@@ -231,6 +248,11 @@ def main():
                 n_data = r * s
                 if opts.dynamic_mode == "coherent":
                     from dc_decode import add_coherent_correction
+                    if opts.dynamic_confirm > 1:
+                        print("!! --dynamic-confirm is expr-mode only: the "
+                              "coherent stage computes S from the live block "
+                              "qubits of ONE round (no prior-round record "
+                              "exists coherently).  Ignoring.")
                     blk = list(range(qzz.num_qubits - n_data,
                                      qzz.num_qubits))
                     qzz = add_coherent_correction(
@@ -239,15 +261,53 @@ def main():
                     print(f"  coherent correction injected: ZZ arm, CX "
                           f"network before steane_{lz} measurement, zero "
                           f"classical branches; XX arm postselect-only")
+                elif opts.dynamic_mode == "inplace":
+                    from dc_decode import add_inplace_coherent_correction
+                    if opts.dynamic_confirm > 1:
+                        print("!! --dynamic-confirm is expr-mode only: the "
+                              "in-place stage computes from the live block "
+                              "qubits of ONE round.  Ignoring.")
+                    blk = list(range(qzz.num_qubits - n_data,
+                                     qzz.num_qubits))
+                    qzz = add_inplace_coherent_correction(
+                        qzz, r, s, list(range(n_data)), blk,
+                        f"steane_{lz}")
+                    print(f"  in-place coherent correction injected: ZZ "
+                          f"arm, block qubits reused as compute register "
+                          f"(0 fresh qubits), kernel fixup in-branch, "
+                          f"prefix uncomputed before steane_{lz} readout; "
+                          f"XX arm postselect-only")
                 else:
-                    syn_creg = [cr for cr in qzz.cregs
-                                if cr.name == f"steane_{lz}"][0]
+                    k = opts.dynamic_confirm
+                    if k > 1 and len(z_rounds) < k:
+                        print(f"!! --dynamic-confirm {k}: only "
+                              f"{len(z_rounds)} Z round(s) in schedule — "
+                              f"falling back to raw last-round syndrome")
+                        k = 1
+                    window = z_rounds[-k:]   # oldest first
+                    cregs = [[cr for cr in qzz.cregs
+                              if cr.name == f"steane_{t}"][0]
+                             for t in window]
+                    if k == 1:
+                        bit_fn = steane_bit_fn(cregs[0], r, s)
+                        src = f"steane_{lz} (last Z round)"
+                    else:
+                        # NOTE: the stage is injected before the FINAL data
+                        # measurement (inject_dynamic_stage), which is after
+                        # all steane_{t} blocks have been destructively read
+                        # out — every register in the window is already
+                        # populated at evaluation time.
+                        bit_fn = confirmed_bit_fn(cregs, r, s)
+                        kind = "AND-pair" if k == 2 else "majority-of-3"
+                        src = (f"{kind} of steane_{{{','.join(map(str, window))}}}"
+                               f" (persistent-defect filter: syndrome "
+                               f"errors vetoed, gate/data errors kept)")
                     qzz = inject_dynamic_stage(
                         qzz, r, s, list(range(n_data)),
-                        steane_bit_fn(syn_creg, r, s), classical=True)
+                        bit_fn, classical=True)
                     print(f"  dynamic correction injected: ZZ arm, from "
-                          f"steane_{lz} (last Z round), classical "
-                          f"expressions; XX arm postselect-only per rule 1")
+                          f"{src}, classical expressions; XX arm "
+                          f"postselect-only per rule 1")
 
     for lab, qc in [("ZZ arm", qzz), ("XX arm", qxx)]:
         ops = qc.count_ops()
@@ -369,6 +429,23 @@ def main():
         # readout is Z regardless of the stabilizer sequence.
         d_syn = data_syndrome(data) if basis[0] == "Z" else None
 
+        # audit: reconstruct what the in-circuit confirmation filter did.
+        # steane registers return with every shot, so the veto decisions
+        # are fully replayable offline.
+        if opts.dynamic and opts.dynamic_confirm > 1 and opts.steane \
+                and syn.shape[1] >= opts.dynamic_confirm:
+            from dc_decode import numpy_confirmed
+            zr = [t for t in range(n) if basis[t % len(basis)] == "Z"]
+            if len(zr) >= opts.dynamic_confirm:
+                widx = zr[-opts.dynamic_confirm:]
+                _, vst = numpy_confirmed(syn, widx)
+                tot = max(vst["raw_defects"], 1)
+                print(f"{arm}: confirm-{opts.dynamic_confirm} audit "
+                      f"(rounds {widx}): {vst['raw_defects']} raw defects "
+                      f"in last round, {vst['confirmed']} confirmed, "
+                      f"{vst['vetoed']} vetoed as syndrome errors "
+                      f"({100 * vst['vetoed'] / tot:.1f}%)")
+
         corr = np.zeros_like(data)
         decoded = False
         if opts.dynamic:
@@ -436,6 +513,18 @@ def main():
                                       >= hs // 2 + 1).astype(np.uint8)
                                 Edc[:, a, py::2] ^= rf[:, None]
                     src = "recorded (dc_corr_m ^ dc_row_m)"
+                elif opts.dynamic_mode == "inplace" and \
+                        hasattr(pub.data, "dc_row_m"):
+                    # raw block readout is preserved (prefix uncomputed):
+                    # replay the exact applied correction, fixup included
+                    from dc_decode import numpy_inplace_replica
+                    lz = z_rounds[-1]
+                    braw = getattr(pub.data, f"steane_{lz}").to_bool_array(
+                        order='little').astype(np.uint8).reshape(nsh, r, s)
+                    rowm = pub.data.dc_row_m.to_bool_array(
+                        order='little').astype(np.uint8)
+                    Edc = numpy_inplace_replica(braw, rowm, r, s)
+                    src = f"recorded (steane_{lz} + dc_row_m, fixup incl.)"
                 else:
                     Edc = numpy_correction(syn[:, z_rounds[-1]], r, s)
                     src = "replica"

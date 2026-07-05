@@ -50,6 +50,77 @@ def steane_bit_fn(block_creg, r, s):
     return fn
 
 
+def confirmed_bit_fn(block_cregs, r, s):
+    """Temporal-differencing syndrome filter: gate/data errors persist
+    across rounds, syndrome (readout / ancilla-prep) errors do not.
+
+    Takes 2 or 3 Steane block registers (RAW block readouts of CONSECUTIVE
+    same-basis rounds, oldest first) and returns a callable
+    (a, b) -> classical expression for the CONFIRMED defect:
+
+      2 registers:  C(a,b) = S_t(a,b) AND S_{t-1}(a,b)
+                    — correct only defects present in both rounds.  A
+                    measurement flip in round t-1 fires the defect at t-1
+                    and again (as the difference) never persists into t's
+                    absolute syndrome caused by real data error, so the
+                    AND vetoes it.  One-sided: a flip in the LAST round
+                    is also vetoed (conservative — the final destructive
+                    data readout catches what this defers).
+      3 registers:  C(a,b) = MAJ(S_{t-2}, S_{t-1}, S_t)(a,b)
+                    — two-sided majority vote; tolerates one bad round
+                    anywhere in the window.
+
+    Cost: each S is an XOR-of-4 of raw block bits, so the confirmed-bit
+    expression is ~2.3x (AND-pair) / ~7x (majority-of-3) the node count
+    of a single-round bit.  Everything downstream
+    (add_classical_correction via _rect_xor_expr) is unchanged: this is
+    a drop-in replacement for steane_bit_fn as the `syn_creg` callable.
+    """
+    if len(block_cregs) not in (2, 3):
+        raise ValueError("confirmed_bit_fn: need 2 or 3 block registers, "
+                         f"got {len(block_cregs)}")
+    fns = [steane_bit_fn(cr, r, s) for cr in block_cregs]
+    if len(fns) == 2:
+        f0, f1 = fns
+        return lambda a, b: expr.bit_and(f0(a, b), f1(a, b))
+    f0, f1, f2 = fns
+    def maj(a, b):
+        e0, e1, e2 = f0(a, b), f1(a, b), f2(a, b)
+        return expr.bit_or(expr.bit_or(expr.bit_and(e0, e1),
+                                       expr.bit_and(e0, e2)),
+                           expr.bit_and(e1, e2))
+    return maj
+
+
+def numpy_confirmed(syn, round_idx):
+    """Offline numpy mirror of confirmed_bit_fn for hardware-run audits.
+
+    Args:
+        syn: (shots, rounds, r, s) uint8 syndrome array (already the
+             XOR-of-4 rolled syndrome, e.g. from steane_syndromes).
+        round_idx: list of 2 or 3 round indices (oldest first) — must
+             match the registers fed to confirmed_bit_fn in-circuit.
+
+    Returns:
+        (confirmed, stats) where confirmed is (shots, r, s) uint8 and
+        stats is a dict with:
+          'raw_defects':  total defects in the LAST round of the window
+          'confirmed':    defects surviving the filter
+          'vetoed':       raw_defects - confirmed (presumed syndrome errors)
+    """
+    syn = syn.astype(np.uint8)
+    w = [syn[:, t] for t in round_idx]
+    if len(w) == 2:
+        conf = w[0] & w[1]
+    elif len(w) == 3:
+        conf = (w[0] & w[1]) | (w[0] & w[2]) | (w[1] & w[2])
+    else:
+        raise ValueError("numpy_confirmed: need 2 or 3 round indices")
+    raw = int(w[-1].sum())
+    c = int(conf.sum())
+    return conf, {"raw_defects": raw, "confirmed": c, "vetoed": raw - c}
+
+
 def _sector_coords(a, b):
     """Return (px, py, ha, hb) for parity-sector coords."""
     return a & 1, b & 1, a >> 1, b >> 1
@@ -303,6 +374,221 @@ def add_coherent_correction(qc_source, r, s, data_indices, block_indices,
     if not emitted:
         raise ValueError(f"no measurement into {block_creg_name} found")
     return new
+
+
+def _sigma_prefix_c_terms(u, v):
+    """c-terms (sector-prefix coords) whose XOR equals the INCLUSIVE
+    sigma-prefix  I_S(u, v) = XOR_{i<=u, j<=v} sigma(i, j),  where
+    sigma(i,j) = beta(i,j)^beta(i+1,j)^beta(i,j+1)^beta(i+1,j+1) is the
+    sector-local syndrome and c is the inclusive 2D prefix of the RAW
+    block bits beta.  Inclusion-exclusion over the four beta offsets:
+      I_S(u,v) = XOR_{di,dj in {0,1}} rect(di..u+di, dj..v+dj)
+      rect(i1..i2, j1..j2) = c(i2,j2)^c(i1-1,j2)^c(i2,j1-1)^c(i1-1,j1-1)
+    (negative-index terms dropped; no wraparound needed for u <= hr-2,
+    which the hr==2 guard of the in-place stage guarantees).  Returns
+    the set of (i, j) c-coordinates with odd multiplicity — at hr=2 this
+    always collapses to <= 3 terms."""
+    par = {}
+    def _rect(i1, i2, j1, j2):
+        for i, j in ((i2, j2), (i1 - 1, j2), (i2, j1 - 1), (i1 - 1, j1 - 1)):
+            if i >= 0 and j >= 0:
+                par[(i, j)] = par.get((i, j), 0) ^ 1
+    for di in (0, 1):
+        for dj in (0, 1):
+            _rect(di, u + di, dj, v + dj)
+    return {k for k, p in par.items() if p}
+
+
+def add_inplace_coherent_correction(qc_source, r, s, data_indices,
+                                    block_indices, block_creg_name):
+    """Coherent correction stage with ZERO fresh qubits: the Steane block
+    qubits double as the compute register.
+
+    Rationale (measured): add_coherent_correction's 2n fresh ancillas
+    (dc_comp/dc_corr) route terribly on heavy-hex — ~160 logical CX
+    ballooned to ~1030 transpiled 2q, and the data decohered through the
+    routed depth.  The block qubits, by contrast, are already placed
+    adjacent to data (transversal CX layout) and adjacent to each other
+    (sector neighbours are grid neighbours), so the same algebra runs
+    near-natively on them.
+
+    The XOR-of-4 roll map b -> S is NOT invertible (its kernel is the
+    code), so S cannot be materialised in place.  Instead only the
+    INVERTIBLE sector prefix  c = P.b  is computed in place (triangular,
+    pure CX), and every needed quantity is expanded in c:
+
+      E_p at data site (a,b), sector coord (u,v), u,v >= 1:
+          = I_S(u-1, v-1)  ->  XOR of <= 3 c-qubits at hr=2
+            (u=1: c(1,v-1) ^ c(1,v) ^ c(1,0))
+      row-majority bits (hr=2, sector row ha=1):
+          I_S(0, j) = c(1,j) ^ c(1,j+1) ^ c(1,0),  j = 0..hs-2
+
+    Pipeline (spliced before the block's destructive measurement):
+      1. In-place sector prefix on block qubits (~2n neighbour CX).
+      2. Row bits: fold the non-anchor c-terms onto an anchor block
+         qubit via CX, measure into 'dc_row_m', un-fold.  (Mid-circuit
+         Z measurement commutes with everything downstream: the block
+         is only ever a CX control / Z-readout from here on.)
+      3. E_p application: <= 3 CX from c-qubits into each data site with
+         a, b >= 2.  E_p never touches grid row 0 / col 0, so the LINEAR
+         part carries ZERO Z_L1Z_L2 action by construction.
+      4. Row-flip if_tests (popcount >= hs//2+1 of the measured bits),
+         X on the full sector row — and, for py == 0 groups, the K_fix
+         kernel pattern INSIDE the same if_test: a py=0 row flip is the
+         only logical-parity source (it flips site (a,0)), and K_fix has
+         logical action 1, so each fired flip self-cancels.  This is the
+         kernel fixup the fresh-ancilla stage lacked (measured: 48.9%
+         logical action without it).
+      5. UNCOMPUTE the prefix (reverse CX): the destructive readout
+         returns the RAW block bits b — steane_syndromes, steane_bit_fn,
+         confirmed_bit_fn and every audit path work unchanged.
+
+    Audit: the applied correction is fully reconstructible offline from
+    the raw block readout + 'dc_row_m' — see numpy_inplace_replica
+    (bit-exact equal to numpy_correction at hr=2, fixup included).
+
+    Returns a NEW circuit with the stage spliced in immediately before
+    the first measurement into `block_creg_name`."""
+    from qiskit import ClassicalRegister, QuantumCircuit
+
+    hr, hs = r // 2, s // 2
+    assert hr == 2, "in-place mode derived for hr == 2 (row majority only)"
+
+    nrow = 4 * (hr - 1) * (hs - 1)
+    row_cr = ClassicalRegister(max(nrow, 1), "dc_row_m")
+    blk_creg = [cr for cr in qc_source.cregs if cr.name == block_creg_name][0]
+    blk_bits = set(blk_creg)
+    new = QuantumCircuit(*qc_source.qregs, *qc_source.cregs, row_cr)
+
+    k_fix = _get_logical_fixup(r, s)
+
+    def emit_stage():
+        # c-qubit lookup: sector (px,py), prefix coord (u,v) -> block qubit
+        def cq(px, py, u, v):
+            return block_indices[_linear_index((u << 1) + px,
+                                               (v << 1) + py, s)]
+
+        # 1. in-place inclusive 2D sector prefix (same scan order as the
+        #    fresh-ancilla stage; targets processed in increasing order so
+        #    each CX adds an already-completed prefix)
+        prefix_cx = []
+        for px in range(2):
+            for py in range(2):
+                for u in range(hr):
+                    for v in range(1, hs):
+                        prefix_cx.append((cq(px, py, u, v - 1),
+                                          cq(px, py, u, v)))
+                for v in range(hs):
+                    for u in range(1, hr):
+                        prefix_cx.append((cq(px, py, u - 1, v),
+                                          cq(px, py, u, v)))
+        for ctl, tgt in prefix_cx:
+            new.cx(ctl, tgt)
+
+        # 2. row-majority bits: fold onto anchor, measure, un-fold
+        ridx = 0
+        row_groups = []                       # (grid row a, py, creg bits)
+        for px in (0, 1):
+            for py in (0, 1):
+                for ha in range(1, hr):       # ha == 1 at hr == 2
+                    a = (ha << 1) + px
+                    bits = []
+                    for j in range(hs - 1):
+                        terms = _sigma_prefix_c_terms(ha - 1, j)
+                        anchor = (1, j + 1)   # c(1, j+1) always present
+                        rest = [t for t in terms if t != anchor]
+                        assert anchor in terms
+                        aq = cq(px, py, *anchor)
+                        for (ti, tj) in rest:
+                            new.cx(cq(px, py, ti, tj), aq)
+                        new.measure(aq, row_cr[ridx])
+                        for (ti, tj) in rest:
+                            new.cx(cq(px, py, ti, tj), aq)
+                        bits.append(row_cr[ridx])
+                        ridx += 1
+                    row_groups.append((a, py, bits))
+
+        # 3. E_p application: <= 3 CX per data site, block -> data
+        for a in range(2, r):
+            for b in range(2, s):
+                px, py, u, v = _sector_coords(a, b)
+                for (ti, tj) in _sigma_prefix_c_terms(u - 1, v - 1):
+                    new.cx(cq(px, py, ti, tj),
+                           data_indices[_linear_index(a, b, s)])
+
+        # 4. row flips + in-branch kernel fixup
+        k_maj = hs // 2 + 1
+        for a, py, bits in row_groups:
+            cond = _or_of_combinations([expr.lift(bit) for bit in bits],
+                                       k_maj)
+            if cond is None:
+                continue
+            with new.if_test(cond):
+                for hb in range(hs):
+                    new.x(data_indices[_linear_index(a, (hb << 1) + py, s)])
+                if py == 0 and k_fix is not None:
+                    # this flip touches (a, 0): logical parity 1 — cancel
+                    # with the logical-1 kernel element, syndrome-neutral
+                    for (ka, kb) in zip(*np.where(k_fix)):
+                        new.x(data_indices[_linear_index(ka, kb, s)])
+
+        # 5. uncompute the prefix: raw b restored for destructive readout
+        for ctl, tgt in reversed(prefix_cx):
+            new.cx(ctl, tgt)
+
+    emitted = False
+    for ins in qc_source.data:
+        if not emitted and ins.operation.name == "measure" \
+                and any(c in blk_bits for c in ins.clbits):
+            emit_stage()
+            emitted = True
+        new.append(ins.operation, ins.qubits, ins.clbits)
+    if not emitted:
+        raise ValueError(f"no measurement into {block_creg_name} found")
+    return new
+
+
+def numpy_inplace_replica(block_bits, row_bits, r, s):
+    """Offline reconstruction of the correction applied by
+    add_inplace_coherent_correction, from returned registers.
+
+    Args:
+        block_bits: (shots, r, s) uint8 RAW block readout (the stage
+            uncomputes its prefix, so steane_{t} holds raw b as always).
+        row_bits: (shots, nrow) uint8 'dc_row_m' readout.
+
+    Returns:
+        (shots, r, s) uint8 applied correction E — bit-exact to what the
+        circuit did, and (at hr == 2) to numpy_correction(S) including
+        the kernel fixup.
+    """
+    b = block_bits.astype(np.uint8)
+    hr, hs = r // 2, s // 2
+    # syndrome via the roll map (same math as steane_bit_fn)
+    S = (b ^ np.roll(b, -2, 1) ^ np.roll(b, -2, 2)
+           ^ np.roll(np.roll(b, -2, 1), -2, 2)) & 1
+    E = np.zeros_like(b)
+    for px in (0, 1):
+        for py in (0, 1):
+            sec = S[:, px::2, py::2]
+            c = np.cumsum(np.cumsum(sec, axis=1), axis=2) & 1
+            ep = np.zeros_like(sec)
+            ep[:, 1:, 1:] = c[:, :-1, :-1]
+            E[:, px::2, py::2] = ep
+    # measured row flips + in-branch kernel fixup
+    k_fix = _get_logical_fixup(r, s)
+    ridx = 0
+    for px in (0, 1):
+        for py in (0, 1):
+            for ha in range(1, hr):
+                a = (ha << 1) + px
+                grp = row_bits[:, ridx:ridx + hs - 1]
+                ridx += hs - 1
+                rf = (grp.sum(axis=1) >= hs // 2 + 1).astype(np.uint8)
+                E[:, a, py::2] ^= rf[:, None]
+                if py == 0 and k_fix is not None:
+                    E[:, k_fix] ^= rf[:, None]
+    return E
 
 
 def _get_logical_fixup(r, s):
