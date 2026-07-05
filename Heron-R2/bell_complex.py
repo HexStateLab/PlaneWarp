@@ -111,6 +111,33 @@ def main():
                     help="Write OpenQASM 3.0 of ZZ arm to this file")
     ap.add_argument("--qiskit", action="store_true",
                     help="Use Qiskit O3 transpiler instead of pytket")
+    ap.add_argument("--job-id", type=str, default=None,
+                    help="Skip execution: fetch this completed IBM job and "
+                         "run the decode/analysis on it. Use 'last' for the "
+                         "most recent completed job. ALL other flags "
+                         "(--grid/--rounds/--stabilizer-basis/--steane/"
+                         "--full-stabilizer) must match the submitted run — "
+                         "they determine register layout and reconstruction.")
+    ap.add_argument("--transpile-seeds", type=int, default=16,
+                    help="Qiskit path only: transpile with this many Sabre "
+                         "seeds and submit the lowest-2q result per arm "
+                         "(measured ~8%% 2q reduction on heavy-hex; set 1 "
+                         "to disable)")
+    ap.add_argument("--dynamic", action="store_true",
+                    help="Inject dynamic circuit correction stage from "
+                         "dc_decode.py.  Computes tesseract correction "
+                         "mid-circuit from measured syndrome and applies "
+                         "conditional X to data — no post-hoc decode. "
+                         "Best with --steane (where syndrome registers "
+                         "carry full r*s bits).")
+    ap.add_argument("--dynamic-mode", choices=("expr", "coherent"),
+                    default="expr",
+                    help="expr: classical-expression if_tests (measured "
+                         "stall cost ~0.27 of raw <ZZ> on Heron). "
+                         "coherent: deferred-measurement CX network — "
+                         "zero classical branches, zero stall; prefix-XOR "
+                         "particular solution only; +2n qubits; correction "
+                         "recorded in dc_corr_m for audit.")
     opts = ap.parse_args()
 
     r, s = opts.grid; n = opts.rounds; shots = opts.shots
@@ -134,6 +161,8 @@ def main():
               "Z-error information; decoding engages from rounds >= 2.")
 
     if dry:
+        if opts.job_id:
+            print("--job-id needs the real service; drop --dry-run."); return
         from qiskit_ibm_runtime.fake_provider.backends.fez.fake_fez import FakeFez
         be = FakeFez()
     else:
@@ -175,6 +204,51 @@ def main():
         print(f"ZZ arm QASM → {opts.output_qasm}")
         return
 
+    # --- dynamic correction injection (Stage 5: dc_decode.py) ---
+    if opts.dynamic:
+        from dc_decode import inject_dynamic_stage, steane_bit_fn
+        if not opts.steane:
+            print("!! --dynamic requires --steane (full r*s syndrome "
+                  "registers); non-Steane syndrome is share-pair "
+                  "with fewer total bits.  Ignoring.")
+        elif n == 0:
+            print("!! --dynamic with rounds=0: no syndrome round to decode. "
+                  "Ignoring.")
+        else:
+            # The steane_{t} registers hold RAW block readout, not syndrome
+            # — steane_bit_fn applies the XOR-of-4 roll math at the
+            # expression level.  The decoder consumes S_Z (X-error
+            # corrections), so use the LAST Z-type round, and inject the
+            # ZZ arm only: X corrections apply to Z-basis readout (rule 1);
+            # injecting post-H in the XX arm would flip X-basis outcomes
+            # on X-error syndromes — the decoded_arm bug, physically.
+            z_rounds = [t for t in range(n) if basis[t % len(basis)] == "Z"]
+            if not z_rounds:
+                print("!! --dynamic: no Z-type round in the schedule — "
+                      "nothing to feed the X-error decoder.  Ignoring.")
+            else:
+                lz = z_rounds[-1]
+                n_data = r * s
+                if opts.dynamic_mode == "coherent":
+                    from dc_decode import add_coherent_correction
+                    blk = list(range(qzz.num_qubits - n_data,
+                                     qzz.num_qubits))
+                    qzz = add_coherent_correction(
+                        qzz, r, s, list(range(n_data)), blk,
+                        f"steane_{lz}")
+                    print(f"  coherent correction injected: ZZ arm, CX "
+                          f"network before steane_{lz} measurement, zero "
+                          f"classical branches; XX arm postselect-only")
+                else:
+                    syn_creg = [cr for cr in qzz.cregs
+                                if cr.name == f"steane_{lz}"][0]
+                    qzz = inject_dynamic_stage(
+                        qzz, r, s, list(range(n_data)),
+                        steane_bit_fn(syn_creg, r, s), classical=True)
+                    print(f"  dynamic correction injected: ZZ arm, from "
+                          f"steane_{lz} (last Z round), classical "
+                          f"expressions; XX arm postselect-only per rule 1")
+
     for lab, qc in [("ZZ arm", qzz), ("XX arm", qxx)]:
         ops = qc.count_ops()
         print(f"{lab}: {qc.num_qubits}q, {ops.get('cx', 0)} CX, "
@@ -188,25 +262,74 @@ def main():
     if dry:
         print("Dry run."); return
 
-    if opts.qiskit:
-        pm = generate_preset_pass_manager(backend=be, optimization_level=3,
-                                          seed_transpiler=42,
-                                          initial_layout=plan["initial_layout"] if plan else None)
-        qzz_t, qxx_t = pm.run(qzz), pm.run(qxx)
-    else:
-        qzz_t = _transpile_pytket(qzz, be)
-        qxx_t = _transpile_pytket(qxx, be)
-    t2q = sum(v for t in (qzz_t, qxx_t) for k, v in t.count_ops().items()
-              if k in ("cz", "ecr", "cx", "swap"))
-    print(f"  transpiled 2q: {t2q}")
-
-    j = Sampler(mode=be).run([qzz_t, qxx_t], shots=shots)
-    print(f"  job: {j.job_id()}\n  https://quantum.ibm.com/jobs/{j.job_id()}")
-    print("  waiting …")
-    try:
+    if opts.job_id:
+        jid = opts.job_id
+        if jid == "last":
+            done = [jb for jb in svc.jobs(limit=20, pending=False)
+                    if "DONE" in str(jb.status()).upper()
+                    or "COMPLETED" in str(jb.status()).upper()]
+            if not done:
+                print("no completed jobs found."); return
+            jid = done[0].job_id()
+        j = svc.job(jid)
+        st = str(j.status())
+        print(f"  fetching job {jid} (status: {st}) — decoding with "
+              f"grid {r}x{s}, rounds {n}, basis {basis}, "
+              f"steane={opts.steane}; these MUST match the submitted run.")
         res = j.result()
-    except KeyboardInterrupt:
-        print("\nDetached."); return
+        if len(res) != 2:
+            print(f"!! expected 2 pubs (ZZ, XX), job has {len(res)} — "
+                  f"not a bell_complex job?"); return
+        # registers must match the flags, else the reconstruction silently
+        # decodes garbage (the zeroed-correlator bug class)
+        pfx = "steane_" if opts.steane else "syn_"
+        have = 0
+        while hasattr(res[0].data, f"{pfx}{have}"):
+            have += 1
+        if opts.steane and have == 0 and hasattr(res[0].data, "syn_0"):
+            print("!! job has syn_* registers, not steane_* — it was "
+                  "submitted WITHOUT --steane"); return
+        if not opts.steane and have == 0 and hasattr(res[0].data, "steane_0"):
+            print("!! job has steane_* registers — it was submitted "
+                  "WITH --steane"); return
+        # expected register count mirrors build_circuit's qec_rounds
+        want_regs = n  # (free_final_round would subtract 1; not a CLI flag here)
+        if have != want_regs:
+            print(f"!! job has {have} {pfx}* register(s) but --rounds {n} "
+                  f"expects {want_regs} — pass --rounds {have}"); return
+        dw = res[0].data.data.to_bool_array(order="little").shape[1]
+        if dw != r * s:
+            print(f"!! data register width {dw} != r*s = {r * s} — "
+                  f"--grid doesn't match the submitted run"); return
+    else:
+        if opts.qiskit:
+            def _best(qc):
+                best_t, best_c = None, None
+                for sd in range(max(1, opts.transpile_seeds)):
+                    pm = generate_preset_pass_manager(
+                        backend=be, optimization_level=3, seed_transpiler=sd,
+                        initial_layout=plan["initial_layout"] if plan else None)
+                    t = pm.run(qc)
+                    c = sum(v for k, v in t.count_ops().items()
+                            if k in ("cz", "ecr", "cx", "swap"))
+                    if best_c is None or c < best_c:
+                        best_t, best_c = t, c
+                return best_t
+            qzz_t, qxx_t = _best(qzz), _best(qxx)
+        else:
+            qzz_t = _transpile_pytket(qzz, be)
+            qxx_t = _transpile_pytket(qxx, be)
+        t2q = sum(v for t in (qzz_t, qxx_t) for k, v in t.count_ops().items()
+                  if k in ("cz", "ecr", "cx", "swap"))
+        print(f"  transpiled 2q: {t2q}")
+
+        j = Sampler(mode=be).run([qzz_t, qxx_t], shots=shots)
+        print(f"  job: {j.job_id()}\n  https://quantum.ibm.com/jobs/{j.job_id()}")
+        print("  waiting …")
+        try:
+            res = j.result()
+        except KeyboardInterrupt:
+            print("\nDetached."); return
 
     # decode-arm follows the STREAM's basis type (basis[0] for multi-char
     # sequences like "ZX"): S_Z detects X errors, which flip Z-basis readout
@@ -248,7 +371,12 @@ def main():
 
         corr = np.zeros_like(data)
         decoded = False
-        if arm == decoded_arm and fn is not None:
+        if opts.dynamic:
+            # data qubits already corrected mid-circuit; skip post-hoc decode
+            # syndrome stream is from BEFORE the correction — using it would
+            # double-correct (the bug class that produced the LER ceiling).
+            pass
+        elif arm == decoded_arm and fn is not None:
             full = stream
             if basis[0] == "Z":
                 full = np.concatenate([stream, d_syn[:, None]], axis=1)
@@ -261,8 +389,10 @@ def main():
 
         # quiet mask: all accumulated rounds zero, plus the arm's valid
         # data-derived plaquettes
+        # With --dynamic the syndrome stream was measured BEFORE correction
+        # and no longer reflects the corrected state — use data-derived S only.
         mask = np.ones(nsh, dtype=bool)
-        if stream.shape[1] > 0:
+        if stream.shape[1] > 0 and not opts.dynamic:
             mask &= stream.reshape(nsh, -1).sum(axis=1) == 0
         if basis[0] == "Z":
             if arm == "ZZ":
@@ -273,10 +403,53 @@ def main():
         raw = 1.0 - 2.0 * bits.mean()
         frame = 1.0 - 2.0 * (bits ^ m).mean()
         wt = int(corr.sum(axis=(1, 2)).mean())
+        label = " (decoded)" if decoded else ""
+        label = label if label else (" (dynamic)" if opts.dynamic else "")
         print(f"  <{arm}> raw={raw:+.4f}  frame={frame:+.4f}  "
-              f"corr wt={wt}{' (decoded)' if decoded else ''}  "
+              f"corr wt={wt}{label}  "
               f"m=0/1: {int((m == 0).sum())}/{int((m == 1).sum())}  "
               f"quiet keep={mask.mean():.2f}")
+        # --dynamic audit: the block register the expressions consumed is
+        # in the results, so what the in-circuit conditionals applied is
+        # fully reconstructible (bit-exact replica; see dc_decode)
+        if opts.dynamic and arm == "ZZ" and n > 0:
+            from dc_decode import numpy_correction
+            z_rounds = [t for t in range(n) if basis[t % len(basis)] == "Z"]
+            if z_rounds:
+                if opts.dynamic_mode == "coherent" and \
+                        hasattr(pub.data, "dc_corr_m"):
+                    # direct in-circuit record: particular solution from
+                    # dc_corr_m XOR the measured-majority row flips
+                    Edc = pub.data.dc_corr_m.to_bool_array(
+                        order='little').astype(np.uint8).reshape(nsh, r, s)
+                    hr, hs = r // 2, s // 2
+                    rowm = pub.data.dc_row_m.to_bool_array(
+                        order='little').astype(np.uint8)
+                    ridx = 0
+                    for px in (0, 1):
+                        for py in (0, 1):
+                            for ha in range(1, hr):
+                                a = (2 * ha) + px
+                                grp = rowm[:, ridx:ridx + hs - 1]
+                                ridx += hs - 1
+                                rf = (grp.sum(axis=1)
+                                      >= hs // 2 + 1).astype(np.uint8)
+                                Edc[:, a, py::2] ^= rf[:, None]
+                    src = "recorded (dc_corr_m ^ dc_row_m)"
+                else:
+                    Edc = numpy_correction(syn[:, z_rounds[-1]], r, s)
+                    src = "replica"
+                fired = float(Edc.any(axis=(1, 2)).mean())
+                mwt = float(Edc.sum(axis=(1, 2)).mean())
+                lbits = ((Edc[:, 0, :].sum(axis=1)
+                          + Edc[:, :, 0].sum(axis=1)) % 2).astype(np.uint8)
+                lflip = float(lbits.mean())
+                undone = 1.0 - 2.0 * (bits ^ lbits).mean()
+                print(f"    dynamic audit [{src}]: correction fired on "
+                      f"{fired:.1%} of shots, mean wt {mwt:.2f}, "
+                      f"logical(Z_L1Z_L2) action on {lflip:.1%}; "
+                      f"counterfactual <ZZ> without it: {undone:+.4f} "
+                      f"(vs raw {raw:+.4f})")
         out[arm] = (bits, m, mask)
 
     # witness: ZZ raw, XX frame-corrected — never the other way around
