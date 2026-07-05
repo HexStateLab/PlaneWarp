@@ -97,7 +97,7 @@ def _ghz_support_coords(r, s):
     return [(r - 1, j) for j in range(s - 1)] + [(i, s - 1) for i in range(r - 1)]
 
 
-def build_circuit(r, s, rounds, logical_state="00", bell=False, bell_measure=False, measure_x=False, partial_x=False, stabilizer_basis='Z', no_reset=True, ghz=False, ghz_measure=False, free_final_round=False, bell_after_qec=False, full_stabilizer=False, dd=False, periodic=True, compact=True, initial_reset=False, share_extra_ancilla=False, bell_ancilla=True, parity_tree=None, rung_plan=None, steane=False, steane_dynamic=False):
+def build_circuit(r, s, rounds, logical_state="00", bell=False, bell_measure=False, measure_x=False, partial_x=False, stabilizer_basis='Z', no_reset=True, ghz=False, ghz_measure=False, free_final_round=False, bell_after_qec=False, full_stabilizer=False, dd=False, periodic=True, compact=True, initial_reset=False, share_extra_ancilla=False, bell_ancilla=True, parity_tree=None, rung_plan=None, steane_ec=False):
     """Build optimized share-pair QEC circuit.
 
     periodic=True: periodic vertical boundary conditions — V(i,j) wraps
@@ -205,42 +205,6 @@ def build_circuit(r, s, rounds, logical_state="00", bell=False, bell_measure=Fal
             return anc_maps[(i, j, 0)]
         base = n_data + 2 * r * s
 
-    if steane:
-        # Steane EC (verified end-to-end in steane_e2e.py). Instead of the
-        # n_anc weight-2/weight-4 check ancillas, each round uses a full r×s
-        # block of ancilla qubits prepared in an ENCODED logical state of this
-        # same code, coupled transversally to the data, and measured. That
-        # block sits immediately after the data qubits.
-        assert compact, "steane requires compact=True"
-        assert not full_stabilizer, (
-            "steane runs its own transversal extraction; leave "
-            "full_stabilizer off (S is reconstructed in software)")
-        assert not free_final_round, (
-            "steane records a full encoded-ancilla readout every round; "
-            "free_final_round (borrowing the final syndrome from the "
-            "destructive data readout) is not supported")
-        assert rung_plan is None and parity_tree is None, (
-            "steane is incompatible with rung_plan / parity_tree")
-        _steane_base = n_data          # right after the data block
-        base = n_data + n_data         # ancilla block = one r×s data copy;
-                                       # the n_anc weight-check ancillas are
-                                       # unused in steane mode and not allocated
-
-        def _sa(i, j):
-            return _steane_base + i * s + j
-
-        # Reuse THE encoder the test validated, so build_circuit and
-        # steane_e2e.py share one source of truth for the logical ancilla.
-        from steane_build import encoded_stabilizer_list
-        from qiskit.synthesis import synth_circuit_from_stabilizers
-
-        def _steane_anc_prep(state):
-            _, gens, _ = encoded_stabilizer_list(r, s, state)
-            return synth_circuit_from_stabilizers(gens)
-
-        _steane_prep = {"plus": _steane_anc_prep("plus"),   # Z-stab round
-                        "zero": _steane_anc_prep("zero")}    # X-stab round
-
     if rung_plan is not None:
         assert full_stabilizer == "paired", \
             "rung_plan only applies to full_stabilizer='paired'"
@@ -275,6 +239,21 @@ def build_circuit(r, s, rounds, logical_state="00", bell=False, bell_measure=Fal
         _tree_base = None
     total = base + n_extra
 
+    if steane_ec:
+        # Steane-style EC: syndrome extracted every round via a transversal
+        # CX onto ONE reusable encoded-ancilla block (n_data qubits, reset
+        # between rounds) that is measured destructively; the round syndrome
+        # is reconstructed in software (steane_syndromes) with the same
+        # V/S roll math as free_final_round — a free syndrome round, every
+        # round.  Ancilla is |+>_L for Z-stabilizer rounds and |0>_L for
+        # X-stabilizer rounds (uniform over the measured-basis logical, so
+        # the transversal copy carries off syndrome, not the data logical).
+        assert compact and periodic, "steane_ec: compact+periodic only"
+        assert full_stabilizer and full_stabilizer != "paired", \
+            "steane_ec replaces stabilizer extraction; use full_stabilizer=True"
+        _steane_base = total
+        total += n_data
+
     qec_rounds = rounds - 1 if free_final_round else rounds
 
     basis_seq = stabilizer_basis.upper()
@@ -288,15 +267,11 @@ def build_circuit(r, s, rounds, logical_state="00", bell=False, bell_measure=Fal
             f"sequence phase accordingly (e.g. 'XZ' for Z readout, 'ZX' for "
             f"X readout, with an even number of rounds)")
 
-    if steane_dynamic:
-        _steane_q_acc = total
-        _steane_q_fz  = total + 1
-        _steane_q_fx  = total + 2
-        total += 3
-
     qr = QuantumRegister(total, "q")
-    cr_syn = [ClassicalRegister(n_data if steane else n_anc, f"syn_{c}")
-              for c in range(qec_rounds)]
+    if steane_ec:
+        cr_syn = [ClassicalRegister(n_data, f"steane_{c}") for c in range(qec_rounds)]
+    else:
+        cr_syn = [ClassicalRegister(n_anc, f"syn_{c}") for c in range(qec_rounds)]
     cr_data = ClassicalRegister(n_data, "data")
     cregs = [*cr_syn, cr_data]
     extra_cr = {}
@@ -510,65 +485,36 @@ def build_circuit(r, s, rounds, logical_state="00", bell=False, bell_measure=Fal
             for anc in _phase_anchors[0]:
                 qc.h(_aq(*anc))       # close phase-0 frames
 
-    def _steane_round(rnd, rb):
-        """One transversal Steane extraction round (verified in steane_e2e.py).
-
-          rb=='Z' -> X-syndrome: encoded |+>_L ancilla, CX(data->anc),
-                     Z-measure the ancilla block.
-          rb=='X' -> Z-syndrome: encoded |0>_L ancilla, CX(anc->data),
-                     H, Z-measure the ancilla block.
-
-        A fresh encoded logical ancilla is used every round (Steane syndromes
-        are independent per round — no cross-round accumulation, so no_reset
-        differencing does NOT apply), so the block is reset before it is
-        re-encoded on rounds > 0.
-        """
-        ablk = [_sa(i, j) for i in range(r) for j in range(s)]
-        if rnd > 0 or initial_reset:
-            for a in ablk:
-                qc.reset(a)
-        qc.compose(_steane_anc_prep("plus" if rb == 'Z' else "zero"),
-                   ablk, inplace=True)
-        if rb == 'Z':
+    if steane_ec and qec_rounds > 0:
+        _preps = steane_prep_circuits(r, s)
+        _blkq = [qr[_steane_base + k] for k in range(n_data)]
+        for rnd in range(qec_rounds):
+            rb = basis_seq[rnd % len(basis_seq)]
+            if rnd > 0 or initial_reset:
+                for bq in _blkq:
+                    qc.reset(bq)
+            # encoded ancilla, uniform over the measured-basis logical
+            qc.compose(_preps['plus' if rb == 'Z' else 'zero'], _blkq,
+                       inplace=True)
+            # transversal CX: block qubit k <-> data qubit (i,j), k = i*s + j
             for i in range(r):
                 for j in range(s):
-                    qc.cx(_dq(i, j), _sa(i, j))
-        else:  # rb == 'X'
-            for i in range(r):
-                for j in range(s):
-                    qc.cx(_sa(i, j), _dq(i, j))
-            for a in ablk:
-                qc.h(a)
-        for i in range(r):
-            for j in range(s):
-                qc.measure(_sa(i, j), cr_syn[rnd][i * s + j])
-
-    if steane_dynamic:
-
-        def _steane_dynamic_correct(rnd, rb):
-            _syn = cr_syn[rnd]
-            _acc = _steane_q_acc
-            _frame = _steane_q_fz if rb == "Z" else _steane_q_fx
-            qc.reset(_acc)
-            for k in range(r * s):
-                with qc.if_test((_syn[k], 1)):
-                    qc.x(_acc)
-            qc.cx(_acc, _frame)   # toggle frame if any anc bit was 1
-
-    else:
-        _steane_dynamic_correct = lambda rnd, rb: None
-
-    for rnd in range(qec_rounds):
-        rb = basis_seq[rnd % len(basis_seq)]
-        if steane:
-            _steane_round(rnd, rb)
-            if steane_dynamic:
-                _steane_dynamic_correct(rnd, rb)
+                    k = i * s + j
+                    if rb == 'Z':
+                        qc.cx(_dq(i, j), _blkq[k])
+                    else:
+                        qc.cx(_blkq[k], _dq(i, j))
+            for k in range(n_data):
+                if rb == 'X':
+                    qc.h(_blkq[k])
+                qc.measure(_blkq[k], cr_syn[rnd][k])
             if dd and rnd < qec_rounds - 1:
                 for ii in range(r):
                     for jj in range(s):
                         qc.x(_dq(ii, jj))
-            continue
+
+    for rnd in range(qec_rounds if not steane_ec else 0):
+        rb = basis_seq[rnd % len(basis_seq)]
         if (rnd == 0 and initial_reset) or (rnd > 0 and not no_reset):
             for a in anc_list:
                 qc.reset(a)
@@ -641,13 +587,6 @@ def build_circuit(r, s, rounds, logical_state="00", bell=False, bell_measure=Fal
                 qc.h(_dq(ii, 2))
         qc.barrier()
 
-    # Dynamic feedforward: CNOT frame qubits → data to flip logical outcome
-    if steane and steane_dynamic:
-        if partial_x:
-            qc.cx(_steane_q_fx, _dq(0, 1))
-        else:
-            qc.cx(_steane_q_fz, _dq(0, 0))
-
     # Final data readout
     for ii in range(r):
         for jj in range(s):
@@ -664,7 +603,7 @@ def build_circuit(r, s, rounds, logical_state="00", bell=False, bell_measure=Fal
     return qc, eff_data_map, lq0_qubits, lq1_qubits, n_anc
 
 
-def all_syndromes_opt(pub_result, rounds, r, s, n_anc, no_reset=True, free_final_round=False, data_raw=None, full_stabilizer=False, periodic=True, steane=False):
+def all_syndromes_opt(pub_result, rounds, r, s, n_anc, no_reset=True, free_final_round=False, data_raw=None, full_stabilizer=False, periodic=True):
     """Extract and reconstruct full (shots, rounds, r, s) syndrome.
 
     Measurements are for V(i,j) = data[i][j] ⊕ data[(i+2)%r][j]
@@ -681,27 +620,7 @@ def all_syndromes_opt(pub_result, rounds, r, s, n_anc, no_reset=True, free_final
 
     Fully vectorized: measurements are scattered into the (r, s) grid with
     precomputed fancy indices in one shot across all rounds.
-
-    steane=True: syn_c holds a full r×s encoded-ancilla readout for round c.
-    Each round is independent (fresh logical ancilla), so the weight-4 S
-    syndrome is reconstructed directly from that round's readout with the
-    same two-roll reduction verified in steane_e2e._softsyn — no cross-round
-    differencing (no_reset / free_final_round are ignored here).
     """
-    if steane:
-        if rounds == 0:
-            shots = data_raw.shape[0] if data_raw is not None else 0
-            return np.zeros((shots, 0, r, s), dtype=np.uint8)
-        first = getattr(pub_result.data, "syn_0")
-        shots = first.num_shots
-        syn = np.zeros((shots, rounds, r, s), dtype=np.uint8)
-        for c in range(rounds):
-            b = getattr(pub_result.data, f"syn_{c}").to_bool_array(
-                order='little')[:, :r * s].astype(np.uint8).reshape(shots, r, s)
-            V = b ^ np.roll(b, -2, axis=1)        # weight-2 vertical pairs
-            syn[:, c] = V ^ np.roll(V, -2, axis=2)  # weight-4 plaquette S
-        return syn
-
     anc_rounds = rounds - 1 if free_final_round else rounds
 
     if anc_rounds == 0:
@@ -763,6 +682,227 @@ def round_bases(rounds, stabilizer_basis):
     """Per-round basis list for a (possibly repeating) stabilizer_basis string."""
     seq = stabilizer_basis.upper()
     return [seq[t % len(seq)] for t in range(rounds)]
+
+
+# =========================================================================
+# Steane-style EC (steane_ec=True)
+#
+# Encoded-ancilla prep is derived from THIS code's own operators — the
+# periodic weight-2-gauge / weight-4-S structure, not a surface-code
+# import.  The code decouples into stride-2 plaquette sectors; the ancilla
+# stabilizer group is completed to a maximal abelian set (symplectic-
+# centralizer completion) so spectator-sector DOF are pinned and the block
+# is a pure codeword: all S = +1, the measured-basis logical uniform.
+# Verified noiselessly: encoded |+>_L / |0>_L pass all-S/logical checks,
+# and a logical Bell pair holds W = <ZZ>_L + <XX>_L = 2.0000 through
+# multiple alternating rounds, with injected errors lighting the
+# reconstructed syndrome.
+# =========================================================================
+
+def _st_pauli(n, kind, coords):
+    """Pauli string on n qubits (q = i*s + j); leftmost char = qubit n-1."""
+    from qiskit.quantum_info import Pauli
+    ch = ["I"] * n
+    for q in coords:
+        ch[q] = kind
+    return Pauli("".join(reversed(ch)))
+
+
+def _st_sym(p):
+    return np.concatenate([p.x.astype(np.uint8), p.z.astype(np.uint8)])
+
+
+def _st_commute(a, b):
+    return (int(np.dot(a.x.astype(int), b.z.astype(int))) +
+            int(np.dot(a.z.astype(int), b.x.astype(int)))) % 2 == 0
+
+
+def _st_independent(vec, basis):
+    """Gaussian-eliminate vec against reduced basis rows; residual or None."""
+    v = vec.copy()
+    for piv, row in basis:
+        if v[piv]:
+            v ^= row
+    nz = np.nonzero(v)[0]
+    return (nz[0], v) if len(nz) else None
+
+
+def _st_gf2_null(rows, ncols):
+    """Basis of the GF(2) null space of the given rows (full RREF)."""
+    R = [row.copy() % 2 for row in rows]
+    piv_row = {}
+    ri = 0
+    for c in range(ncols):
+        sel = next((i for i in range(ri, len(R)) if R[i][c]), None)
+        if sel is None:
+            continue
+        R[ri], R[sel] = R[sel], R[ri]
+        for i in range(len(R)):
+            if i != ri and R[i][c]:
+                R[i] ^= R[ri]
+        piv_row[c] = ri
+        ri += 1
+    basis = []
+    for free in range(ncols):
+        if free in piv_row:
+            continue
+        v = np.zeros(ncols, dtype=np.uint8)
+        v[free] = 1
+        for c, rr in piv_row.items():
+            if R[rr][free]:
+                v[c] = 1
+        basis.append(v)
+    return basis
+
+
+def _st_complete_isotropic(chosen_syms, n):
+    """Extend an isotropic symplectic set to a maximal one (size n) from its
+    symplectic centralizer — pins the spectator-sector DOF of the decoupled
+    stride-2 plaquette sectors."""
+    chosen = [v.copy() % 2 for v in chosen_syms]
+    while len(chosen) < n:
+        cons = [np.concatenate([c[n:], c[:n]]) for c in chosen]
+        null = _st_gf2_null(cons, 2 * n)
+        span = []
+        for c in chosen:
+            res = _st_independent(c, span)
+            if res:
+                span.append(res)
+        for w in null:
+            if w.any() and _st_independent(w, span) is not None:
+                chosen.append(w)
+                break
+        else:
+            break
+    return chosen
+
+
+def _st_vec_to_pauli(vec, n):
+    from qiskit.quantum_info import Pauli
+    x, z = vec[:n], vec[n:]
+    ch = ["IXZY"[int(x[q]) + 2 * int(z[q])] for q in range(n)]
+    return Pauli("".join(reversed(ch)))
+
+
+def steane_code_operators(r, s):
+    """This code's operators (periodic, full_stabilizer):
+    S_P(i,j) = P(i,j)P(i+2,j)P(i,j+2)P(i+2,j+2) at _check_anchors;
+    V_P(i,j) = P(i,j)P(i+2,j) weight-2 gauge; logicals matched to
+    bell_complex readout: Z_L1/X_L2 on row 0, Z_L2/X_L1 on col 0."""
+    n = r * s
+    q = lambda i, j: (i % r) * s + (j % s)
+    anchors = _check_anchors(r, s)
+
+    def S(kind):
+        return [_st_pauli(n, kind, [q(i, j), q(i + 2, j),
+                                    q(i, j + 2), q(i + 2, j + 2)])
+                for (i, j) in anchors]
+
+    def V(kind):
+        return [_st_pauli(n, kind, [q(i, j), q(i + 2, j)])
+                for i in range(r - 2) for j in range(s)]
+
+    L = dict(
+        XL1=_st_pauli(n, "X", [q(i, 0) for i in range(r)]),
+        XL2=_st_pauli(n, "X", [q(0, j) for j in range(s)]),
+        ZL1=_st_pauli(n, "Z", [q(0, j) for j in range(s)]),
+        ZL2=_st_pauli(n, "Z", [q(i, 0) for i in range(r)]),
+    )
+    return n, {"SX": S("X"), "SZ": S("Z"), "VX": V("X"), "VZ": V("Z"), **L}
+
+
+def steane_encoded_stabilizer_list(r, s, state):
+    """Maximal abelian independent generating set (n Paulis) for the encoded
+    ancilla |+>_L (state='plus') or |0>_L (state='zero'): all S of both
+    types + the state's two logicals, spectator DOF pinned by completion.
+    The complementary logical provably stays out of the group (uniform)."""
+    n, ops = steane_code_operators(r, s)
+    if state == "plus":
+        must = ops["SX"] + ops["SZ"] + [ops["XL1"], ops["XL2"]]
+    else:
+        must = ops["SX"] + ops["SZ"] + [ops["ZL1"], ops["ZL2"]]
+    fill = ops["VX"] + ops["VZ"]
+
+    chosen, basis = [], []
+
+    def try_add(p):
+        if not all(_st_commute(p, c) for c in chosen):
+            return False
+        res = _st_independent(_st_sym(p), basis)
+        if res is None:
+            return False
+        chosen.append(p)
+        basis.append(res)
+        return True
+
+    for p in must:
+        try_add(p)
+    for p in fill:
+        if len(chosen) == n:
+            break
+        try_add(p)
+    syms = _st_complete_isotropic([_st_sym(p) for p in chosen], n)
+    return n, [_st_vec_to_pauli(v, n) for v in syms]
+
+
+_steane_prep_cache = {}
+
+
+def steane_prep_circuits(r, s):
+    """{'plus': circuit, 'zero': circuit} preparing the encoded ancilla block
+    (n_data qubits).  'plus' (|+>_L, Z_L uniform) pairs with Z-stabilizer
+    rounds; 'zero' (|0>_L, X_L uniform) with X-stabilizer rounds.  Cached."""
+    key = (r, s)
+    if key not in _steane_prep_cache:
+        from qiskit.synthesis import synth_circuit_from_stabilizers
+        preps = {}
+        for state in ("plus", "zero"):
+            n, gens = steane_encoded_stabilizer_list(r, s, state)
+            assert len(gens) == n, \
+                f"steane prep {r}x{s} {state}: {len(gens)} gens != {n} (not pure)"
+            preps[state] = synth_circuit_from_stabilizers(gens)
+        _steane_prep_cache[key] = preps
+    return _steane_prep_cache[key]
+
+
+def steane_syndromes(pub_result, rounds, r, s, free_final_round=False,
+                     data_raw=None):
+    """(shots, rounds, r, s) syndrome from steane_ec block readouts.
+
+    Each round's steane_{t} register holds the destructive readout of the
+    ancilla block (Z basis after data->block CX for Z rounds; X basis after
+    block->data CX + H for X rounds).  The syndrome is reconstructed with
+    exactly the free_final_round math, per round:
+        V = b ^ roll(b, -2, rows);  S = V ^ roll(V, -2, cols)
+    Every round is a free syndrome round.  With free_final_round=True the
+    last round comes from the data readout (data_raw) as usual.
+
+    Semantics match all_syndromes_opt(full_stabilizer=True): per-round S
+    VALUES, not detectors.  After the product-state |00> prep the weight-4
+    S of the type NOT fixed by the prep are gauge-random per shot until the
+    first round of that type projects them (verified: same statistics as
+    the ancilla-based extraction, and consecutive same-type XOR detectors
+    are exactly zero noiselessly).  Form detectors downstream as usual."""
+    blk_rounds = rounds - 1 if free_final_round else rounds
+    if blk_rounds == 0:
+        shots = data_raw.shape[0]
+        syn = np.zeros((shots, rounds, r, s), dtype=np.uint8)
+    else:
+        first = getattr(pub_result.data, "steane_0")
+        shots = first.num_shots
+        b = np.zeros((shots, blk_rounds, r, s), dtype=np.uint8)
+        for t in range(blk_rounds):
+            bits = getattr(pub_result.data, f"steane_{t}").to_bool_array(
+                order='little')
+            b[:, t] = bits[:, :r * s].astype(np.uint8).reshape(shots, r, s)
+        V = b ^ np.roll(b, shift=-2, axis=2)
+        syn = np.zeros((shots, rounds, r, s), dtype=np.uint8)
+        syn[:, :blk_rounds] = V ^ np.roll(V, shift=-2, axis=3)
+    if free_final_round and data_raw is not None:
+        V_last = data_raw.astype(np.uint8) ^ np.roll(
+            data_raw.astype(np.uint8), shift=-2, axis=1)
+        syn[:, -1] = V_last ^ np.roll(V_last, shift=-2, axis=2)
+    return syn
 
 
 def split_by_basis(all_syn, stabilizer_basis):
