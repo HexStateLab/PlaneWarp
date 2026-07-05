@@ -208,7 +208,10 @@ def main():
     except KeyboardInterrupt:
         print("\nDetached."); return
 
-    decoded_arm = "ZZ" if basis == "Z" else "XX"
+    # decode-arm follows the STREAM's basis type (basis[0] for multi-char
+    # sequences like "ZX"): S_Z detects X errors, which flip Z-basis readout
+    # only — rule 1 above.  `basis == "Z"` alone mis-routes "ZX" to XX.
+    decoded_arm = "ZZ" if basis[0] == "Z" else "XX"
     valid = plaquette_validity(r, s)
     out = {}
 
@@ -238,14 +241,16 @@ def main():
 
         # the readout-basis-matched arm also yields a data-derived final
         # syndrome — append as the last decode round; the mixed XX readout
-        # only yields valid plaquettes (postselection only)
-        d_syn = data_syndrome(data) if basis == "Z" else None
+        # only yields valid plaquettes (postselection only).  Valid whenever
+        # the decode stream is Z-type (basis[0]), since the ZZ arm's data
+        # readout is Z regardless of the stabilizer sequence.
+        d_syn = data_syndrome(data) if basis[0] == "Z" else None
 
         corr = np.zeros_like(data)
         decoded = False
         if arm == decoded_arm and fn is not None:
             full = stream
-            if basis == "Z":
+            if basis[0] == "Z":
                 full = np.concatenate([stream, d_syn[:, None]], axis=1)
             corr, decoded = decode_stream(full, r, s, fn)
         fixed = data ^ corr
@@ -259,7 +264,7 @@ def main():
         mask = np.ones(nsh, dtype=bool)
         if stream.shape[1] > 0:
             mask &= stream.reshape(nsh, -1).sum(axis=1) == 0
-        if basis == "Z":
+        if basis[0] == "Z":
             if arm == "ZZ":
                 mask &= d_syn.reshape(nsh, -1).sum(axis=1) == 0
             else:
