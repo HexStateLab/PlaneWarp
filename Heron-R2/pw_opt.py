@@ -1,11 +1,31 @@
 """
-pw_opt.py — Optimized share-pair circuit builder for (1+x²)(1+y²) code.
+pw_opt.py — Optimized share-pair circuit builder for the plaquette code
+family (1+x^g)(1+y^g), parametrized by the check stride g.
 
-Key improvement: only 2 vertical-pair ancillas per 3-row column (p=0,1).
-V(2,q) = V(0,q) ⊕ V(1,q) computed in software.
-Saves 16 ancillas vs the standard share-pair layout (32 vs 48).
+FACTORIZATION UPDATE (stride=1 default): over GF(2),
+    (1+x²)(1+y²) = ((1+x)(1+y))² = (1 + x + y + xy)²,
+i.e. the legacy stride-2 code is the SQUARE of the nearest-neighbor
+plaquette code and decouples into 4 independent (row parity × column
+parity) copies of it. This module now builds the square-root code
+directly: stride=1 (default) uses nearest-neighbor checks
+    V(i,j) = P(i,j) P(i+1,j)          (weight-2 gauge)
+    S(i,j) = V(i,j)·V(i,j+1)
+           = P(i,j) P(i+1,j) P(i,j+1) P(i+1,j+1)   (weight-4 stabilizer)
+on the FULL lattice — same logicals (row 0 / column 0), unit-distance
+check support (better routing), and no qubits spent on decoupled
+spectator sectors. Anything the stride-2 code did on r×s, stride=1 does
+on (r/2)×(s/2). Pass stride=2 to every entry point to reproduce the
+legacy (1+x²)(1+y²) behavior bit-for-bit (anchors, classical-bit order,
+syndrome math, layouts all match the previous revision).
 
-For 6×8: 48 data + 32 anc = 80 qubits, 64 CX, depth ~17, 0 SWAPs.
+General stride g: V(i,j) = P(i,j)P(i+g,j) measured for i=0..r-g-1 (all
+except the last g rows), the last g rows' V reconstructed in software
+per residue class; S(i,j) = V(i,j)·V(i,j+g); n_anc = (r-g)·s. Periodic
+boundaries require r % g == 0 == s % g.
+
+Legacy sizing note (stride=2, 6×8): 48 data + 32 anc = 80 qubits, 64 CX,
+depth ~17, 0 SWAPs. The stride=1 equivalent of one sector is 3×4:
+12 data + 8 anc.
 
 Optimizations in this revision (all output-format compatible):
   - compact=True (default): the QuantumRegister holds exactly the qubits
@@ -64,23 +84,32 @@ Optimizations in this revision (all output-format compatible):
 
 Note: pw_qiskit.heavy_hex_flag_layout (compact=False path) and waxis_decode
 are external and were exercised here only against a local stub; re-run your
-own verify_* suite after integrating.
+own verify_* suite after integrating. Both are stride-2 artifacts:
+compact=False asserts stride == 2, and verify_pipeline tries
+WaxisDecoder(r, s, stride=...) falling back to WaxisDecoder(r, s) —
+supply a stride-aware decoder for stride != 2.
 """
 import numpy as np
 from qiskit import QuantumCircuit, QuantumRegister, ClassicalRegister
 
 
-def _check_anchors(r, s):
-    """Check anchor coordinates (i, j) in classical-bit order (px, py, p, q)."""
-    hr, hs = r // 2, s // 2
-    return [(2 * p + px, 2 * q + py)
-            for px in range(2) for py in range(2)
+def _check_anchors(r, s, stride=1):
+    """Check anchor coordinates (i, j) in classical-bit order (px, py, p, q).
+
+    stride g: anchors are all (i, j) with i in [0, r-g), enumerated by
+    (row residue px, column residue py, row cell p, column cell q) so the
+    classical-bit order at stride=2 matches the legacy layout exactly.
+    At stride=1 this reduces to plain (i, j) row-major over i < r-1."""
+    g = stride
+    hr, hs = r // g, s // g
+    return [(g * p + px, g * q + py)
+            for px in range(g) for py in range(g)
             for p in range(hr - 1) for q in range(hs)]
 
 
-def _unpack_indices(r, s):
+def _unpack_indices(r, s, stride=1):
     """Row/col fancy-index arrays matching the classical-bit order."""
-    anchors = _check_anchors(r, s)
+    anchors = _check_anchors(r, s, stride)
     ii = np.array([a[0] for a in anchors])
     jj = np.array([a[1] for a in anchors])
     return ii, jj
@@ -97,13 +126,18 @@ def _ghz_support_coords(r, s):
     return [(r - 1, j) for j in range(s - 1)] + [(i, s - 1) for i in range(r - 1)]
 
 
-def build_circuit(r, s, rounds, logical_state="00", bell=False, bell_measure=False, measure_x=False, partial_x=False, stabilizer_basis='Z', no_reset=True, ghz=False, ghz_measure=False, free_final_round=False, bell_after_qec=False, full_stabilizer=False, dd=False, periodic=True, compact=True, initial_reset=False, share_extra_ancilla=False, bell_ancilla=True, parity_tree=None, rung_plan=None, steane_ec=False):
+def build_circuit(r, s, rounds, logical_state="00", bell=False, bell_measure=False, measure_x=False, partial_x=False, stabilizer_basis='Z', no_reset=True, ghz=False, ghz_measure=False, free_final_round=False, bell_after_qec=False, full_stabilizer=False, dd=False, periodic=True, compact=True, initial_reset=False, share_extra_ancilla=False, bell_ancilla=True, parity_tree=None, rung_plan=None, steane_ec=False, stride=1):
     """Build optimized share-pair QEC circuit.
 
+    stride (g, default 1): check stride of the (1+x^g)(1+y^g) code.
+    stride=1 is the factorized nearest-neighbor plaquette code
+    (1+x+y+xy) — see module docstring; stride=2 reproduces the legacy
+    (1+x²)(1+y²) code exactly.
+
     periodic=True: periodic vertical boundary conditions — V(i,j) wraps
-    i+2 modulo r, and V(r-2,j), V(r-1,j) reconstructed in software.
-    periodic=False: open boundaries — V(i,j) = Z_i Z_{i+2,j} for i=0..r-3
-    only; bottom two rows have no vertical stabilizers. X_L1 = col 0,
+    i+g modulo r, and the last g rows' V reconstructed in software.
+    periodic=False: open boundaries — V(i,j) = Z_i Z_{i+g,j} for
+    i=0..r-g-1 only; bottom g rows have no vertical stabilizers. X_L1 = col 0,
     X_L2 = col 2 (vertical strings) commute with all V(i,j), so Bell
     state survives multi-round QEC.
 
@@ -116,8 +150,19 @@ def build_circuit(r, s, rounds, logical_state="00", bell=False, bell_measure=Fal
     Z-type checks alone leave dephasing uncorrected (X_L1X_L2 decays at the
     physical T2), and X-type alone leave bit flips uncorrected. Notes:
       - Use full_stabilizer=True with alternating bases for Bell states.
-        The weight-4 S operators of both types commute with each other and
-        with X_L1X_L2 and Z_L1Z_L2. The weight-2 V gauge operators do NOT:
+        Every weight-4 S of either type commutes with all four logicals,
+        so the logical Bell correlators are exactly preserved (verified:
+        W = 2.0 noiselessly at both strides). Note that S_Z(i,j) and
+        S_X(i+g,j+g) at diagonally adjacent anchors share ONE qubit and
+        anticommute (at any stride — hidden on small legacy lattices by
+        the column wrap), so opposite-basis rounds gauge-randomize those
+        individual S values: same-basis detection events carry a ~25%
+        gauge background noiselessly wherever a diagonal opposite-type
+        anchor was measured in between. A fully static CSS variant at
+        stride=1 would place S_Z and S_X on checkerboard cells (the
+        standard toric code) — not implemented here, to keep register
+        semantics identical to the legacy stride-2 pipeline. The
+        weight-2 V gauge operators are worse still:
         V_Z checks anticommute with X_L1X_L2 (periodic) and dephase the
         Bell state in one round even on perfect hardware.
       - no_reset differencing is basis-agnostic (the ancilla accumulates
@@ -153,13 +198,16 @@ def build_circuit(r, s, rounds, logical_state="00", bell=False, bell_measure=Fal
     worth it when qubit count is the binding constraint. Classical output
     unchanged either way.
 
-    For periodic r×s where both are even:
-      - Sector (px, py): data at (2p+px, 2q+py) for p=0..r/2-1, q=0..s/2-1
-      - In sector coords, V(p,q) = data[p][q] ⊕ data[(p+1)%(r/2)][q]
-      - Measure V(p,q) for p=0..r/2-2 (all except last row in sector)
-      - Compute V(r/2-1, q) = sum of all measured V(p,q) for p=0..r/2-2
+    For periodic r×s with r % g == 0 == s % g:
+      - Sector (px, py), px,py in [0,g): data at (gp+px, gq+py)
+      - In sector coords, V(p,q) = data[p][q] ⊕ data[(p+1)%(r/g)][q]
+      - Measure V(p,q) for p=0..r/g-2 (all except last row in sector)
+      - Compute V(r/g-1, q) = sum of all measured V(p,q) for p=0..r/g-2
+    At stride=1 there is a single sector spanning the whole lattice.
 
-    For r=6, s=8: sector size 3×4, measure p=0,1; compute p=2.
+    Legacy example (stride=2, r=6, s=8): sector 3×4, measure p=0,1;
+    compute p=2. Same-size example at stride=1: measure i=0..r-2,
+    compute i=r-1.
 
     parity_tree=None: optional plan from synthesize_parity_layout(backend,...).
     When given, the ancilla parity measurements (bell / bell_measure / ghz /
@@ -177,13 +225,18 @@ def build_circuit(r, s, rounds, logical_state="00", bell=False, bell_measure=Fal
     bit, an X fault during (un)growth walks out as a contiguous segment the
     checks can see.
     """
-    from pw_qiskit import heavy_hex_flag_layout
-    data_map, anc_maps, _, _ = heavy_hex_flag_layout(r, s)
+    g = stride
+    assert r > g and (not periodic or (r % g == 0 and s % g == 0)), \
+        f"stride {g} needs r > g and (periodic) r, s divisible by g"
+    if not compact:
+        assert g == 2, ("compact=False uses pw_qiskit.heavy_hex_flag_layout, "
+                        "which is a stride-2 artifact")
+        from pw_qiskit import heavy_hex_flag_layout
+        data_map, anc_maps, _, _ = heavy_hex_flag_layout(r, s)
 
     n_data = r * s
-    hr, hs = r // 2, s // 2
-    n_anc = 4 * (hr - 1) * hs
-    checks = _check_anchors(r, s)
+    n_anc = (r - g) * s
+    checks = _check_anchors(r, s, g)
 
     extra_flags = [name for name, on in (("bell", bell and bell_ancilla),
                                           ("bell_m", bell_measure),
@@ -381,20 +434,21 @@ def build_circuit(r, s, rounds, logical_state="00", bell=False, bell_measure=Fal
                         flip(_dq(ii, 0))
 
     # QEC rounds (rounds-1 if free_final_round, else rounds)
-    def row2(i):
-        return i + 2 if not periodic else (i + 2) % r
+    def row_g(i):
+        return i + g if not periodic else (i + g) % r
 
     anc_list = [_aq(i, j) for (i, j) in checks]
     paired = (full_stabilizer == "paired")
     if paired:
-        assert s % 4 == 0, ("paired full_stabilizer needs s % 4 == 0: the "
-                            "column cycle must 2-color so every ancilla is "
-                            "primary in one phase and helper in the other")
+        assert s % (2 * g) == 0, (
+            "paired full_stabilizer needs s % (2*stride) == 0: the column "
+            "cycle must 2-color so every ancilla is primary in one phase "
+            "and helper in the other")
         assert no_reset, ("paired mode's software correction assumes the "
                           "no_reset accumulation semantics")
         assert periodic, "paired mode implemented for periodic boundaries"
         _slot = {c: k for k, c in enumerate(checks)}
-        _kpar = lambda j: (j // 2) % 2
+        _kpar = lambda j: (j // g) % 2
         _phase_anchors = {ph: [c for c in checks if _kpar(c[1]) == ph]
                           for ph in (0, 1)}
     # Direction-major CX schedule: each offset layer touches every data qubit
@@ -402,26 +456,26 @@ def build_circuit(r, s, rounds, logical_state="00", bell=False, bell_measure=Fal
     # CX layers deep. All CXs in a round pairwise commute (data qubits only
     # ever on the control side in Z basis / target side in X basis), so the
     # unitary matches the original per-ancilla emission order.
-    offsets = ([(0, 0), (2, 0), (0, 2), (2, 2)]
+    offsets = ([(0, 0), (g, 0), (0, g), (g, g)]
                if (full_stabilizer and not paired)
-               else [(0, 0), (2, 0)])
+               else [(0, 0), (g, 0)])
 
     def _load(anchor, rb, invert=False):
         """CX pair coupling the weight-2 V at `anchor` onto its own ancilla."""
         (i, j) = anchor
         a = _aq(i, j)
-        for di in (0, 2):
-            d = _dq(row2(i) if di else i, j)
+        for di in (0, g):
+            d = _dq(row_g(i) if di else i, j)
             if rb == 'X':
                 qc.cx(a, d)
             else:
                 qc.cx(d, a)
 
     def _paired_round(rnd, rb):
-        """Weight-4 S = V(i,j)·V(i,j+2) via coherent helper fan-in.
+        """Weight-4 S = V(i,j)·V(i,j+g) via coherent helper fan-in.
 
         Per phase: primaries load their own V (2 CX), their helpers (the
-        (j+2) ancillas, always opposite phase) load V(i,j+2) (2 CX), one
+        (j+g) ancillas, always opposite phase) load V(i,j+g) (2 CX), one
         fan CX merges the helper's full state into the primary, the helper
         unloads (2 CX, exact classical uncompute — no commutation needed),
         and only the primary is measured.  The helper's prior content leaks
@@ -439,7 +493,7 @@ def build_circuit(r, s, rounds, logical_state="00", bell=False, bell_measure=Fal
                 qc.h(a)
         for ph in (0, 1):
             prim = _phase_anchors[ph]
-            helpers = [(i, (j + 2) % s) for (i, j) in prim]
+            helpers = [(i, (j + g) % s) for (i, j) in prim]
             for anc in prim:
                 _load(anc, rb)
             for h in helpers:
@@ -486,7 +540,7 @@ def build_circuit(r, s, rounds, logical_state="00", bell=False, bell_measure=Fal
                 qc.h(_aq(*anc))       # close phase-0 frames
 
     if steane_ec and qec_rounds > 0:
-        _preps = steane_prep_circuits(r, s)
+        _preps = steane_prep_circuits(r, s, g)
         _blkq = [qr[_steane_base + k] for k in range(n_data)]
         for rnd in range(qec_rounds):
             rb = basis_seq[rnd % len(basis_seq)]
@@ -526,7 +580,7 @@ def build_circuit(r, s, rounds, logical_state="00", bell=False, bell_measure=Fal
                     qc.h(a)
             for (di, dj) in offsets:
                 for (i, j), a in zip(checks, anc_list):
-                    ti = row2(i) if di else i
+                    ti = row_g(i) if di else i
                     tj = (j + dj) % s
                     if rb == 'X':
                         qc.cx(a, _dq(ti, tj))
@@ -603,13 +657,14 @@ def build_circuit(r, s, rounds, logical_state="00", bell=False, bell_measure=Fal
     return qc, eff_data_map, lq0_qubits, lq1_qubits, n_anc
 
 
-def all_syndromes_opt(pub_result, rounds, r, s, n_anc, no_reset=True, free_final_round=False, data_raw=None, full_stabilizer=False, periodic=True):
+def all_syndromes_opt(pub_result, rounds, r, s, n_anc, no_reset=True, free_final_round=False, data_raw=None, full_stabilizer=False, periodic=True, stride=1):
     """Extract and reconstruct full (shots, rounds, r, s) syndrome.
 
-    Measurements are for V(i,j) = data[i][j] ⊕ data[(i+2)%r][j]
-    for i=0..r-3 (both even and odd, all columns j).
-    The last two rows' V are computed via linear combination (periodic)
-    or left as zero (open boundaries).
+    Measurements are for V(i,j) = data[i][j] ⊕ data[(i+g)%r][j]
+    for i=0..r-g-1 (all row residues, all columns j), g=stride.
+    The last g rows' V are computed via linear combination (periodic)
+    or left as zero (open boundaries). Pass the same stride used in
+    build_circuit (default 1 = the factorized nearest-neighbor code).
 
     When no_reset=True, ancillas persist between rounds: m_r = m_{r-1} ⊕ P_r.
     The actual parity P_r = m_r ⊕ m_{r-1} (with m_{-1} = 0).
@@ -621,6 +676,7 @@ def all_syndromes_opt(pub_result, rounds, r, s, n_anc, no_reset=True, free_final
     Fully vectorized: measurements are scattered into the (r, s) grid with
     precomputed fancy indices in one shot across all rounds.
     """
+    g = stride
     anc_rounds = rounds - 1 if free_final_round else rounds
 
     if anc_rounds == 0:
@@ -639,10 +695,10 @@ def all_syndromes_opt(pub_result, rounds, r, s, n_anc, no_reset=True, free_final
             # S_a(t) = m_a(t) ^ m_a(t-1) ^ m_h(t - [phase==0]) with m(-1)=0:
             # differencing removes the primary's accumulation, and the raw
             # helper measurement removes the helper-state leak of the fan CX.
-            anchors = _check_anchors(r, s)
+            anchors = _check_anchors(r, s, g)
             slot = {c: k for k, c in enumerate(anchors)}
-            hidx = np.array([slot[(i, (j + 2) % s)] for (i, j) in anchors])
-            kap = np.array([(j // 2) % 2 for (_, j) in anchors])
+            hidx = np.array([slot[(i, (j + g) % s)] for (i, j) in anchors])
+            kap = np.array([(j // g) % 2 for (_, j) in anchors])
             m_parity = m_raw.copy()
             m_parity[:, 1:] ^= m_raw[:, :-1]
             i0 = np.where(kap == 0)[0]
@@ -656,24 +712,24 @@ def all_syndromes_opt(pub_result, rounds, r, s, n_anc, no_reset=True, free_final
             m_parity = m_raw
 
         # Scatter all rounds at once: (shots, anc_rounds, n_anc) -> (shots, anc_rounds, r, s)
-        ui, uj = _unpack_indices(r, s)
+        ui, uj = _unpack_indices(r, s, g)
         V = np.zeros((shots, anc_rounds, r, s), dtype=np.uint8)
         V[:, :, ui, uj] = m_parity
 
         if periodic:
-            V[:, :, r - 2, :] = V[:, :, 0:r - 2:2, :].sum(axis=2) % 2
-            V[:, :, r - 1, :] = V[:, :, 1:r - 1:2, :].sum(axis=2) % 2
+            for u in range(g):
+                V[:, :, r - g + u, :] = V[:, :, u:r - g:g, :].sum(axis=2) % 2
 
         syn = np.zeros((shots, rounds, r, s), dtype=np.uint8)
         if full_stabilizer:
             syn[:, :anc_rounds] = V  # measurements ARE S directly
         else:
-            syn[:, :anc_rounds] = V ^ np.roll(V, shift=-2, axis=3)
+            syn[:, :anc_rounds] = V ^ np.roll(V, shift=-g, axis=3)
 
     # Free final round: compute last syndrome from data readout
     if free_final_round and data_raw is not None:
-        V_last = data_raw.astype(np.uint8) ^ np.roll(data_raw.astype(np.uint8), shift=-2, axis=1)
-        syn[:, -1] = V_last ^ np.roll(V_last, shift=-2, axis=2)
+        V_last = data_raw.astype(np.uint8) ^ np.roll(data_raw.astype(np.uint8), shift=-g, axis=1)
+        syn[:, -1] = V_last ^ np.roll(V_last, shift=-g, axis=2)
 
     return syn
 
@@ -757,8 +813,8 @@ def _st_gf2_null(rows, ncols):
 
 def _st_complete_isotropic(chosen_syms, n):
     """Extend an isotropic symplectic set to a maximal one (size n) from its
-    symplectic centralizer — pins the spectator-sector DOF of the decoupled
-    stride-2 plaquette sectors."""
+    symplectic centralizer — pins the spectator-sector DOF of the
+    decoupled stride-g plaquette sectors (trivial at stride=1)."""
     chosen = [v.copy() % 2 for v in chosen_syms]
     while len(chosen) < n:
         cons = [np.concatenate([c[n:], c[:n]]) for c in chosen]
@@ -784,23 +840,24 @@ def _st_vec_to_pauli(vec, n):
     return Pauli("".join(reversed(ch)))
 
 
-def steane_code_operators(r, s):
+def steane_code_operators(r, s, stride=1):
     """This code's operators (periodic, full_stabilizer):
-    S_P(i,j) = P(i,j)P(i+2,j)P(i,j+2)P(i+2,j+2) at _check_anchors;
-    V_P(i,j) = P(i,j)P(i+2,j) weight-2 gauge; logicals matched to
+    S_P(i,j) = P(i,j)P(i+g,j)P(i,j+g)P(i+g,j+g) at _check_anchors;
+    V_P(i,j) = P(i,j)P(i+g,j) weight-2 gauge; logicals matched to
     bell_complex readout: Z_L1/X_L2 on row 0, Z_L2/X_L1 on col 0."""
+    g = stride
     n = r * s
     q = lambda i, j: (i % r) * s + (j % s)
-    anchors = _check_anchors(r, s)
+    anchors = _check_anchors(r, s, g)
 
     def S(kind):
-        return [_st_pauli(n, kind, [q(i, j), q(i + 2, j),
-                                    q(i, j + 2), q(i + 2, j + 2)])
+        return [_st_pauli(n, kind, [q(i, j), q(i + g, j),
+                                    q(i, j + g), q(i + g, j + g)])
                 for (i, j) in anchors]
 
     def V(kind):
-        return [_st_pauli(n, kind, [q(i, j), q(i + 2, j)])
-                for i in range(r - 2) for j in range(s)]
+        return [_st_pauli(n, kind, [q(i, j), q(i + g, j)])
+                for i in range(r - g) for j in range(s)]
 
     L = dict(
         XL1=_st_pauli(n, "X", [q(i, 0) for i in range(r)]),
@@ -811,12 +868,12 @@ def steane_code_operators(r, s):
     return n, {"SX": S("X"), "SZ": S("Z"), "VX": V("X"), "VZ": V("Z"), **L}
 
 
-def steane_encoded_stabilizer_list(r, s, state):
+def steane_encoded_stabilizer_list(r, s, state, stride=1):
     """Maximal abelian independent generating set (n Paulis) for the encoded
     ancilla |+>_L (state='plus') or |0>_L (state='zero'): all S of both
     types + the state's two logicals, spectator DOF pinned by completion.
     The complementary logical provably stays out of the group (uniform)."""
-    n, ops = steane_code_operators(r, s)
+    n, ops = steane_code_operators(r, s, stride)
     if state == "plus":
         must = ops["SX"] + ops["SZ"] + [ops["XL1"], ops["XL2"]]
     else:
@@ -848,32 +905,51 @@ def steane_encoded_stabilizer_list(r, s, state):
 _steane_prep_cache = {}
 
 
-def steane_prep_circuits(r, s):
+def steane_prep_circuits(r, s, stride=1):
     """{'plus': circuit, 'zero': circuit} preparing the encoded ancilla block
     (n_data qubits).  'plus' (|+>_L, Z_L uniform) pairs with Z-stabilizer
     rounds; 'zero' (|0>_L, X_L uniform) with X-stabilizer rounds.  Cached."""
-    key = (r, s)
+    key = (r, s, stride)
     if key not in _steane_prep_cache:
-        from qiskit.synthesis import synth_circuit_from_stabilizers
+        from qiskit.synthesis import (synth_circuit_from_stabilizers,
+                                      synth_clifford_greedy)
+        from qiskit.quantum_info import Clifford
         preps = {}
         for state in ("plus", "zero"):
-            n, gens = steane_encoded_stabilizer_list(r, s, state)
+            n, gens = steane_encoded_stabilizer_list(r, s, state, stride)
             assert len(gens) == n, \
                 f"steane prep {r}x{s} {state}: {len(gens)} gens != {n} (not pure)"
-            preps[state] = synth_circuit_from_stabilizers(gens)
+            qc = synth_circuit_from_stabilizers(gens)
+            # Post-synthesis: greedy Clifford resynthesis of the SAME
+            # unitary (hence the same prepared state, exactly).  Measured
+            # on 4x6 / FakeMarrakesh: 54cx+17swap -> 39cx+20swap logical,
+            # 146 -> 112 transpiled 2q at O3 — the block prep is ~all of
+            # the optimizable gate mass of a Steane round, so this is the
+            # cheapest ~23% available.  Keep whichever is lighter by the
+            # routed-cost proxy cx + 3*swap.
+            try:
+                qg = synth_clifford_greedy(Clifford(qc))
+                def _cost(c):
+                    o = c.count_ops()
+                    return o.get("cx", 0) + 3 * o.get("swap", 0)
+                if _cost(qg) < _cost(qc):
+                    qc = qg
+            except Exception:
+                pass                      # keep baseline synthesis
+            preps[state] = qc
         _steane_prep_cache[key] = preps
     return _steane_prep_cache[key]
 
 
 def steane_syndromes(pub_result, rounds, r, s, free_final_round=False,
-                     data_raw=None):
+                     data_raw=None, stride=1):
     """(shots, rounds, r, s) syndrome from steane_ec block readouts.
 
     Each round's steane_{t} register holds the destructive readout of the
     ancilla block (Z basis after data->block CX for Z rounds; X basis after
     block->data CX + H for X rounds).  The syndrome is reconstructed with
     exactly the free_final_round math, per round:
-        V = b ^ roll(b, -2, rows);  S = V ^ roll(V, -2, cols)
+        V = b ^ roll(b, -g, rows);  S = V ^ roll(V, -g, cols)   (g=stride)
     Every round is a free syndrome round.  With free_final_round=True the
     last round comes from the data readout (data_raw) as usual.
 
@@ -883,6 +959,7 @@ def steane_syndromes(pub_result, rounds, r, s, free_final_round=False,
     first round of that type projects them (verified: same statistics as
     the ancilla-based extraction, and consecutive same-type XOR detectors
     are exactly zero noiselessly).  Form detectors downstream as usual."""
+    g = stride
     blk_rounds = rounds - 1 if free_final_round else rounds
     if blk_rounds == 0:
         shots = data_raw.shape[0]
@@ -895,13 +972,13 @@ def steane_syndromes(pub_result, rounds, r, s, free_final_round=False,
             bits = getattr(pub_result.data, f"steane_{t}").to_bool_array(
                 order='little')
             b[:, t] = bits[:, :r * s].astype(np.uint8).reshape(shots, r, s)
-        V = b ^ np.roll(b, shift=-2, axis=2)
+        V = b ^ np.roll(b, shift=-g, axis=2)
         syn = np.zeros((shots, rounds, r, s), dtype=np.uint8)
-        syn[:, :blk_rounds] = V ^ np.roll(V, shift=-2, axis=3)
+        syn[:, :blk_rounds] = V ^ np.roll(V, shift=-g, axis=3)
     if free_final_round and data_raw is not None:
         V_last = data_raw.astype(np.uint8) ^ np.roll(
-            data_raw.astype(np.uint8), shift=-2, axis=1)
-        syn[:, -1] = V_last ^ np.roll(V_last, shift=-2, axis=2)
+            data_raw.astype(np.uint8), shift=-g, axis=1)
+        syn[:, -1] = V_last ^ np.roll(V_last, shift=-g, axis=2)
     return syn
 
 
@@ -970,7 +1047,7 @@ def accumulated_syndromes(all_syn, stabilizer_basis,
     return out
 
 
-def check_consistency(all_syn, data_raw, r, s):
+def check_consistency(all_syn, data_raw, r, s, stride=1):
     """Diagnostic: compare final-round ancilla syndrome vs data-readout syndrome.
 
     When free_final_round is used, both the ancilla-based and data-based
@@ -987,8 +1064,9 @@ def check_consistency(all_syn, data_raw, r, s):
     # the free final round (= rounds-1) which comes from data.
     syn_anc = all_syn[:, -2]   # (n_shots, r, s) from ancilla
     # Data-based syndrome for the same physical state
-    V_data = data_raw.astype(np.uint8) ^ np.roll(data_raw.astype(np.uint8), shift=-2, axis=1)
-    syn_data = V_data ^ np.roll(V_data, shift=-2, axis=2)
+    g = stride
+    V_data = data_raw.astype(np.uint8) ^ np.roll(data_raw.astype(np.uint8), shift=-g, axis=1)
+    syn_data = V_data ^ np.roll(V_data, shift=-g, axis=2)
 
     mismatch = syn_anc ^ syn_data   # 1 where ancilla syndrome ≠ data syndrome
     n_mismatch = mismatch.sum(axis=(1, 2))  # mismatched plaquettes per shot
@@ -1069,7 +1147,7 @@ def verify_optimized():
           f"CZ={ops_b_t.get('cz',0)}, SWAP={ops_b_t.get('swap',0)}")
 
 
-def verify_pipeline(no_reset=False):
+def verify_pipeline(no_reset=False, stride=1):
     """End-to-end: circuit → simulate → syndrome extraction → decode.
 
     Vectorized: bitstrings are parsed once per unique outcome, syndromes
@@ -1084,8 +1162,10 @@ def verify_pipeline(no_reset=False):
     backend = AerSimulator(device='CPU')
     r, s, rounds = 6, 8, 1
 
-    qc, dm, lq0, lq1, n_anc = build_circuit(r, s, rounds, logical_state="00", no_reset=no_reset)
-    print(f"Circuit: {qc.num_qubits}q, CX={qc.count_ops().get('cx',0)}")
+    qc, dm, lq0, lq1, n_anc = build_circuit(r, s, rounds, logical_state="00",
+                                             no_reset=no_reset, stride=stride)
+    print(f"Circuit: {qc.num_qubits}q, CX={qc.count_ops().get('cx',0)} "
+          f"(stride={stride})")
 
     noise_model = NoiseModel()
     noise_model.add_all_qubit_quantum_error(depolarizing_error(0.02, 2), ['cx'])
@@ -1109,19 +1189,25 @@ def verify_pipeline(no_reset=False):
     data_u = _bits([p[0] for p in parts]).reshape(-1, r, s)
     syn_bits = _bits([p[1] for p in parts]) if len(parts[0]) >= 2 else None
 
-    ui, uj = _unpack_indices(r, s)
+    g = stride
+    ui, uj = _unpack_indices(r, s, g)
     V = np.zeros((len(items), r, s), dtype=np.uint8)
     if syn_bits is not None:
         V[:, ui, uj] = syn_bits[:, :len(ui)]
-    V[:, r - 2, :] = V[:, 0:r - 2:2, :].sum(axis=1) % 2
-    V[:, r - 1, :] = V[:, 1:r - 1:2, :].sum(axis=1) % 2
-    syn_u = V ^ np.roll(V, shift=-2, axis=2)
+    for u in range(g):
+        V[:, r - g + u, :] = V[:, u:r - g:g, :].sum(axis=1) % 2
+    syn_u = V ^ np.roll(V, shift=-g, axis=2)
 
     n = int(cnts.sum())
     print(f"  Total shots decoded: {n} ({len(items)} unique outcomes)")
 
     # Decode each *unique syndrome* once, then broadcast back.
-    dec = WaxisDecoder(r, s)
+    try:
+        dec = WaxisDecoder(r, s, stride=stride)
+    except TypeError:
+        assert stride == 2, ("external WaxisDecoder is stride-2 only; "
+                             "pass a stride-aware decoder for stride != 2")
+        dec = WaxisDecoder(r, s)
     uniq_syn, inv = np.unique(syn_u.reshape(len(items), -1), axis=0, return_inverse=True)
     corr_u = np.zeros((len(uniq_syn), r, s), dtype=np.uint8)
     for k, v in enumerate(uniq_syn.reshape(-1, r, s)):
@@ -1292,11 +1378,12 @@ def _steiner_connect(G, free, terminals):
 
 def _constructive_placement(G, r, s, coords, checks, anc_index, seed,
                             max_anchors=120, max_paths=150,
-                            keep_anc_access=False):
+                            keep_anc_access=False, stride=1):
     """Greedy constructive placement of the QEC interaction graph.
 
-    The graph is a forest of 2s independent chains (per column: the even-row
-    and odd-row data qubits alternating with their check ancillas), which is
+    The graph is a forest of stride·s independent chains (per column: one
+    chain per row-residue class, data alternating with check ancillas
+    — at stride=1 a single chain per column), which is
     why generic subgraph search (VF2) is slow — nothing prunes. Instead:
     pack the chains one by one in scanline order from a graph CORNER
     (max-eccentricity vertex) — corner packing keeps the unused remainder
@@ -1315,11 +1402,11 @@ def _constructive_placement(G, r, s, coords, checks, anc_index, seed,
     n_data = r * s
     support_set = set(map(tuple, coords))
 
-    # component specs: per (column, parity) chain, slots = d,a,d,a,...,d
+    # component specs: per (column, residue) chain, slots = d,a,d,a,...,d
     comps = []
     for j in range(s):
-        for par in (0, 1):
-            rr = list(range(par, r, 2))
+        for par in range(stride):
+            rr = list(range(par, r, stride))
             slots = []
             for t, i in enumerate(rr):
                 slots.append(("d", i, j))
@@ -1478,7 +1565,8 @@ def _constructive_placement(G, r, s, coords, checks, anc_index, seed,
     return phys
 
 
-def _score_plan(plan, phys, G_unused, backend, r, s, checks, rounds_weight=8):
+def _score_plan(plan, phys, G_unused, backend, r, s, checks, rounds_weight=8,
+                stride=1):
     """Calibration-aware log-fidelity score for a candidate placement.
 
     QEC chain edges and ancilla readouts recur every round (weighted by
@@ -1496,7 +1584,7 @@ def _score_plan(plan, phys, G_unused, backend, r, s, checks, rounds_weight=8):
     for k, (i, j) in enumerate(checks):
         a = phys[n_data + k]
         d0 = phys[i * s + j]
-        d1 = phys[((i + 2) % r) * s + j]
+        d1 = phys[((i + stride) % r) * s + j]
         for e in (frozenset((d0, a)), frozenset((a, d1))):
             score += rounds_weight * math.log1p(-_c(cz_err.get(e, 0.0)))
         score += rounds_weight * math.log1p(-_c(ro_err.get(a, 0.0)))
@@ -1515,7 +1603,7 @@ def _score_plan(plan, phys, G_unused, backend, r, s, checks, rounds_weight=8):
 def synthesize_parity_layout(backend, r, s, op="bell", periodic=True,
                              vf2_time=180, seeds=tuple(range(32)),
                              noise_aware=True, rounds_weight=8,
-                             verbose=True):
+                             verbose=True, stride=1):
     """Synthesize a zero-SWAP layout plan for the ancilla parity measurement.
 
     Why: the single-ancilla X⊗n gadget is a degree-n star — unembeddable on
@@ -1563,9 +1651,9 @@ def synthesize_parity_layout(backend, r, s, op="bell", periodic=True,
 
     coords = (_ghz_support_coords(r, s) if op == "ghz"
               else _bell_support_coords(r, s, periodic))
-    n_data, hr, hs = r * s, r // 2, s // 2
-    n_anc = 4 * (hr - 1) * hs
-    checks = _check_anchors(r, s)
+    n_data = r * s
+    n_anc = (r - stride) * s
+    checks = _check_anchors(r, s, stride)
     anc_index = {c: n_data + k for k, c in enumerate(checks)}
     base = n_data + n_anc
     n_sup = len(coords)
@@ -1579,7 +1667,7 @@ def synthesize_parity_layout(backend, r, s, op="bell", periodic=True,
     best_plan = None
     for seed in seeds:
         phys = _constructive_placement(G, r, s, coords, checks, anc_index,
-                                       seed)
+                                       seed, stride=stride)
         if phys is None:
             continue
         leaves = phys[base:]
@@ -1663,7 +1751,7 @@ def synthesize_parity_layout(backend, r, s, op="bell", periodic=True,
         }
         if noise_aware:
             plan["score"] = _score_plan(plan, phys, G, backend, r, s,
-                                        checks, rounds_weight)
+                                        checks, rounds_weight, stride=stride)
             if best_plan is None or plan["score"] > best_plan.get(
                     "score", float("-inf")):
                 best_plan = plan
@@ -1684,7 +1772,7 @@ def synthesize_parity_layout(backend, r, s, op="bell", periodic=True,
 
 def synthesize_paired_layout(backend, r, s, seeds=tuple(range(24)),
                              n_extra=0, rounds_weight=8, noise_aware=True,
-                             verbose=True):
+                             verbose=True, stride=1):
     """Try to synthesize a zero-SWAP layout plan for full_stabilizer='paired'.
 
     Why paired mode: the legacy weight-4 star places a degree-4 interaction
@@ -1728,10 +1816,11 @@ def synthesize_paired_layout(backend, r, s, seeds=tuple(range(24)),
     """
     import collections
     import math
-    assert s % 4 == 0, "paired mode needs s % 4 == 0"
-    n_data, hr, hs = r * s, r // 2, s // 2
-    n_anc = 4 * (hr - 1) * hs
-    checks = _check_anchors(r, s)
+    g = stride
+    assert s % (2 * g) == 0, "paired mode needs s % (2*stride) == 0"
+    n_data = r * s
+    n_anc = (r - g) * s
+    checks = _check_anchors(r, s, g)
     anc_index = {c: n_data + k for k, c in enumerate(checks)}
     base = n_data + n_anc
 
@@ -1785,7 +1874,7 @@ def synthesize_paired_layout(backend, r, s, seeds=tuple(range(24)),
         return sites
 
     def _heavyhex_placement(seed):
-        """Embed the s (columns) x 2 (parities) = 2s data-ancilla chains onto
+        """Embed the s (columns) x g (residues) = g·s data-ancilla chains onto
         the heavy-hex lattice with a free rung port on every ancilla.
 
         Each chain's a-d-a core is a deg3-deg2-deg3 "bridge" (u, v, w); u and
@@ -1797,8 +1886,12 @@ def synthesize_paired_layout(backend, r, s, seeds=tuple(range(24)),
         (column, parity) grouped by rung cycle so partners land near each
         other. Returns the phys list or None if this seed can't complete."""
         import random
+        if r != 3 * g:
+            # the a-d-a bridge yields exactly 3-data chains: native packing
+            # applies only when each residue chain has 3 data rows
+            return None
         rng = random.Random(seed * 2654435761 & 0xffffffff)
-        need = 2 * s
+        need = g * s
         raw = _heavyhex_sites()
         if len(raw) < need:
             return None
@@ -1837,16 +1930,16 @@ def synthesize_paired_layout(backend, r, s, seeds=tuple(range(24)),
         # rung cycle. Order chosen bridges by device index so consecutive
         # picks are physically close, keeping rung paths short.
         chosen.sort(key=lambda t: (t[1], t[0]))
-        cycles = [[(py + 2 * t, px) for t in range(s // 2)]
-                  for px in range(2) for py in range(2)]
+        cycles = [[(py + g * t, px) for t in range(s // g)]
+                  for px in range(g) for py in range(g)]
         flat = [pj for cyc in cycles for pj in cyc]
         assign = {}
         for (j, px), (u, v, w, d0, d4, pu, pw) in zip(flat, chosen):
             assign[(px) * s + j] = d0
             assign[anc_index[(px, j)]] = u
-            assign[(px + 2) * s + j] = v
-            assign[anc_index[(px + 2, j)]] = w
-            assign[(px + 4) * s + j] = d4
+            assign[(px + g) * s + j] = v
+            assign[anc_index[(px + g, j)]] = w
+            assign[(px + 2 * g) * s + j] = d4
         return [assign[q] for q in range(n_data)] + \
                [assign[n_data + k] for k in range(n_anc)]
 
@@ -1897,7 +1990,8 @@ def synthesize_paired_layout(backend, r, s, seeds=tuple(range(24)),
         phys = _heavyhex_placement(seed)
         if phys is None:
             phys = _constructive_placement(G, r, s, [], checks, anc_index,
-                                           seed, keep_anc_access=True)
+                                           seed, keep_anc_access=True,
+                                           stride=g)
         if phys is None:
             continue
         used = set(phys)
@@ -1907,10 +2001,10 @@ def synthesize_paired_layout(backend, r, s, seeds=tuple(range(24)),
         for ph in (0, 1):
             load.clear()
             rungs = sorted(((k, c) for k, c in enumerate(checks)
-                            if (c[1] // 2) % 2 == ph),
+                            if (c[1] // g) % 2 == ph),
                            key=lambda kc: kc[0])
             for k, (i, j) in rungs:
-                pa = phys[anc_index[(i, (j + 2) % s)]]
+                pa = phys[anc_index[(i, (j + g) % s)]]
                 pb = phys[anc_index[(i, j)]]
                 p = weighted_path(pa, pb, used, load)
                 if p is None:
@@ -1934,11 +2028,11 @@ def synthesize_paired_layout(backend, r, s, seeds=tuple(range(24)),
             score = 0.0
             for k, (i, j) in enumerate(checks):
                 a = phys[anc_index[(i, j)]]
-                d0, d1 = phys[i * s + j], phys[((i + 2) % r) * s + j]
+                d0, d1 = phys[i * s + j], phys[((i + g) % r) * s + j]
                 for e in (frozenset((d0, a)), frozenset((a, d1))):
                     score += 3 * rounds_weight * math.log1p(-_c(cz_err.get(e, 0.0)))
                 score += rounds_weight * math.log1p(-_c(ro_err.get(a, 0.0)))
-                chain = ([phys[anc_index[(i, (j + 2) % s)]]]
+                chain = ([phys[anc_index[(i, (j + g) % s)]]]
                          + bridges_by_slot[k] + [a])
                 for u, v in zip(chain, chain[1:]):
                     score += 2 * rounds_weight * math.log1p(
@@ -2026,6 +2120,200 @@ def verify_tree_parity():
               f"P(prep=1)={b.mean():.2f}")
         assert agree == 1.0
     print("  ✓ tree statistics match the single-ancilla gadget")
+
+
+def synthesize_steane_layout(backend, r, s, n_extra=1,
+                             seeds=tuple(range(24)), verbose=True,
+                             stride=1):
+    """Synthesize an initial_layout for steane_ec runs that makes the
+    transversal CX layer zero-SWAP and both prep circuits route locally.
+
+    Interaction-graph observation that makes this tractable: in a Steane
+    round there are NO data<->data gates at all — extraction is exactly one
+    CX per (data_k, block_k) pair.  So the placement problem is: choose
+    n_data vertex-disjoint DEVICE EDGES (one per pair; the transversal
+    layer is then native by construction), inside a compact low-error
+    region, oriented so that data ends neighbour data ends and block ends
+    neighbour block ends as much as possible (the two Clifford preps —
+    encoded data pair and encoded ancilla block — are the remaining 2q
+    mass, and they route over exactly those induced subgraphs).
+
+    Algorithm (seeded greedy + orientation hill-climb, same spirit as
+    synthesize_paired_layout):
+      1. grow a connected region of n_data disjoint edges from a random
+         low-cz-error seed edge, preferring low cz + readout error;
+      2. order the edges along a greedy nearest-neighbour snake and assign
+         grid sites row-major (only compactness matters — no data<->data
+         circuit adjacency to honour);
+      3. orient each edge (which endpoint is data) by hill-climbing the
+         count of native data-data + block-block adjacencies;
+      4. park the bell/extra ancillas on free neighbours of the row-0
+         data qubits (gadget support) and the n_anc unused stabilizer
+         ancillas on any remaining free qubits.
+
+    Returns {'initial_layout': [...], 'native_dd': int, 'native_bb': int,
+    'mean_cz': float} or None if no seed completes.  Virtual order matches
+    build_circuit(steane_ec=True): [data n][anc n_anc][extras n_extra]
+    [block n].  Pass to the transpiler as initial_layout; O3 keeps native
+    2q untouched and routes only the preps' non-native remainder.
+    """
+    import collections
+    import random as _random
+
+    n_data = r * s
+    n_anc = (r - stride) * s
+
+    cm = backend.coupling_map if hasattr(backend, "coupling_map") else backend
+    G = collections.defaultdict(set)
+    for a, c in cm.get_edges():
+        G[a].add(c)
+        G[c].add(a)
+    cz_err, ro_err = _target_error_maps(backend)
+
+    def _e(a, b):
+        v = cz_err.get(frozenset((a, b)), 0.01)
+        v = v if v == v else 0.05  # NaN guard
+        w = (ro_err.get(a, 0.02) + ro_err.get(b, 0.02)) / 2
+        return min(max(v, 1e-5), 0.999) + 0.5 * min(max(w, 1e-5), 0.999)
+
+    all_edges = sorted({tuple(sorted((a, b))) for a in G for b in G[a]})
+
+    def _grow(rng):
+        seed_pool = sorted(all_edges, key=lambda ed: _e(*ed))[:max(8, len(all_edges) // 4)]
+        e0 = seed_pool[rng.randrange(len(seed_pool))]
+        used, region = set(e0), [e0]
+        while len(region) < n_data:
+            cands = []
+            for (a, b) in all_edges:
+                if a in used or b in used:
+                    continue
+                if any(w in used for w in (G[a] | G[b])):
+                    cands.append((a, b))
+            if not cands:
+                return None
+            cands.sort(key=lambda ed: _e(*ed) + rng.random() * 1e-4)
+            pick = cands[0]
+            region.append(pick)
+            used.update(pick)
+        return region
+
+    def _snake(region):
+        """Greedy nearest-neighbour order over edge midpoints (graph dist)."""
+        # BFS distances between edges via their endpoints
+        idx = {ed: k for k, ed in enumerate(region)}
+        vert2edge = {}
+        for ed in region:
+            for v in ed:
+                vert2edge[v] = ed
+        order = [region[0]]
+        left = set(region[1:])
+        while left:
+            # BFS from current edge endpoints to nearest unused region edge
+            src = order[-1]
+            seen, q = set(src), collections.deque(src)
+            hit = None
+            while q and hit is None:
+                v = q.popleft()
+                for w in G[v]:
+                    if w in seen:
+                        continue
+                    seen.add(w)
+                    ed = vert2edge.get(w)
+                    if ed in left:
+                        hit = ed
+                        break
+                    q.append(w)
+            if hit is None:
+                hit = left.pop()
+            else:
+                left.discard(hit)
+            order.append(hit)
+        return order
+
+    def _orient(order, rng):
+        """ori[k] in {0,1}: which endpoint of edge k is DATA.  Hill-climb
+        native data-data + block-block adjacency."""
+        m = len(order)
+        ori = [rng.randrange(2) for _ in range(m)]
+
+        def ends(k):
+            a, b = order[k]
+            return (a, b) if ori[k] == 0 else (b, a)   # (data, block)
+
+        def score():
+            dset = {ends(k)[0] for k in range(m)}
+            bset = {ends(k)[1] for k in range(m)}
+            dd = sum(1 for v in dset for w in G[v] if w in dset) // 2
+            bb = sum(1 for v in bset for w in G[v] if w in bset) // 2
+            return dd + bb, dd, bb
+
+        best, dd, bb = score()
+        improved = True
+        while improved:
+            improved = False
+            for k in range(m):
+                ori[k] ^= 1
+                sc, d2, b2 = score()
+                if sc > best:
+                    best, dd, bb = sc, d2, b2
+                    improved = True
+                else:
+                    ori[k] ^= 1
+        return [ends(k) for k in range(m)], dd, bb
+
+    best_plan = None
+    for sd in seeds:
+        rng = _random.Random(sd * 2654435761 & 0xffffffff)
+        region = _grow(rng)
+        if region is None:
+            continue
+        order = _snake(region)
+        pairs, dd, bb = _orient(order, rng)         # [(data_phys, block_phys)]
+        used = {v for p in pairs for v in p}
+        free = [v for v in sorted(G) if v not in used]
+
+        data_phys = [None] * n_data
+        block_phys = [None] * n_data
+        for k, (dp, bp) in enumerate(pairs):        # snake order -> row-major
+            data_phys[k] = dp
+            block_phys[k] = bp
+
+        # extras next to row-0 data (bell-gadget support), then leftovers
+        extras = []
+        for v in free:
+            if len(extras) >= n_extra:
+                break
+            if any(w in set(data_phys[:s]) for w in G[v]):
+                extras.append(v)
+        for v in free:
+            if len(extras) >= n_extra:
+                break
+            if v not in extras:
+                extras.append(v)
+        rest = [v for v in free if v not in set(extras)]
+        if len(extras) < n_extra or len(rest) < n_anc:
+            continue
+        anc_phys = rest[:n_anc]
+
+        layout = data_phys + anc_phys + extras[:n_extra] + block_phys
+        mean_cz = float(np.mean([_e(*p) for p in pairs]))
+        plan = {"initial_layout": layout, "native_dd": dd, "native_bb": bb,
+                "mean_cz": mean_cz}
+        key = (dd + bb, -mean_cz)
+        if best_plan is None or key > best_plan[0]:
+            best_plan = (key, plan)
+
+    if best_plan is None:
+        if verbose:
+            print("steane layout synthesis: no seed completed")
+        return None
+    plan = best_plan[1]
+    if verbose:
+        print(f"steane layout: {n_data} native pair edges (transversal CX "
+              f"zero-SWAP), native data-data adjacencies {plan['native_dd']}, "
+              f"block-block {plan['native_bb']}, mean pair 2q err "
+              f"{plan['mean_cz']:.4f}")
+    return plan
 
 
 if __name__ == "__main__":
