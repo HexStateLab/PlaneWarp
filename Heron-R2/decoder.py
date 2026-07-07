@@ -56,12 +56,22 @@ _lib.rot_4d_inv.argtypes = [_ct.c_int, _ct.c_int,
 _lib.rot_4d_inv.restype = None
 
 # ---- 4D rotation helpers ----
-# Best fixed rotations found at weight 3000 on 100×100
-ROTS = [(0,0,0), (50,50,1), (0,50,2), (33,33,3)]
-
-# Auto-rotation: if True, every decode path applies the best single rotation.
-# Heuristic: shift by ~r/4 along j to move the black hole off the antipode.
+# Grid-matched rotation params: diverse shifts + SL(2,Z) modes
+# Generated dynamically via rotation_grid() for each (r,s).
 USE_ROTATION = True
+
+def rotation_grid(r, s):
+    """Generate diverse rotation params for given grid size."""
+    r4 = max(1, r // 4)
+    s4 = max(1, s // 4)
+    r2 = (r // 2) % r
+    s2 = (s // 2) % s
+    rots = [
+        (0, 0, 0), (r4, 0, 0), (0, s4, 0), (r4, s4, 0),
+        (0, 0, 1), (r4, s4, 1), (0, 0, 2), (r4, s4, 3),
+        (r2, s2, 4), ((r4 * 3) % r, (s4 * 3) % s, 5),
+    ]
+    return [(dx % r, dy % s, mi % 6) for dx, dy, mi in rots]
 
 def default_rot(r, s):
     """Best single-rotation params for given grid size."""
@@ -77,6 +87,24 @@ def _decode_with_rot(syn, r, s, rot=None):
         corr_r = solve(syn_r, r, s)
         return unrotate_corr(corr_r, dx, dy, mi)
     return solve(syn, r, s)
+
+def decode_union(syn, r, s):
+    """Try all grid-matched rotations, return lowest-weight valid correction.
+    Falls back to identity-rotation correction if none pass stabilizer check.
+    """
+    best = None
+    best_wt = 10**9
+    for dx, dy, mi in rotation_grid(r, s):
+        syn_r = rotate_syn(syn, dx, dy, mi)
+        corr_r = solve(syn_r, r, s)
+        corr = unrotate_corr(corr_r, dx, dy, mi)
+        # Check: is corr a valid correction (matches syndrome)?
+        if np.array_equal(S_of(corr, r, s), syn):
+            wt = int(corr.sum())
+            if wt < best_wt:
+                best_wt = wt
+                best = corr
+    return best if best is not None else solve(syn, r, s)
 
 def rotate_syn(syn, dx, dy, mi):
     """C-backed 4D rotation: syndrome → rotated syndrome."""
@@ -200,18 +228,30 @@ def tesseract_decode_rot(syndromes, r, s, mi=3, dx=33, dy=33):
     return _decode_with_rot(syn, r, s, rot=(dx, dy, mi))
 
 
+def tesseract_decode_rotn(syndromes, r, s):
+    """Union decode: try all grid-matched rotations, pick lowest-weight valid.
+    Use this for best error-correction quality at the cost of N× runtime.
+    """
+    syn = syndromes[-1].copy().astype(np.uint8)
+    return decode_union(syn, r, s)
+
+
 def tesseract_decode_rot4(syndromes, r, s):
-    """Run all 4 best rotations, return corrections stacked (4,r,s).
+    """Run all grid-matched rotations, return corrections stacked (N,r,s).
     For external union-rate evaluation; not for production single-shot.
     """
     syn = syndromes[-1].copy().astype(np.uint8)
     out = []
-    for dx, dy, mi in ROTS:
+    for dx, dy, mi in rotation_grid(r, s):
         syn_r = rotate_syn(syn, dx, dy, mi)
         prep(syn_r, r, s)
         corr_r = solve(syn_r, r, s)
         out.append(unrotate_corr(corr_r, dx, dy, mi))
     return np.stack(out)
+
+
+# Alias for backward compatibility
+tesseract_decode_union = tesseract_decode_rotn
 
 
 def tesseract_decode_np(syndromes, r, s, timeout=30):
@@ -221,13 +261,12 @@ def tesseract_decode_np(syndromes, r, s, timeout=30):
 
 
 def tesseract_decode_np_rot4(syndromes, r, s, timeout=30):
-    """4-rotation ANY-of-N pipeline using subprocess --decode-np.
-    Returns stacked (4,r,s) corrections identical to run_80pct.py.
-    Union rate ~84% at weight 3000 on 100×100.
+    """N-rotation ANY-of-N pipeline using subprocess --decode-np.
+    Returns stacked (N,r,s) corrections.
     """
     syn = syndromes[-1].copy().astype(np.uint8)
     out = []
-    for dx, dy, mi in ROTS:
+    for dx, dy, mi in rotation_grid(r, s):
         syn_r = rotate_syn(syn, dx, dy, mi)
         corr_r = decode_np(syn_r, r, s, timeout)
         out.append(unrotate_corr(corr_r, dx, dy, mi))

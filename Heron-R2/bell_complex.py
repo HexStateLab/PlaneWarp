@@ -157,7 +157,6 @@ def main():
     opts = ap.parse_args()
 
     r, s = opts.grid; n = opts.rounds; shots = opts.shots
-    n_anc = 4 * (r // 2 - 1) * (s // 2)
     basis = opts.stabilizer_basis.upper()
     dry = opts.dry_run
 
@@ -210,7 +209,8 @@ def main():
             kw["full_stabilizer"] = True
             kw["no_reset"] = True
 
-    qzz, *_ = build_circuit(r, s, n, **kw)
+    qzz, *qzz_ret = build_circuit(r, s, n, **kw)
+    n_anc = qzz_ret[3] if len(qzz_ret) > 3 else (r - 1) * s
     qxx, *_ = build_circuit(r, s, n, partial_x=True, **kw)
 
     if opts.output_qasm:
