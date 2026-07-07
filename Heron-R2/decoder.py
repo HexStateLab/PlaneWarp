@@ -29,15 +29,22 @@ _lib.is_stabilizer.argtypes = [_ct.c_int, _ct.c_int,
     _ct.POINTER(_ct.c_uint8)]
 _lib.is_stabilizer.restype = _ct.c_int
 
-# Subprocess decode — uses the working Heron-R2/plane_warp binary (Jun 27),
-# NOT the rebuilt .so which has a broken solve_plane.
+# Subprocess decode — flat-view decoder (rebuild Jun 2026, includes
+# solve_plane_flat for beyond-distance performance).
 import subprocess as _sp
 _BIN = _os.path.join(_lib_dir, 'plane_warp')
 
+# Set True to use the flat-view decoder (global K_fix, optimal for odd
+# block dimensions and concentrated error weight beyond code distance).
+FLAT_DECODER = True
+
 def _sub_decode(syn, r, s, timeout=30):
-    """Call ./plane_warp --decode-np via subprocess (matching run_80pct.py)."""
-    proc = _sp.run([_BIN, str(r), str(s), '--decode-np'],
-                   input=syn.tobytes(), capture_output=True, timeout=timeout)
+    """Call ./plane_warp [--flat] --decode-np via subprocess."""
+    args = [_BIN, str(r), str(s)]
+    if FLAT_DECODER:
+        args.append('--flat')
+    args.append('--decode-np')
+    proc = _sp.run(args, input=syn.tobytes(), capture_output=True, timeout=timeout)
     return np.frombuffer(proc.stdout, np.uint8).reshape(r, s)
 _lib.rot_4d_fwd.argtypes = [_ct.c_int, _ct.c_int,
     _ct.POINTER(_ct.c_uint8), _ct.POINTER(_ct.c_uint8),
