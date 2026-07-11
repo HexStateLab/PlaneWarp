@@ -55,73 +55,88 @@ _lib.rot_4d_inv.argtypes = [_ct.c_int, _ct.c_int,
     _ct.c_int, _ct.c_int, _ct.c_int]
 _lib.rot_4d_inv.restype = None
 
-# ---- 4D rotation helpers ----
+# ---- Translation helpers (origin-shift on the torus) ----
 # Grid-matched rotation params: diverse shifts + SL(2,Z) modes
 # Generated dynamically via rotation_grid() for each (r,s).
 USE_ROTATION = True
 
-def rotation_grid(r, s):
-    """Generate diverse rotation params for given grid size."""
+def translation_grid(r, s):
+    """Generate diverse translations for given grid size."""
     r4 = max(1, r // 4)
     s4 = max(1, s // 4)
-    r2 = (r // 2) % r
-    s2 = (s // 2) % s
-    rots = [
-        (0, 0, 0), (r4, 0, 0), (0, s4, 0), (r4, s4, 0),
-        (0, 0, 1), (r4, s4, 1), (0, 0, 2), (r4, s4, 3),
-        (r2, s2, 4), ((r4 * 3) % r, (s4 * 3) % s, 5),
+    shifts = [
+        (0, 0), (r4, 0), (0, s4), (r4, s4),
+        (r4*2, s4*2), (r4*3, s4*3), (r//2, 0), (0, s//2),
     ]
-    return [(dx % r, dy % s, mi % 6) for dx, dy, mi in rots]
+    return [(dx % r, dy % s) for dx, dy in shifts]
 
 def default_rot(r, s):
-    """Best single-rotation params for given grid size."""
+    """Best single-translation params for given grid size."""
     return (0, max(1, r // 4), 0)
 
 def _decode_with_rot(syn, r, s, rot=None):
-    """Decode with optional rotation. If rot=None and USE_ROTATION, applies default."""
+    """Decode with optional translation. If rot=None and USE_ROTATION, applies default."""
     if USE_ROTATION and rot is None:
         rot = default_rot(r, s)
     if rot:
         dx, dy, mi = rot
-        syn_r = rotate_syn(syn, dx, dy, mi)
-        corr_r = solve(syn_r, r, s)
-        return unrotate_corr(corr_r, dx, dy, mi)
+        syn_t = translate_syn(syn, dx, dy)
+        corr_t = solve(syn_t, r, s)
+        return untranslate_corr(corr_t, dx, dy)
     return solve(syn, r, s)
 
-def decode_union(syn, r, s):
-    """Try all grid-matched rotations, return lowest-weight valid correction.
-    Falls back to identity-rotation correction if none pass stabilizer check.
+def flatness_translation(syn, r, s):
+    """Pick translation that puts syndrome in geometrically flat zone.
+    The decoder's K_fix column (block col hs/2) is a 'curved' region —
+    syndrome there is harder to correct.  The seed column (block col 0)
+    is 'flat' — the decoder has maximum freedom.
+    Score each candidate dy by how much syndrome weight falls in
+    flat (b=0) vs curved (b=1) block columns.  Row shifts (dx)
+    don't affect column flatness so we fix dx=0.
     """
-    best = None
-    best_wt = 10**9
-    for dx, dy, mi in rotation_grid(r, s):
-        syn_r = rotate_syn(syn, dx, dy, mi)
-        corr_r = solve(syn_r, r, s)
-        corr = unrotate_corr(corr_r, dx, dy, mi)
-        # Check: is corr a valid correction (matches syndrome)?
-        if np.array_equal(S_of(corr, r, s), syn):
-            wt = int(corr.sum())
-            if wt < best_wt:
-                best_wt = wt
-                best = corr
-    return best if best is not None else solve(syn, r, s)
+    hs = s // 2
+    khs = hs // 2  # K_fix column index
+    best_dy = 0
+    best_score = -1e9
+    for dy in range(s):
+        score = 0
+        for j in range(s):
+            wt = int(syn[:, j].sum())
+            if wt == 0:
+                continue
+            b = ((j - dy) % s) // 2
+            if b < khs:
+                score += wt     # flat: seed column
+            elif b == khs:
+                score -= wt     # curved: K_fix column
+        if score > best_score:
+            best_score = score
+            best_dy = dy
+    return (0, best_dy)
 
-def rotate_syn(syn, dx, dy, mi):
-    """C-backed 4D rotation: syndrome → rotated syndrome."""
+def decode_tracking(syn, r, s):
+    """Decode with geometric-flatness-guided translation."""
+    dx, dy = flatness_translation(syn, r, s)
+    syn_t = translate_syn(syn, dx, dy)
+    corr_t = solve(syn_t, r, s)
+    return untranslate_corr(corr_t, dx, dy)
+
+def translate_syn(syn, dx, dy):
+    """C-backed translation: syndrome → shifted syndrome."""
     out = np.zeros_like(syn)
     r, s = syn.shape
     _lib.rot_4d_fwd(r, s,
         syn.ctypes.data_as(_ct.POINTER(_ct.c_uint8)),
-        out.ctypes.data_as(_ct.POINTER(_ct.c_uint8)), dx, dy, mi)
+        out.ctypes.data_as(_ct.POINTER(_ct.c_uint8)), dx, dy, 0)
     return out
 
-def unrotate_corr(corr, dx, dy, mi):
-    """C-backed inverse 4D rotation: correction → unrotated."""
+def untranslate_corr(corr, dx, dy):
+    """C-backed inverse translation: correction → unshifted."""
     out = np.zeros_like(corr)
     r, s = corr.shape
     _lib.rot_4d_inv(r, s,
         corr.ctypes.data_as(_ct.POINTER(_ct.c_uint8)),
-        out.ctypes.data_as(_ct.POINTER(_ct.c_uint8)), dx, dy, mi)
+        out.ctypes.data_as(_ct.POINTER(_ct.c_uint8)), dx, dy, 0)
     return out
 
 # Cache for min-weight kernel LUT per grid size
@@ -222,6 +237,40 @@ def tesseract_decode_ffinal(syndromes, r, s):
     return _decode_with_rot(syn, r, s)
 
 
+def tesseract_decode_sequential(syndromes, r, s):
+    """Sequential decode: each round decodes in a frame shifted by the
+    previous round's correction centroid.  Errors accumulate; the frame
+    tracks them round by round, keeping the decoder's origin near where
+    the error cluster is concentrated.
+    """
+    nr = syndromes.shape[0]
+    acc = np.zeros((r, s), dtype=np.uint8)
+    for t in range(nr):
+        syn = syndromes[t].copy().astype(np.uint8)
+        if acc.sum() > 0:
+            ys, xs = np.nonzero(acc)
+            ci = float(ys.mean())
+            cj = float(xs.mean())
+            di = int(ci + 0.5) % r
+            dj = int(cj + 0.5) % s
+            dx, dy = (-di) % r, (-dj) % s
+            syn_t = translate_syn(syn, dx, dy)
+            corr_t = solve(syn_t, r, s)
+            acc ^= untranslate_corr(corr_t, dx, dy)
+        else:
+            corr = solve(syn, r, s)
+            acc ^= corr
+    return acc
+
+
+def tesseract_decode_tracking(syndromes, r, s):
+    """Decode with adaptive tracking: centroid-based translation from
+    the accumulated syndrome across all rounds.
+    """
+    syn = syndromes[-1].copy().astype(np.uint8)
+    return decode_tracking(syn, r, s)
+
+
 def tesseract_decode_rot(syndromes, r, s, mi=3, dx=33, dy=33):
     """ffinal decoder with explicit 4D rotation (bypasses auto-rotation default)."""
     syn = syndromes[-1].copy().astype(np.uint8)
@@ -229,7 +278,7 @@ def tesseract_decode_rot(syndromes, r, s, mi=3, dx=33, dy=33):
 
 
 def tesseract_decode_rotn(syndromes, r, s):
-    """Union decode: try all grid-matched rotations, pick lowest-weight valid.
+    """Union decode: try all grid translations, pick lowest-weight valid.
     Use this for best error-correction quality at the cost of N× runtime.
     """
     syn = syndromes[-1].copy().astype(np.uint8)
@@ -237,16 +286,16 @@ def tesseract_decode_rotn(syndromes, r, s):
 
 
 def tesseract_decode_rot4(syndromes, r, s):
-    """Run all grid-matched rotations, return corrections stacked (N,r,s).
+    """Run all grid translations, return corrections stacked (N,r,s).
     For external union-rate evaluation; not for production single-shot.
     """
     syn = syndromes[-1].copy().astype(np.uint8)
     out = []
-    for dx, dy, mi in rotation_grid(r, s):
-        syn_r = rotate_syn(syn, dx, dy, mi)
-        prep(syn_r, r, s)
-        corr_r = solve(syn_r, r, s)
-        out.append(unrotate_corr(corr_r, dx, dy, mi))
+    for dx, dy in translation_grid(r, s):
+        syn_t = translate_syn(syn, dx, dy)
+        prep(syn_t, r, s)
+        corr_t = solve(syn_t, r, s)
+        out.append(untranslate_corr(corr_t, dx, dy))
     return np.stack(out)
 
 
@@ -261,15 +310,15 @@ def tesseract_decode_np(syndromes, r, s, timeout=30):
 
 
 def tesseract_decode_np_rot4(syndromes, r, s, timeout=30):
-    """N-rotation ANY-of-N pipeline using subprocess --decode-np.
+    """N-translation ANY-of-N pipeline using subprocess --decode-np.
     Returns stacked (N,r,s) corrections.
     """
     syn = syndromes[-1].copy().astype(np.uint8)
     out = []
-    for dx, dy, mi in rotation_grid(r, s):
-        syn_r = rotate_syn(syn, dx, dy, mi)
-        corr_r = decode_np(syn_r, r, s, timeout)
-        out.append(unrotate_corr(corr_r, dx, dy, mi))
+    for dx, dy in translation_grid(r, s):
+        syn_t = translate_syn(syn, dx, dy)
+        corr_t = decode_np(syn_t, r, s, timeout)
+        out.append(untranslate_corr(corr_t, dx, dy))
     return np.stack(out)
 
 
