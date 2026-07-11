@@ -87,32 +87,41 @@ def _decode_with_rot(syn, r, s, rot=None):
 
 def flatness_translation(syn, r, s):
     """Pick translation that puts syndrome in geometrically flat zone.
-    The decoder's K_fix column (block col hs/2) is a 'curved' region —
-    syndrome there is harder to correct.  The seed column (block col 0)
-    is 'flat' — the decoder has maximum freedom.
-    Score each candidate dy by how much syndrome weight falls in
-    flat (b=0) vs curved (b=1) block columns.  Row shifts (dx)
-    don't affect column flatness so we fix dx=0.
+    The recurrence E[a+1][b+1] = S[a][b] ^ E[a][b] ^ E[a+1][b] ^ E[a][b+1]
+    means S at block column b constrains E at block column b+1.
+    Flat zone: S at block col hs-2 (constrains free column E at hs-1).
+    Curved zone: S at block col 0 (constrains K_fix E at hs/2).
+    Search both dx and dy.  Row shifts change which block row
+    the syndrome falls in, affecting the recurrence depth.
     """
-    hs = s // 2
-    khs = hs // 2  # K_fix column index
-    best_dy = 0
+    hr, hs = r // 2, s // 2
+    flat_b = hs - 2
+    curved_b = 0
+    best_dx, best_dy = 0, 0
     best_score = -1e9
-    for dy in range(s):
-        score = 0
-        for j in range(s):
-            wt = int(syn[:, j].sum())
-            if wt == 0:
-                continue
-            b = ((j - dy) % s) // 2
-            if b < khs:
-                score += wt     # flat: seed column
-            elif b == khs:
-                score -= wt     # curved: K_fix column
-        if score > best_score:
-            best_score = score
-            best_dy = dy
-    return (0, best_dy)
+    for dx in range(r):
+        for dy in range(s):
+            score = 0
+            for i in range(r):
+                for j in range(s):
+                    wt = int(syn[i, j])
+                    if wt == 0:
+                        continue
+                    a = ((i - dx) % r) // 2
+                    b = ((j - dy) % s) // 2
+                    if a == 0 and b == flat_b:
+                        score += 3 * wt   # seed row + free col, max freedom
+                    elif b == flat_b:
+                        score += 2 * wt   # free column
+                    elif a == 0 and b == curved_b:
+                        score -= wt        # seed row but curved col
+                    elif b == curved_b:
+                        score -= 2 * wt   # K_fix-constraining column, worst
+                    # else: neutral block interior
+            if score > best_score:
+                best_score = score
+                best_dx, best_dy = dx, dy
+    return (best_dx, best_dy)
 
 def decode_tracking(syn, r, s):
     """Decode with geometric-flatness-guided translation."""
